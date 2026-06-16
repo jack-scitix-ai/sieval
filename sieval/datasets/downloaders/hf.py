@@ -13,10 +13,31 @@ indirection, no offline/online split inside ``datasets.load_dataset``.
 AI-Generated Code - Claude Opus 4.7 (1M context) (Anthropic)
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 
 # Payload suffixes found across pilot datasets; extend as other formats surface.
 _DATA_SUFFIXES = (".arrow", ".parquet", ".jsonl", ".json", ".csv")
+
+
+@dataclass(frozen=True)
+class HFSource:
+    repo_id: str
+    revision: str | None
+
+
+def parse_hf_source(source: str) -> HFSource:
+    if not source.startswith("hf:"):
+        raise ValueError(f"Expected hf: scheme, got {source!r}")
+    repo_ref = source[len("hf:") :]
+    if not repo_ref:
+        raise ValueError(f"Invalid hf source: {source!r}")
+    repo_id, separator, revision = repo_ref.rpartition("@")
+    if not separator:
+        return HFSource(repo_id=repo_ref, revision=None)
+    if not repo_id or not revision:
+        raise ValueError(f"Invalid hf source revision pin: {source!r}")
+    return HFSource(repo_id=repo_id, revision=revision)
 
 
 class HFHandler:
@@ -31,12 +52,13 @@ class HFHandler:
     ) -> None:
         from huggingface_hub import snapshot_download
 
-        repo_id = self._strip_scheme(source)
-        local_dir = dest_root / repo_id
+        parsed = parse_hf_source(source)
+        local_dir = dest_root / parsed.repo_id
         local_dir.mkdir(parents=True, exist_ok=True)
         snapshot_download(
-            repo_id=repo_id,
+            repo_id=parsed.repo_id,
             repo_type="dataset",
+            revision=parsed.revision,
             local_dir=str(local_dir),
             force_download=force,
         )
@@ -47,8 +69,8 @@ class HFHandler:
         dest_root: Path,
         dataset_name: str,
     ) -> bool:
-        repo_id = self._strip_scheme(source)
-        local_dir = dest_root / repo_id
+        parsed = parse_hf_source(source)
+        local_dir = dest_root / parsed.repo_id
         if not local_dir.exists():
             return False
         # `huggingface_hub` writes `.incomplete` sidecars under
@@ -68,9 +90,3 @@ class HFHandler:
             if p.suffix in _DATA_SUFFIXES:
                 return True
         return False
-
-    @staticmethod
-    def _strip_scheme(source: str) -> str:
-        if not source.startswith("hf:"):
-            raise ValueError(f"Expected hf: scheme, got {source!r}")
-        return source[len("hf:") :]

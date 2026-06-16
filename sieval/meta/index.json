@@ -88,6 +88,27 @@
       "license": "CC-BY-4.0"
     },
     {
+      "name": "gsm8k",
+      "display_name": "GSM8K",
+      "description": "Grade School Math 8K - grade-school arithmetic word problems.",
+      "source": [
+        "hf:openai/gsm8k@740312add88f781978c0658806c59bc2815b9866"
+      ],
+      "categories": [
+        {
+          "level1": "Mathematics",
+          "level2": "ElementaryMath"
+        }
+      ],
+      "tags": [
+        "english",
+        "math-word-problems",
+        "open-ended"
+      ],
+      "deps_group": null,
+      "license": "MIT"
+    },
+    {
       "name": "human_eval",
       "display_name": "HumanEval",
       "description": "OpenAI HumanEval — 164 Python function-synthesis problems.",
@@ -310,6 +331,28 @@
         "source": "simple-evals",
         "url": "https://github.com/openai/simple-evals/blob/ee3b0318d8d1d9d72755a4120879be65f7c07e9e/gpqa_eval.py",
         "notes": "Permutation + seed logic aligned with simple-evals."
+      },
+      "status": "stable"
+    },
+    {
+      "name": "gsm8k_kshot_base_gen",
+      "display_name": "GSM8K (few-shot, base generative)",
+      "description": "GSM8K few-shot base-model strict-match EM evaluation.",
+      "dataset": "gsm8k",
+      "eval_mode": "gen",
+      "n_shot": 8,
+      "tags": [
+        "english",
+        "math-word-problems",
+        "open-ended",
+        "base-model"
+      ],
+      "deps_group": null,
+      "model_type": "gen",
+      "reference_impl": {
+        "source": "lm-evaluation-harness",
+        "url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/gsm8k/gsm8k.yaml",
+        "notes": "Uses lm-eval-harness strict-match extraction, aligned with the original GSM8K dataset.py #### answer delimiter. Also reports lm-eval-harness flexible-extract as a secondary metric, not as the original GSM8K official metric. Default k=8 follows the DeepSeek-V3 Table 3 comparison target (Qwen2.5-72B-Base GSM8K 8-shot EM = 88.3); DeepSeek-V3 does not specify strict vs flexible extraction."
       },
       "status": "stable"
     },

@@ -41,13 +41,12 @@ datasets:
         path: "openai/gsm8k"
 
 tasks:
-    gsm8k_8shot:
+    gsm8k_kshot_base_gen:
         class: GSM8KFewShotBaseGenTask
         dataset: gsm8k
         model: math_model
         args:
             k: 8
-            n: 1
         # infer_args:                  # per-task inference parameter overrides
         #     max_tokens: 512
 ```
