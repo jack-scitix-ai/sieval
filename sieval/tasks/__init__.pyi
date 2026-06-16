@@ -40,6 +40,9 @@ from .mmlu_0shot_gen import (
 from .mmlu_pro_0shot_gen import (
     MMLUProZeroShotGenTask,
 )
+from .mmmlu_kshot_base_gen import (
+    MMMLUKShotBaseGenTask,
+)
 from .t_eval_before_calling_0shot_gen import (
     TEvalBeforeCallingZeroShotGenTask,
 )
@@ -61,6 +64,7 @@ __all__ = [
     "MATH500ZeroShotGenTask",
     "MMLUProZeroShotGenTask",
     "MMLUZeroShotGenTask",
+    "MMMLUKShotBaseGenTask",
     "TEvalBeforeCallingZeroShotGenTask",
     "TheoremQAKShotBaseGenTask",
 ]

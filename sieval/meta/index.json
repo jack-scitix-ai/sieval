@@ -251,6 +251,26 @@
       "license": "MIT"
     },
     {
+      "name": "mmmlu",
+      "display_name": "MMMLU",
+      "description": "OpenAI MMMLU - human-translated MMLU test split covering 57 subjects across 14 locales.",
+      "source": [
+        "hf:openai/MMMLU"
+      ],
+      "categories": [
+        {
+          "level1": "Knowledge",
+          "level2": "Multi-domain"
+        }
+      ],
+      "tags": [
+        "multilingual",
+        "multiple-choice"
+      ],
+      "deps_group": null,
+      "license": "MIT"
+    },
+    {
       "name": "t_eval_before_calling",
       "display_name": "T-Eval Before-Calling",
       "description": "T-Eval tool-use benchmark — before-calling stage (plan/reason).",
@@ -563,6 +583,26 @@
         "source": "opencompass",
         "url": "https://github.com/open-compass/opencompass/blob/568572803ab108eb0e2ae73b770d965b7de078de/opencompass/configs/datasets/mmlu_pro/mmlu_pro_0shot_cot_gen_08c1de.py",
         "notes": "QUERY_TEMPLATE / CHOICES adapted from opencompass 0-shot CoT config."
+      },
+      "status": "stable"
+    },
+    {
+      "name": "mmmlu_kshot_base_gen",
+      "display_name": "MMMLU (k-shot, base logprob)",
+      "description": "OpenAI MMMLU multilingual k-shot MCQ with weighted groups.",
+      "dataset": "mmmlu",
+      "eval_mode": "ppl",
+      "n_shot": 5,
+      "tags": [
+        "multilingual",
+        "multiple-choice"
+      ],
+      "deps_group": null,
+      "model_type": "gen",
+      "reference_impl": {
+        "source": "lm-evaluation-harness + hendrycks/test",
+        "url": "https://github.com/EleutherAI/lm-evaluation-harness/tree/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/openai-mmmlu",
+        "notes": "Uses MMMLU locale/category/subject organization and size-weighted aggregation from lm-evaluation-harness; uses Hendrycks evaluate.py completion top-logprob scoring for base models."
       },
       "status": "stable"
     },
