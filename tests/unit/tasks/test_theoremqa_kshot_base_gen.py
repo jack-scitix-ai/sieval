@@ -68,9 +68,11 @@ def _preserve_registries():
 class _MockGenModel(GenModel):
     def __init__(self):
         super().__init__(model="mock-gen", api_key="fake")
+        self.last_kwargs: dict[str, object] = {}
 
     async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
+        _ = prompt
+        self.last_kwargs = dict(kwargs)
         return ModelOutput(model=self.meta(), texts=["The answer is 4"])
 
     async def _alogprobs_impl(
@@ -143,6 +145,20 @@ async def test_report_divides_metrics_by_completed_finals_only():
     assert report["accuracy"] == 100.0
     assert report["fails"] == 1.0
     assert report["empty"] == 0.0
+
+
+@pytest.mark.anyio
+async def test_infer_only_forwards_prompt_coupled_stop():
+    task_module = _task_module()
+    model = _MockGenModel()
+    task = task_module.TheoremQAKShotBaseGenTask(_dataset(), model, k=0)
+
+    await task.infer(
+        "prompt",
+        TaskContext(sample_id=0, raw_sample={"Question": "What is 2+2?"}),
+    )
+
+    assert model.last_kwargs == {"stop": task_module._STOP_TOKENS}
 
 
 @pytest.mark.anyio

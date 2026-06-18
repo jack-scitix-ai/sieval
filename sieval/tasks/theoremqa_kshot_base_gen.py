@@ -2,11 +2,17 @@
 TheoremQA k-shot base generative task.
 
 This implementation intentionally tracks the original TheoremQA vLLM
-evaluation path: official short-form examples, temperature=0, top_p=1,
-max_tokens=2048, matching stop tokens, and the upstream answer_clean matcher.
+evaluation path: official short-form examples, matching stop tokens, and the
+upstream answer_clean matcher. For score reproduction, configure the model
+layer with the official decoding values: temperature=0, top_p=1, and
+max_tokens=2048.
 Two common anomaly classes are therefore expected compatibility artifacts:
 long chain-of-thought outputs can finish with reason="length", and repeated
 "The answer is" triggers can be treated as ICL leakage by the upstream cleaner.
+
+Known implementation deviations are limited to import/runtime safety: numeric
+eval is sandboxed instead of using upstream bare eval, and latex2sympy2 falls
+back to latex2sympy2_extended when the original package is unavailable.
 
 The Qwen2.5 technical report lists Qwen2.5-72B at 42.8 on TheoremQA without
 publishing full evaluation details. By matching the original TheoremQA runner
@@ -30,6 +36,9 @@ from sieval.datasets import TheoremQADatasetSample
 
 
 def _load_latex2sympy():
+    # Official TheoremQA imports latex2sympy2. Python >=3.12 environments may
+    # only have the compatible latex2sympy2_extended fallback, whose parser can
+    # differ from upstream on edge cases.
     try:
         return import_module("latex2sympy2").latex2sympy
     except ModuleNotFoundError:
@@ -47,6 +56,8 @@ def _get_latex2sympy() -> Callable[[str], object]:
 
 
 E = 2.718
+# Upstream uses bare eval(num). SiEval keeps eval sandboxed for task runtime
+# safety, so builtins such as abs/round/pow are intentionally unavailable.
 _EVAL_GLOBALS = {
     "__builtins__": {},
     "math": math,
@@ -72,6 +83,7 @@ _STOP_TOKENS = [
     "\n\nProblem",
     "Problem:",
 ]
+_THEOREMQA_RUN_URL = "https://github.com/TIGER-AI-Lab/TheoremQA/blob/acfc9686aa9b49f3c8f189364a9a9ee9c53da039/run.py"  # noqa: E501
 
 _THEOREMQA_EXAMPLES: tuple[tuple[str, str], ...] = (
     (
@@ -402,10 +414,7 @@ def _normalize_k(k: int | None) -> int:
     model_type="gen",
     reference_impl=ReferenceImpl(
         source="TIGER-AI-Lab/TheoremQA",
-        url=(
-            "https://github.com/TIGER-AI-Lab/TheoremQA/blob/"
-            "acfc9686aa9b49f3c8f189364a9a9ee9c53da039/run.py"
-        ),
+        url=_THEOREMQA_RUN_URL,
         notes=(
             "Prompt follows official short-form examples by default; k can "
             "select any prefix of the built-in examples. answer_clean and "
@@ -419,22 +428,21 @@ class TheoremQAKShotBaseGenTask(
     def __init__(self, dataset, model, name: str | None = None, k: int | None = None):
         super().__init__(dataset=dataset, model=model, name=name)
         self._k = _normalize_k(k)
+        self._prompt_no_input: str | None = None
+        self._prompt_prefix: str | None = None
+
+    @override
+    async def setup(self) -> None:
+        self._prompt_no_input, self._prompt_prefix = self._build_prompt_parts()
 
     @override
     async def preprocess(self, raw, ctx):
-        used_examples = list(_THEOREMQA_EXAMPLES[: self._k])
-        prompt_no_input, prefix = _get_short_format(used_examples)
+        prompt_no_input, prefix = self._get_prompt_parts()
         return prompt_no_input + prefix.format(query=raw["Question"])
 
     @override
     async def infer(self, pre, ctx):
-        return await self.model.agenerate(
-            pre,
-            temperature=0,
-            top_p=1,
-            max_tokens=2048,
-            stop=_STOP_TOKENS,
-        )
+        return await self.model.agenerate(pre, stop=_STOP_TOKENS)
 
     @override
     async def postprocess(self, inf, ctx):
@@ -474,3 +482,12 @@ class TheoremQAKShotBaseGenTask(
             "fails": float(len(fails)),
             "empty": float(empty),
         }
+
+    def _build_prompt_parts(self) -> tuple[str, str]:
+        used_examples = list(_THEOREMQA_EXAMPLES[: self._k])
+        return _get_short_format(used_examples)
+
+    def _get_prompt_parts(self) -> tuple[str, str]:
+        if self._prompt_no_input is None or self._prompt_prefix is None:
+            self._prompt_no_input, self._prompt_prefix = self._build_prompt_parts()
+        return self._prompt_no_input, self._prompt_prefix
