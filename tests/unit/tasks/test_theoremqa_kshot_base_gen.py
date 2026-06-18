@@ -1,7 +1,7 @@
 """
 Unit tests for TheoremQA k-shot base generative task.
 
-AI-Generated Code - GPT-5 (OpenAI)
+AI-Generated Code - GPT-5.5 (OpenAI)
 """
 
 import importlib
@@ -182,6 +182,23 @@ async def test_preprocess_uses_configured_k(k, expected_examples):
     if expected_examples == 2:
         assert examples[1][0] in prompt
         assert examples[2][0] not in prompt
+
+
+@pytest.mark.anyio
+async def test_preprocess_preserves_official_runtime_prompt_artifacts():
+    raw = {"Question": "What is 2+2?", "Answer": "4", "Answer_type": "integer"}
+    task = _task(k=3)
+
+    prompt = await task.preprocess(raw, TaskContext(sample_id=0, raw_sample=raw))
+
+    assert "\u2248 833.33 frames" in prompt
+    assert "Bytes/frame is approximately 833.33 frames" not in prompt
+    upstream_control_line = (
+        "Let's calculate the numerical value of "
+        "$\\left[\x0crac{10}{3}, \x0crac{4}{3}\x0dight]_C$ "
+        "as [3.33, 1.33]."
+    )
+    assert upstream_control_line in prompt
 
 
 def test_constructor_rejects_negative_k():

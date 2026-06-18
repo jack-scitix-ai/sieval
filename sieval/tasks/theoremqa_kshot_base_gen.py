@@ -6,19 +6,26 @@ evaluation path: official short-form examples, matching stop tokens, and the
 upstream answer_clean matcher. For score reproduction, configure the model
 layer with the official decoding values: temperature=0, top_p=1, and
 max_tokens=2048.
+The few-shot prompt preserves official runtime artifacts, including the
+approximation symbol and the control characters produced by non-raw LaTeX
+escapes in the upstream examples.py.
 Two common anomaly classes are therefore expected compatibility artifacts:
 long chain-of-thought outputs can finish with reason="length", and repeated
 "The answer is" triggers can be treated as ICL leakage by the upstream cleaner.
 
-Known implementation deviations are limited to import/runtime safety: numeric
-eval is sandboxed instead of using upstream bare eval, and latex2sympy2 falls
-back to latex2sympy2_extended when the original package is unavailable.
+Known implementation deviations are import/runtime safety and typed
+groundtruth plumbing: numeric eval is sandboxed instead of using upstream bare
+eval, latex2sympy2 falls back to latex2sympy2_extended when the original
+package is unavailable, and numeric groundtruths are derived from the
+dataset's Answer_type field instead of the official loader's runtime Python
+types to reproduce the same typed comparison inputs.
 
-The Qwen2.5 technical report lists Qwen2.5-72B at 42.8 on TheoremQA without
-publishing full evaluation details. By matching the original TheoremQA runner
-strictly, this task reproduces a nearby score under SiEval.
+The Qwen2.5 technical report Table 2 lists TheoremQA as a 5-shot base-model
+benchmark: Qwen2.5-72B scores 42.4, while 42.8 belongs to Qwen2-72B. By
+matching the original TheoremQA runner strictly, this task reproduces a nearby
+Qwen2.5-72B score under SiEval.
 
-AI-Generated Code - GPT-5 (OpenAI)
+AI-Generated Code - GPT-5.5 (OpenAI)
 """
 
 import ast
@@ -85,6 +92,9 @@ _STOP_TOKENS = [
 ]
 _THEOREMQA_RUN_URL = "https://github.com/TIGER-AI-Lab/TheoremQA/blob/acfc9686aa9b49f3c8f189364a9a9ee9c53da039/run.py"  # noqa: E501
 
+# These strings mirror the official runtime examples, including artifacts from
+# upstream non-raw string escapes. The model-facing prompt is intentionally more
+# important here than source readability.
 _THEOREMQA_EXAMPLES: tuple[tuple[str, str], ...] = (
     (
         "In a 10 Gigabit Ethernet network, the average size of a frame is "
@@ -96,7 +106,7 @@ _THEOREMQA_EXAMPLES: tuple[tuple[str, str], ...] = (
         "1 ms * 1.25 * 10^9 Bytes/s = 1.25 * 10^6 Bytes\n\n"
         "Finally, divide the data loss by the average frame size to get the "
         "number of frames lost:\n\n"
-        "1.25 * 10^6 Bytes / 1500 Bytes/frame is approximately 833.33 frames\n"
+        "1.25 * 10^6 Bytes / 1500 Bytes/frame \u2248 833.33 frames\n"
         "The answer is 833.33",
     ),
     (
@@ -142,7 +152,7 @@ _THEOREMQA_EXAMPLES: tuple[tuple[str, str], ...] = (
         "basis consisting of vectors u_1 = [2, 4] and u_2 = [1, -1] is "
         "$\\left[\\frac{10}{3}, \\frac{4}{3}\\right]_C$. \n"
         "Let's calculate the numerical value of "
-        "$\\left[\\frac{10}{3}, \\frac{4}{3}\\right]_C$ as [3.33, 1.33].\n"
+        "$\\left[\frac{10}{3}, \frac{4}{3}\right]_C$ as [3.33, 1.33].\n"
         "The answer is [3.33, 1.33]",
     ),
     (
