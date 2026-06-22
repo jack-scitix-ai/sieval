@@ -60,7 +60,7 @@ def _task(
 
 @pytest.mark.anyio
 async def test_preprocess_and_infer_use_base_completion_prompt():
-    task, model, _ = _task(n=2, max_tokens=32, stop=("\nclass",))
+    task, model, _ = _task(n=2, stop=("\nclass",))
     try:
         raw = _sample()
         pre = await task.preprocess(raw, TaskContext(sample_id=0, raw_sample=raw))
@@ -70,8 +70,10 @@ async def test_preprocess_and_infer_use_base_completion_prompt():
         assert pre == raw["prompt"]
         assert model.last_prompt == raw["prompt"]
         assert model.last_kwargs["n"] == 2
-        assert model.last_kwargs["max_tokens"] == 32
         assert model.last_kwargs["stop"] == ["\nclass"]
+        # Decoding params (max_tokens, temperature, top_p) are owned by the
+        # model config / infer_args, never injected by the task layer.
+        assert "max_tokens" not in model.last_kwargs
     finally:
         await task.shutdown()
 

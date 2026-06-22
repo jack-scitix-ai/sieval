@@ -374,7 +374,7 @@
       "reference_impl": {
         "source": "lm-evaluation-harness",
         "url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/humaneval/humaneval.yaml",
-        "notes": "Aligned with lm-evaluation-harness humaneval.yaml prompt, stop sequences, max_gen_toks, zero-shot setting, repeats=1, and raw completion filtering; code execution is handled by the SiEval code-eval API."
+        "notes": "Aligned with lm-evaluation-harness humaneval.yaml prompt, stop sequences, max_gen_toks, zero-shot setting, repeats=1, and raw completion filtering; code execution is handled by the SiEval code-eval API. No single canonical Qwen2.5-72B-Base target exists: DeepSeek-V3 Table 3 reports 53.0 and the Qwen2.5 technical report self-reports 59.1 (no published eval config). This task reproduces lm-eval-harness, so its score is expected to land between those references rather than match Qwen's self-report."
       },
       "status": "stable"
     },
