@@ -30,4 +30,4 @@ def test_load_does_not_forward_revision_pin_to_local_dataset_loader():
 
     assert mock_load.call_args.args == ("/tmp/TIGER-Lab/TheoremQA",)
     assert "revision" not in mock_load.call_args.kwargs
-    assert "Picture" not in loaded["test"].column_names
+    assert "Picture" in loaded["test"].column_names

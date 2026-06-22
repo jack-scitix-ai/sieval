@@ -4,7 +4,7 @@ TheoremQA dataset wrapper.
 AI-Generated Code - GPT-5 (OpenAI)
 """
 
-from typing import TypedDict, override
+from typing import NotRequired, TypedDict, override
 
 from datasets import DatasetDict as HFDatasetDict
 from datasets import load_dataset
@@ -24,6 +24,7 @@ class TheoremQADatasetSample(TypedDict):
     Question: str
     Answer: str
     Answer_type: str
+    Picture: NotRequired[object]
 
 
 @sieval_dataset(
@@ -41,9 +42,4 @@ class TheoremQADatasetSample(TypedDict):
 class TheoremQADataset(Dataset[TheoremQADatasetSample]):
     @override
     def load(self, name_or_path: str, **kwargs) -> HFDatasetDict:
-        dataset = load_dataset(name_or_path, **kwargs)
-        dataset = ensure_dataset_dict(dataset)
-        for split_name, split in dataset.items():
-            if "Picture" in split.column_names:
-                dataset[split_name] = split.remove_columns("Picture")
-        return dataset
+        return ensure_dataset_dict(load_dataset(name_or_path, **kwargs))

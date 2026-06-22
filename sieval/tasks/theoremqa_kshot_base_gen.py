@@ -435,7 +435,9 @@ def _normalize_k(k: int | None) -> int:
 class TheoremQAKShotBaseGenTask(
     Task[TheoremQADatasetSample, str, ModelOutput, str, Feedback, dict[str, float]]
 ):
-    def __init__(self, dataset, model, name: str | None = None, k: int | None = None):
+    def __init__(
+        self, dataset, model, name: str | None = None, *, k: int | None = None
+    ):
         super().__init__(dataset=dataset, model=model, name=name)
         self._k = _normalize_k(k)
         self._prompt_no_input: str | None = None
