@@ -1,5 +1,21 @@
 """HumanEval zero-shot base-model generative task.
 
+Reproduces the lm-evaluation-harness ``humaneval.yaml`` for base completion
+models, scored with pass@k via the SiEval code-eval API.
+
+Decoding follows the harness defaults and is configured on the model, not
+injected by this task: greedy sampling (``temperature=0``, ``top_p=1``) and
+``max_gen_toks=1024``. Set these through the model ``args`` or per-task
+``infer_args`` in the run config. The task owns only the prompt-coupled
+``stop`` sequences and ``n`` (the pass@k sampling count).
+
+HumanEval has no single canonical Qwen2.5-72B-Base score: references span
+roughly six points — DeepSeek-V3 Table 3 reports 53.0, while the Qwen2.5
+technical report self-reports 59.1 (with no published eval config). Because
+this task reproduces lm-eval-harness rather than Qwen's own setup, its score
+is expected to land between those references rather than match the Qwen
+self-report; the full 164-item run scores 56.1 (92/164, fails=0).
+
 AI-Generated Code - GPT-5.5-Codex (OpenAI)
 """
 
@@ -53,7 +69,12 @@ STOP_SEQUENCES = ("\nclass", "\ndef", "\n#", "\nif", "\nprint")
             "Aligned with lm-evaluation-harness humaneval.yaml prompt, stop "
             "sequences, max_gen_toks, zero-shot setting, repeats=1, and raw "
             "completion filtering; code execution is handled by the SiEval "
-            "code-eval API."
+            "code-eval API. No single canonical Qwen2.5-72B-Base target "
+            "exists: DeepSeek-V3 Table 3 reports 53.0 and the Qwen2.5 "
+            "technical report self-reports 59.1 (no published eval config). "
+            "This task reproduces lm-eval-harness, so its score is expected "
+            "to land between those references rather than match Qwen's "
+            "self-report."
         ),
     ),
 )
@@ -74,7 +95,6 @@ class HumanEvalZeroShotBaseGenTask(
         name: str | None = None,
         k: int = 1,
         n: int = 1,
-        max_tokens: int = 1024,
         max_concurrency: int = 4,
         timeout: float = 5.0,
         stop: tuple[str, ...] = STOP_SEQUENCES,
@@ -82,7 +102,6 @@ class HumanEvalZeroShotBaseGenTask(
         super().__init__(dataset=dataset, model=model, name=name)
         self._k = k
         self._n = n
-        self._max_tokens = max_tokens
         self._max_concurrency = max_concurrency
         self._timeout = timeout
         self._stop = stop
@@ -99,10 +118,13 @@ class HumanEvalZeroShotBaseGenTask(
 
     @override
     async def infer(self, pre, ctx):
+        # Decoding params (temperature, top_p, max_tokens) come from the
+        # model's configured args / per-task infer_args, not this task. Only
+        # the prompt-coupled stop sequences and the pass@k sample count live
+        # here.
         return await self.model.agenerate(
             pre,
             n=self._n,
-            max_tokens=self._max_tokens,
             stop=list(self._stop),
         )
 
