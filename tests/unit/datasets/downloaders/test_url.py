@@ -116,6 +116,25 @@ def test_download_rejects_truncated_stream(tmp_path):
     assert not (tmp_path / "foo" / "foo.csv.partial").exists()
 
 
+def test_download_skips_length_check_for_compressed_transport(tmp_path):
+    """Content-Length is encoded size when transport compression is enabled,
+    but httpx.iter_bytes() yields decoded bytes."""
+    h = URLHandler()
+    with patch("sieval.datasets.downloaders.url.httpx.stream") as mock_stream:
+        mock_resp = MagicMock()
+        mock_resp.iter_bytes.return_value = [b"decoded-body"]
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.headers = {"content-length": "4", "content-encoding": "gzip"}
+        mock_stream.return_value.__enter__.return_value = mock_resp
+        h.download(
+            "url:https://example.com/foo.csv",
+            dest_root=tmp_path,
+            dataset_name="foo",
+            force=False,
+        )
+    assert (tmp_path / "foo" / "foo.csv").read_bytes() == b"decoded-body"
+
+
 def test_download_accepts_missing_content_length(tmp_path):
     """Chunked transfer-encoded responses often omit Content-Length. The
     truncation check must degrade gracefully rather than reject every
