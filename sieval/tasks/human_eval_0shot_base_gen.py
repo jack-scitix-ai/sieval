@@ -14,7 +14,7 @@ roughly six points — DeepSeek-V3 Table 3 reports 53.0, while the Qwen2.5
 technical report self-reports 59.1 (with no published eval config). Because
 this task reproduces lm-eval-harness rather than Qwen's own setup, its score
 is expected to land between those references rather than match the Qwen
-self-report; the full 164-item run scores 56.1 (92/164, fails=0).
+self-report.
 
 AI-Generated Code - GPT-5.5-Codex (OpenAI)
 """

@@ -11,7 +11,10 @@ from sieval.core.models import ModelOutput
 from sieval.core.models.gen_model import GenModel
 from sieval.core.tasks import TaskContext
 from sieval.datasets.human_eval import HumanEvalDataset, HumanEvalDatasetSample
-from sieval.tasks.human_eval_0shot_base_gen import HumanEvalZeroShotBaseGenTask
+from sieval.tasks.human_eval_0shot_base_gen import (
+    STOP_SEQUENCES,
+    HumanEvalZeroShotBaseGenTask,
+)
 
 
 class _CapturingGenModel(GenModel):
@@ -56,6 +59,10 @@ def _task(
     )
     model = _CapturingGenModel()
     return HumanEvalZeroShotBaseGenTask(dataset, model, **kwargs), model, dataset
+
+
+def test_default_stop_matches_lm_eval_harness():
+    assert STOP_SEQUENCES == ("\nclass", "\ndef", "\n#", "\nif", "\nprint")
 
 
 @pytest.mark.anyio
