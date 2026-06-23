@@ -19,6 +19,9 @@ from .gsm8k_kshot_base_gen import (
 from .human_eval_0shot_gen import (
     HumanEvalZeroShotGenTask,
 )
+from .ifbench_0shot_gen import (
+    IFBenchZeroShotGenTask,
+)
 from .ifeval_0shot_gen import (
     IFEvalZeroShotGenTask,
 )
@@ -45,6 +48,7 @@ __all__ = [
     "GPQADiamondZeroShotGenTask",
     "GSM8KFewShotBaseGenTask",
     "HumanEvalZeroShotGenTask",
+    "IFBenchZeroShotGenTask",
     "IFEvalZeroShotGenTask",
     "LiveCodeBenchCodeGenerationZeroShotGenTask",
     "MATH500ZeroShotGenTask",
