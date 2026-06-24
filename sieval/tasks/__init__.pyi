@@ -7,6 +7,9 @@ from .aime_2024_0shot_gen import (
 from .aime_2025_0shot_gen import (
     AIME2025ZeroShotGenTask,
 )
+from .c_eval_kshot_ppl import (
+    CEvalFewShotPPLTask,
+)
 from .drop_kshot_gen import (
     DROPFewShotGenTask,
 )
@@ -41,6 +44,7 @@ from .t_eval_before_calling_0shot_gen import (
 __all__ = [
     "AIME2024ZeroShotGenTask",
     "AIME2025ZeroShotGenTask",
+    "CEvalFewShotPPLTask",
     "DROPFewShotGenTask",
     "GPQADiamondZeroShotGenTask",
     "GSM8KFewShotBaseGenTask",
