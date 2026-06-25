@@ -34,14 +34,8 @@ class URLHandler:
         try:
             with httpx.stream("GET", url, timeout=_TIMEOUT, follow_redirects=True) as r:
                 r.raise_for_status()
-                # Catches 2xx identity responses that dropped the connection
-                # mid-stream. For compressed transport, Content-Length is the
-                # encoded byte count while iter_bytes() yields decoded bytes.
-                expected = (
-                    None
-                    if _has_compressed_content(r.headers)
-                    else _parse_content_length(r.headers.get("content-length"))
-                )
+                # Catches 2xx responses that dropped the connection mid-stream.
+                expected = _parse_content_length(r.headers.get("content-length"))
                 written = 0
                 with tmp.open("wb") as f:
                     for chunk in r.iter_bytes(chunk_size=1 << 16):
@@ -93,10 +87,3 @@ def _parse_content_length(raw: str | None) -> int | None:
         return int(raw.strip())
     except ValueError:
         return None
-
-
-def _has_compressed_content(headers: httpx.Headers | dict[str, str]) -> bool:
-    encoding = headers.get("content-encoding")
-    if encoding is None:
-        return False
-    return encoding.strip().lower() not in {"", "identity"}
