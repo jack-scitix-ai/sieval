@@ -29,16 +29,12 @@ AI-Generated Code - Claude Opus 4.8 (Anthropic)
 """
 
 from collections import defaultdict
-from collections.abc import Sequence
-from typing import Any, TypedDict, override
+from typing import TypedDict, override
 
-from sieval.core.datasets import Dataset
-from sieval.core.models import Model
 from sieval.core.tasks import (
     EvalMode,
     ReferenceImpl,
     Task,
-    TaskContext,
     TaskStageOutput,
     sieval_task,
 )
@@ -91,8 +87,8 @@ class CEvalFewShotPPLTask(
 
     def __init__(
         self,
-        dataset: Dataset[CEvalDatasetSample],
-        model: Model[Any],
+        dataset,
+        model,
         name: str | None = None,
         *,
         k: int = 5,
@@ -167,17 +163,11 @@ class CEvalFewShotPPLTask(
         return few_shot + question + (option_label or "")
 
     @override
-    async def preprocess(
-        self,
-        raw: CEvalDatasetSample,
-        ctx: TaskContext[Any, Any, Any, Any, Any],
-    ) -> CEvalDatasetSample:
+    async def preprocess(self, raw, ctx):
         return raw
 
     @override
-    async def infer(
-        self, pre: CEvalDatasetSample, ctx: TaskContext[Any, Any, Any, Any, Any]
-    ) -> TaskStageOutput[dict[str, float]]:
+    async def infer(self, pre, ctx):
         """Score each option letter by its conditional next-token logprob."""
         scores: dict[str, float] = {}
         model_outputs = []
@@ -198,23 +188,15 @@ class CEvalFewShotPPLTask(
         return TaskStageOutput(value=scores, meta=build_stage_meta(*model_outputs))
 
     @override
-    async def postprocess(
-        self,
-        inf: TaskStageOutput[dict[str, float]],
-        ctx: TaskContext[Any, Any, Any, Any, Any],
-    ) -> str:
+    async def postprocess(self, inf, ctx):
         """Select the option with the highest log-probability."""
         if not inf.value:
             return ""
         return max(inf.value.items(), key=lambda item: item[1])[0]
 
     @override
-    async def feedback(
-        self, post: str, ctx: TaskContext[CEvalDatasetSample, Any, Any, Any, Any]
-    ) -> tuple[bool, Feedback]:
+    async def feedback(self, post, ctx):
         raw = ctx.raw_sample
-        if raw is None:
-            return True, {"correct": False, "pred": post, "answer": "", "subject": ""}
         answer = raw["answer"]
         return True, {
             "correct": post == answer,
@@ -224,9 +206,7 @@ class CEvalFewShotPPLTask(
         }
 
     @override
-    async def report(
-        self, finals: Sequence[Any], fails: Sequence[Any]
-    ) -> dict[str, float]:
+    async def report(self, finals, fails):
         # score == macro-average: the mean of per-subject accuracy (the C-Eval
         # paper's "average over all subjects"). Failures are reported separately.
         by_subject: dict[str, list[bool]] = defaultdict(list)
