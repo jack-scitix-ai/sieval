@@ -7,6 +7,7 @@ AI-Generated Code - GPT-5 (OpenAI)
 from typing import NotRequired, TypedDict, override
 
 from datasets import DatasetDict as HFDatasetDict
+from datasets import Image as HFImage
 from datasets import load_dataset
 
 from sieval.core.datasets import (
@@ -42,4 +43,19 @@ class TheoremQADatasetSample(TypedDict):
 class TheoremQADataset(Dataset[TheoremQADatasetSample]):
     @override
     def load(self, name_or_path: str, **kwargs) -> HFDatasetDict:
-        return ensure_dataset_dict(load_dataset(name_or_path, **kwargs))
+        # Mirror the source as-is, but disable eager image decoding. ``Picture``
+        # is an HF ``Image`` feature (``decode=True`` by default); materializing
+        # the 53/800 picture rows would decode them into PIL objects and require
+        # Pillow, which ``datasets`` only ships under its ``vision`` extra and is
+        # outside ``sieval[math]``. This task is text-only and never reads
+        # ``Picture``, so we keep the column as raw bytes without pulling Pillow
+        # into the install closure. The decode default is made an explicit choice
+        # rather than left implicit.
+        dataset = ensure_dataset_dict(load_dataset(name_or_path, **kwargs))
+        for split_name, split in dataset.items():
+            picture = split.features.get("Picture")
+            if isinstance(picture, HFImage) and picture.decode:
+                dataset[split_name] = split.cast_column(
+                    "Picture", HFImage(decode=False)
+                )
+        return dataset

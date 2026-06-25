@@ -481,8 +481,8 @@ class TheoremQAKShotBaseGenTask(
             return {
                 "score": 0.0,
                 "accuracy": 0.0,
-                "fails": float(len(fails)),
-                "empty": 0.0,
+                "fails": len(fails),
+                "empty": 0,
             }
 
         correct = sum(1 for ctx in finals if ctx.feedback_result["correct"])
@@ -491,8 +491,8 @@ class TheoremQAKShotBaseGenTask(
         return {
             "score": accuracy,
             "accuracy": accuracy,
-            "fails": float(len(fails)),
-            "empty": float(empty),
+            "fails": len(fails),
+            "empty": empty,
         }
 
     def _build_prompt_parts(self) -> tuple[str, str]:
