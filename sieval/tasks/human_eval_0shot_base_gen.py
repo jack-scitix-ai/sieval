@@ -96,7 +96,7 @@ class HumanEvalZeroShotBaseGenTask(
         k: int = 1,
         n: int = 1,
         max_concurrency: int = 4,
-        timeout: float = 5.0,
+        timeout: float = 3.0,  # official HumanEval per-exec budget (flat, single run)
         stop: tuple[str, ...] = STOP_SEQUENCES,
     ):
         super().__init__(dataset=dataset, model=model, name=name)

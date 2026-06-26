@@ -151,7 +151,9 @@ class LiveCodeBenchCodeGenerationZeroShotGenTask(
                             "outputs": outputs,
                             "fn_name": fn_name,
                         },
-                        "timeout": self._timeout,
+                        # All N cases share one sequential budget, so scale by N.
+                        # Approximates official per-case 6s within a single run.
+                        "timeout": self._timeout + len(inputs) * 2.0,
                     },
                     # allow more time for more test cases
                     # with extra buffer for network latency
