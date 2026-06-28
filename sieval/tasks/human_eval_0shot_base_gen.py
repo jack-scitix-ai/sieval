@@ -1,20 +1,31 @@
-import base64
-import json
+"""HumanEval zero-shot base-model generative task.
+
+Reproduces the lm-evaluation-harness ``humaneval.yaml`` for base completion
+models, scored with pass@k via the SiEval code-eval API.
+
+Decoding follows the harness defaults and is configured on the model, not
+injected by this task: greedy sampling (``temperature=0``, ``top_p=1``) and
+``max_gen_toks=1024``. Set these through the model ``args`` or per-task
+``infer_args`` in the run config. The task owns only the prompt-coupled
+``stop`` sequences and ``n`` (the pass@k sampling count).
+
+HumanEval has no single canonical Qwen2.5-72B-Base score: references span
+roughly six points — DeepSeek-V3 Table 3 reports 53.0, while the Qwen2.5
+technical report self-reports 59.1 (with no published eval config). Because
+this task reproduces lm-eval-harness rather than Qwen's own setup, its score
+is expected to land between those references rather than match the Qwen
+self-report.
+
+AI-Generated Code - GPT-5.5-Codex (OpenAI)
+"""
+
 import os
-import pickle
 import time
-import zlib
 from typing import TypedDict, override
 
 import httpx
 from loguru import logger
-from openai.types.chat import ChatCompletionUserMessageParam
 
-from sieval.community.livecodebench.prompts.code_generation import (
-    PromptConstants,
-    get_generic_question_template_answer,
-)
-from sieval.community.livecodebench.utils.extraction_utils import extract_code
 from sieval.core.models import ModelOutput
 from sieval.core.tasks import (
     EvalMode,
@@ -22,7 +33,7 @@ from sieval.core.tasks import (
     Task,
     sieval_task,
 )
-from sieval.datasets import LiveCodeBenchDatasetSample
+from sieval.datasets import HumanEvalDatasetSample
 
 
 class ResourceMetrics(TypedDict):
@@ -38,27 +49,39 @@ class Feedback(TypedDict):
     metrics: ResourceMetrics | None
 
 
+STOP_SEQUENCES = ("\nclass", "\ndef", "\n#", "\nif", "\nprint")
+
+
 @sieval_task(
-    name="livecodebench_code_generation_0shot_gen",
-    display_name="LiveCodeBench Code Generation (0-shot)",
-    description="LiveCodeBench — contamination-free code benchmark, generation subset.",
+    name="human_eval_0shot_base_gen",
+    display_name="HumanEval (0-shot, base generative)",
+    description="OpenAI HumanEval for base completion models evaluated with pass@k.",
     eval_mode=EvalMode.GEN,
     n_shot=0,
-    tags=("english", "python", "code-exec"),
-    model_type="chat",
+    tags=("english", "python", "code-exec", "base-model"),
+    model_type="gen",
     reference_impl=ReferenceImpl(
-        source="livecodebench",
-        url="https://github.com/LiveCodeBench/LiveCodeBench/blob/28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24/lcb_runner/prompts/code_generation.py",
+        source="lm-evaluation-harness",
+        url=(
+            "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/humaneval/humaneval.yaml"
+        ),
         notes=(
-            "Prompt templates and extract_code vendored from "
-            "lcb_runner/{prompts,utils}."
+            "Aligned with lm-evaluation-harness humaneval.yaml prompt, stop "
+            "sequences, max_gen_toks, zero-shot setting, repeats=1, and raw "
+            "completion filtering; code execution is handled by the SiEval "
+            "code-eval API. No single canonical Qwen2.5-72B-Base target "
+            "exists: DeepSeek-V3 Table 3 reports 53.0 and the Qwen2.5 "
+            "technical report self-reports 59.1 (no published eval config). "
+            "This task reproduces lm-eval-harness, so its score is expected "
+            "to land between those references rather than match Qwen's "
+            "self-report."
         ),
     ),
 )
-class LiveCodeBenchCodeGenerationZeroShotGenTask(
+class HumanEvalZeroShotBaseGenTask(
     Task[
-        LiveCodeBenchDatasetSample,
-        list[ChatCompletionUserMessageParam],
+        HumanEvalDatasetSample,
+        str,
         ModelOutput,
         list[str],
         list[Feedback],
@@ -70,17 +93,17 @@ class LiveCodeBenchCodeGenerationZeroShotGenTask(
         dataset,
         model,
         name: str | None = None,
-        cot: bool = False,
         k: int = 1,
         n: int = 1,
         max_concurrency: int = 4,
-        timeout: float = 6.0,
+        timeout: float = 3.0,  # official HumanEval per-exec budget (flat, single run)
+        stop: tuple[str, ...] = STOP_SEQUENCES,
     ):
         super().__init__(dataset=dataset, model=model, name=name)
-        self._cot = cot
         self._k = k
         self._n = n
         self._timeout = timeout
+        self._stop = stop
         self._code_eval_api = os.getenv(
             "SIEVAL_CODE_EVAL_API", "http://localhost:11451/evaluations"
         )
@@ -90,78 +113,53 @@ class LiveCodeBenchCodeGenerationZeroShotGenTask(
 
     @override
     async def preprocess(self, raw, ctx):
-        question = {
-            "question_content": raw["question_content"],
-            "starter_code": raw["starter_code"],
-        }
-        prompt = get_generic_question_template_answer(question, self._cot)
-        return [
-            {"role": "system", "content": PromptConstants.SYSTEM_MESSAGE_GENERIC},
-            {"role": "user", "content": prompt},
-        ]
+        return raw["prompt"]
 
     @override
     async def infer(self, pre, ctx):
-        return await self.model.agenerate(pre, n=self._n)
+        # Decoding params (temperature, top_p, max_tokens) come from the
+        # model's configured args / per-task infer_args, not this task. Only
+        # the prompt-coupled stop sequences and the pass@k sample count live
+        # here.
+        return await self.model.agenerate(
+            pre,
+            n=self._n,
+            stop=list(self._stop),
+        )
 
     @override
     async def postprocess(self, inf, ctx):
-        res: list[str] = []
-        for choice in inf.texts:
-            code = extract_code(choice)
-            res.append(code)
-        return res
+        return list(inf.texts)
 
     @override
     async def feedback(self, post, ctx):
-        public_test_cases = json.loads(ctx.raw_sample["public_test_cases"])
-        private_test_cases = ctx.raw_sample["private_test_cases"]
-        try:
-            private_test_cases = json.loads(ctx.raw_sample["private_test_cases"])
-        except Exception:
-            private_test_cases = json.loads(
-                pickle.loads(
-                    zlib.decompress(
-                        base64.b64decode(private_test_cases.encode("utf-8"))
-                    )
-                )
-            )
-        metadata = json.loads(ctx.raw_sample["metadata"])
-
         feedbacks = [
             {"correct": False, "msg": "Not evaluated", "metrics": None}
             for _ in range(len(post))
         ]
 
-        cases = public_test_cases + private_test_cases
-        inputs = [t["input"] for t in cases]
-        outputs = [t["output"] for t in cases]
-        fn_name = metadata.get("func_name", None)
-
         for idx, pred in enumerate(post):
+            check_program = (
+                ctx.raw_sample["prompt"]
+                + pred
+                + "\n"
+                + ctx.raw_sample["test"]
+                + "\n"
+                + f"check({ctx.raw_sample['entry_point']})"
+            )
             try:
                 resp = await self._http_client.post(
                     self._code_eval_api,
                     json={
                         "uuid": f"{idx}-{time.perf_counter_ns()}",
-                        "source": "livecodebench",
-                        "code": pred,
-                        "test": {
-                            "inputs": inputs,
-                            "outputs": outputs,
-                            "fn_name": fn_name,
-                        },
-                        # All N cases share one sequential budget, so scale by N.
-                        # Approximates official per-case 6s within a single run.
-                        "timeout": self._timeout + len(inputs) * 2.0,
+                        "source": "human-eval",
+                        "code": check_program,
+                        "timeout": self._timeout,
                     },
-                    # allow more time for more test cases
-                    # with extra buffer for network latency
-                    timeout=self._timeout + len(inputs) * 2 + 2,
+                    timeout=self._timeout + 2,
                 )
                 resp.raise_for_status()
                 res = resp.json()
-                # should raise error if no `status` & `msg` field
                 feedbacks[idx] = {
                     "correct": res["status"],
                     "msg": res["msg"],
@@ -216,8 +214,6 @@ class LiveCodeBenchCodeGenerationZeroShotGenTask(
             return 0.0
         if c == 0:
             return 0.0
-        # Formula: 1 - product_{i=0}^{k-1} (n - c - i) / (n - i)
-        # This calculates the probability that all k samples are wrong
         prob_all_wrong = 1.0
         for i in range(k):
             prob_all_wrong *= (n - c - i) / (n - i)
