@@ -49,6 +49,10 @@ from .mmlu_pro import (
     MMLUProDataset,
     MMLUProDatasetSample,
 )
+from .openbookqa import (
+    OpenBookQADataset,
+    OpenBookQADatasetSample,
+)
 from .t_eval import (
     TEvalBeforeCallingDataset,
     TEvalBeforeCallingDatasetSample,
@@ -83,6 +87,8 @@ __all__ = [
     "MMLUDatasetSample",
     "MMLUProDataset",
     "MMLUProDatasetSample",
+    "OpenBookQADataset",
+    "OpenBookQADatasetSample",
     "TEvalBeforeCallingDataset",
     "TEvalBeforeCallingDatasetSample",
     "TheoremQADataset",
