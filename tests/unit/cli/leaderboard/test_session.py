@@ -219,9 +219,9 @@ class TestDatasetOperations:
         "op,op_args,method_name,method_args,method_kwargs",
         [
             (
-                "select",
+                "slice",
                 {"num": 10},
-                "select",
+                "slice",
                 (10,),
                 {"split": "test"},
             ),
@@ -266,11 +266,27 @@ class TestDatasetOperations:
         with pytest.raises(ValueError, match=error_match):
             runner._apply_dataset_operations(ds, operations, "test_ds")
 
+    def test_renamed_operation_raises_migration_hint(self):
+        runner = self._make_runner()
+        ds = MagicMock()
+        with pytest.raises(ValueError, match="'select' was renamed to 'slice'"):
+            runner._apply_dataset_operations(ds, [{"select": {"num": 5}}], "test_ds")
+
+    def test_never_shipped_operation_raises_unknown_not_renamed(self):
+        # 'stratified_select' never shipped, so it must hit the generic unknown
+        # branch — no migration hint for a name users never saw.
+        runner = self._make_runner()
+        ds = MagicMock()
+        with pytest.raises(ValueError, match="Unknown operation 'stratified_select'"):
+            runner._apply_dataset_operations(
+                ds, [{"stratified_select": {"num": 5}}], "test_ds"
+            )
+
     # (op_name, missing_args, expected_error_pattern)
     @pytest.mark.parametrize(
         "op,missing_args,error_match",
         [
-            ("select", {}, "'select' requires 'num'"),
+            ("slice", {}, "'slice' requires 'num'"),
             ("repeat", {}, "'repeat' requires 'times'"),
         ],
     )
@@ -284,36 +300,142 @@ class TestDatasetOperations:
         runner = self._make_runner()
         ds = MagicMock()
         ds.shuffle.return_value = ds
-        ds.select.return_value = ds
+        ds.slice.return_value = ds
 
         _result = runner._apply_dataset_operations(
             ds,
-            [{"shuffle": {"seed": 0}}, {"select": {"num": 5}}],
+            [{"shuffle": {"seed": 0}}, {"slice": {"num": 5}}],
             "test_ds",
         )
         ds.shuffle.assert_called_once()
-        ds.select.assert_called_once()
+        ds.slice.assert_called_once()
 
     def test_operation_argument_variants(self):
         """Validate alias, custom split, and None-arg default behaviors."""
         runner = self._make_runner()
 
         ds_alias = MagicMock()
-        ds_alias.select.return_value = ds_alias
-        runner._apply_dataset_operations(ds_alias, [{"select": {"n": 7}}], "test_ds")
-        ds_alias.select.assert_called_once_with(7, split="test")
+        ds_alias.slice.return_value = ds_alias
+        runner._apply_dataset_operations(ds_alias, [{"slice": {"n": 7}}], "test_ds")
+        ds_alias.slice.assert_called_once_with(7, split="test")
 
         ds_custom_split = MagicMock()
-        ds_custom_split.select.return_value = ds_custom_split
+        ds_custom_split.slice.return_value = ds_custom_split
         runner._apply_dataset_operations(
-            ds_custom_split, [{"select": {"num": 5, "split": "train"}}], "test_ds"
+            ds_custom_split, [{"slice": {"num": 5, "split": "train"}}], "test_ds"
         )
-        ds_custom_split.select.assert_called_once_with(5, split="train")
+        ds_custom_split.slice.assert_called_once_with(5, split="train")
 
         ds_none_args = MagicMock()
         ds_none_args.shuffle.return_value = ds_none_args
         runner._apply_dataset_operations(ds_none_args, [{"shuffle": None}], "test_ds")
         ds_none_args.shuffle.assert_called_once_with(seed=0, split="test")
+
+    def test_stratified_sample_dispatch(self):
+        runner = self._make_runner()
+        ds = MagicMock()
+        ds.stratified_sample.return_value = ds
+        runner._apply_dataset_operations(
+            ds,
+            [
+                {
+                    "stratified_sample": {
+                        "by": "Subject",
+                        "num": 800,
+                        "min_per_group": 5,
+                        "seed": 42,
+                    }
+                }
+            ],
+            "test_ds",
+        )
+        ds.stratified_sample.assert_called_once_with(
+            "Subject", num=800, per_group=None, min_per_group=5, seed=42, split="test"
+        )
+
+    def test_stratified_sample_defaults(self):
+        runner = self._make_runner()
+        ds = MagicMock()
+        ds.stratified_sample.return_value = ds
+        runner._apply_dataset_operations(
+            ds, [{"stratified_sample": {"by": "category", "num": 600}}], "test_ds"
+        )
+        ds.stratified_sample.assert_called_once_with(
+            "category",
+            num=600,
+            per_group=None,
+            min_per_group=None,
+            seed=0,
+            split="test",
+        )
+
+    def test_stratified_sample_requires_by(self):
+        runner = self._make_runner()
+        ds = MagicMock()
+        with pytest.raises(ValueError, match="requires 'by'"):
+            runner._apply_dataset_operations(
+                ds, [{"stratified_sample": {"num": 5}}], "test_ds"
+            )
+        with pytest.raises(ValueError, match="requires 'by'"):
+            runner._apply_dataset_operations(ds, [{"stratified_sample": {}}], "test_ds")
+
+    def test_stratified_sample_requires_exactly_one_budget(self):
+        runner = self._make_runner()
+        ds = MagicMock()
+        with pytest.raises(ValueError, match="exactly one of 'num' or 'per_group'"):
+            runner._apply_dataset_operations(
+                ds, [{"stratified_sample": {"by": "Subject"}}], "test_ds"
+            )
+        with pytest.raises(ValueError, match="exactly one of 'num' or 'per_group'"):
+            runner._apply_dataset_operations(
+                ds,
+                [{"stratified_sample": {"by": "Subject", "num": 5, "per_group": 2}}],
+                "test_ds",
+            )
+
+    def test_stratified_sample_min_per_group_excludes_per_group(self):
+        runner = self._make_runner()
+        ds = MagicMock()
+        with pytest.raises(ValueError, match="cannot be combined with 'per_group'"):
+            runner._apply_dataset_operations(
+                ds,
+                [
+                    {
+                        "stratified_sample": {
+                            "by": "Subject",
+                            "per_group": 5,
+                            "min_per_group": 1,
+                        }
+                    }
+                ],
+                "test_ds",
+            )
+
+    def test_stratified_sample_per_group_dispatch(self):
+        runner = self._make_runner()
+        ds = MagicMock()
+        ds.stratified_sample.return_value = ds
+        runner._apply_dataset_operations(
+            ds,
+            [
+                {
+                    "stratified_sample": {
+                        "by": ["locale", "subject"],
+                        "per_group": 20,
+                        "seed": 42,
+                    }
+                }
+            ],
+            "test_ds",
+        )
+        ds.stratified_sample.assert_called_once_with(
+            ["locale", "subject"],
+            num=None,
+            per_group=20,
+            min_per_group=None,
+            seed=42,
+            split="test",
+        )
 
 
 # ===================================================================
@@ -646,7 +768,7 @@ tasks:
 
     @pytest.mark.anyio
     async def test_yaml_dataset_operations(self, tmp_path):
-        """Dataset operations (shuffle, select) should be applied from YAML."""
+        """Dataset operations (shuffle, slice) should be applied from YAML."""
         yaml_content = """\
 result_dir: "{result_dir}"
 
@@ -663,7 +785,7 @@ datasets:
     args: {{}}
     operations:
       - shuffle: {{seed: 42}}
-      - select: {{num: 2}}
+      - slice: {{num: 2}}
 
 tasks:
   ops_eval:
@@ -687,7 +809,7 @@ tasks:
         results = await task_runner.arun()
 
         assert "ops_eval" in results
-        # select num=2 should reduce dataset to 2 samples
+        # slice num=2 should reduce dataset to 2 samples
         assert results["ops_eval"]["total"] == 2
 
     @pytest.mark.anyio

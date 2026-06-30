@@ -704,7 +704,7 @@ class EvalSession:
         path: "./data/aime_2024"
         operations:
           - shuffle: {seed: 42}
-          - select: {num: 100}
+          - slice: {num: 100}
 
     tasks:
       aime_2024_eval:
@@ -1228,14 +1228,22 @@ class EvalSession:
 
             match op_name:
                 case "select":
+                    raise ValueError(
+                        f"Dataset '{dataset_name}': operation 'select' was renamed "
+                        f"to 'slice'; update your config."
+                    )
+
+                case "slice":
                     num = op_args.get("num", op_args.get("n"))
                     split = op_args.get("split", "test")
                     if num is None:
                         raise ValueError(
-                            f"Dataset '{dataset_name}': 'select' requires 'num'"
+                            f"Dataset '{dataset_name}': 'slice' requires 'num'"
                         )
-                    dataset = dataset.select(num, split=split)
-                    logger.debug("Dataset '{}': selected {} samples", dataset_name, num)
+                    dataset = dataset.slice(num, split=split)
+                    logger.debug(
+                        "Dataset '{}': sliced to first {} samples", dataset_name, num
+                    )
 
                 case "shuffle":
                     seed = op_args.get("seed", 0)
@@ -1257,10 +1265,53 @@ class EvalSession:
                     dataset = dataset.repeat(times, split=split)
                     logger.debug("Dataset '{}': repeated {} times", dataset_name, times)
 
+                case "stratified_sample":
+                    by = op_args.get("by")
+                    num = op_args.get("num", op_args.get("n"))
+                    per_group = op_args.get("per_group")
+                    min_per_group = op_args.get("min_per_group")
+                    if by is None:
+                        raise ValueError(
+                            f"Dataset '{dataset_name}': 'stratified_sample' "
+                            f"requires 'by'"
+                        )
+                    if (num is None) == (per_group is None):
+                        raise ValueError(
+                            f"Dataset '{dataset_name}': 'stratified_sample' "
+                            f"requires exactly one of 'num' or 'per_group'"
+                        )
+                    if per_group is not None and min_per_group is not None:
+                        raise ValueError(
+                            f"Dataset '{dataset_name}': 'stratified_sample' "
+                            f"'min_per_group' cannot be combined with 'per_group'"
+                        )
+                    seed = op_args.get("seed", 0)
+                    split = op_args.get("split", "test")
+                    dataset = dataset.stratified_sample(
+                        by,
+                        num=num,
+                        per_group=per_group,
+                        min_per_group=min_per_group,
+                        seed=seed,
+                        split=split,
+                    )
+                    logger.debug(
+                        "Dataset '{}': stratified-sampled by '{}' ({}, seed={})",
+                        dataset_name,
+                        by,
+                        (
+                            f"per_group={per_group}"
+                            if per_group is not None
+                            else f"num={num}, min_per_group={min_per_group}"
+                        ),
+                        seed,
+                    )
+
                 case _:
                     raise ValueError(
                         f"Dataset '{dataset_name}': Unknown operation '{op_name}'. "
-                        f"Valid operations: select, shuffle, repeat"
+                        f"Valid operations: slice, shuffle, repeat, "
+                        f"stratified_sample"
                     )
 
         return dataset
