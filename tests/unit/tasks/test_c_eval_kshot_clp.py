@@ -11,7 +11,7 @@ from sieval.core.models import ModelOutput
 from sieval.core.models.gen_model import GenModel
 from sieval.core.tasks import TaskContext, TaskStageOutput
 from sieval.datasets.c_eval import CEvalDataset, CEvalDatasetSample
-from sieval.tasks.c_eval_kshot_ppl import CEvalFewShotPPLTask
+from sieval.tasks.c_eval_kshot_clp import CEvalFewShotCLPTask
 
 
 class _ScriptedGenModel(GenModel):
@@ -63,7 +63,7 @@ def _fb(correct: bool, subject: str) -> dict:
     return {"correct": correct, "pred": "A", "answer": "A", "subject": subject}
 
 
-def _task(model: GenModel, k: int = 0) -> CEvalFewShotPPLTask:
+def _task(model: GenModel, k: int = 0) -> CEvalFewShotCLPTask:
     dataset = CEvalDataset(
         _hf_dict=HFDatasetDict(
             {
@@ -72,7 +72,7 @@ def _task(model: GenModel, k: int = 0) -> CEvalFewShotPPLTask:
             }
         )
     )
-    return CEvalFewShotPPLTask(dataset, model, k=k)
+    return CEvalFewShotCLPTask(dataset, model, k=k)
 
 
 @pytest.mark.anyio

@@ -616,11 +616,11 @@
       "status": "stable"
     },
     {
-      "name": "c_eval_kshot_ppl",
+      "name": "c_eval_kshot_clp",
       "display_name": "C-Eval (few-shot, next-token logprob)",
       "description": "C-Eval few-shot MCQ with CEval LLaMA next-token logprob scoring.",
       "dataset": "c_eval",
-      "eval_mode": "ppl",
+      "eval_mode": "clp",
       "n_shot": 5,
       "tags": [
         "chinese",
@@ -631,7 +631,7 @@
       "reference_impl": {
         "source": "ceval",
         "url": "https://raw.githubusercontent.com/hkust-nlp/ceval/cba65ae93bcf189149ced9f66ae0c958201faed9/code/evaluator_series/evaluators/llama.py",
-        "notes": "Mirrors the non-CoT LLaMA evaluator: per-subject few-shot header with the English subject key, dev exemplars, and next-token A/B/C/D logprob argmax (equivalent to softmax(logits[A,B,C,D])). Eval split is the released test set (the reference scored val); score is the macro-average over the 52 subjects."
+        "notes": "Mirrors the non-CoT LLaMA evaluator: per-subject few-shot header with the English subject key, dev exemplars, and next-token A/B/C/D logprob argmax (equivalent to softmax(logits[A,B,C,D])). Eval split is the released test set (reference scored val). Score is the macro-average over the 52 subjects (C-Eval paper Table 3), unlike lm-eval ceval-valid which micro-averages (weight_by_size)."
       },
       "status": "stable"
     },

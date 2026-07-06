@@ -13,10 +13,12 @@ Deviations from the reference:
 - The per-letter logprob comes from four ``echo=True`` completion calls (one per
   candidate) rather than one full-vocab forward pass, because the backend is an
   OpenAI-compatible completions API. Equivalent for the argmax.
-- ``evaluator_series`` reports one subject's accuracy per run and does not
-  aggregate; ``score`` here is the macro-average over the 52 subjects (mean of
-  per-subject accuracy), matching the C-Eval paper's "average accuracy over all
-  the subjects".
+- ``evaluator_series`` is per-subject and defines no cross-subject aggregation.
+  ``score`` is the macro-average over the 52 subjects, following the C-Eval
+  paper (Table 3: "average accuracy over all the subjects"; the reported 66.4
+  for GPT-4 equals the unweighted mean of the 52 per-subject accuracies). This
+  differs from lm-eval ``ceval-valid``, which micro-averages (``weight_by_size``)
+  on the val split.
 - The few-shot header uses the English subject key (e.g. ``operating_system``),
   matching ``evaluator_series/eval.py`` (``subject_name=args.subject``), not the
   Chinese-name variant used by C-Eval's other evaluator.
@@ -54,10 +56,10 @@ class Feedback(TypedDict):
 
 
 @sieval_task(
-    name="c_eval_kshot_ppl",
+    name="c_eval_kshot_clp",
     display_name="C-Eval (few-shot, next-token logprob)",
     description="C-Eval few-shot MCQ with CEval LLaMA next-token logprob scoring.",
-    eval_mode=EvalMode.PPL,
+    eval_mode=EvalMode.CLP,
     n_shot=5,
     tags=("chinese", "multiple-choice"),
     model_type="gen",
@@ -68,12 +70,13 @@ class Feedback(TypedDict):
             "Mirrors the non-CoT LLaMA evaluator: per-subject few-shot header "
             "with the English subject key, dev exemplars, and next-token "
             "A/B/C/D logprob argmax (equivalent to softmax(logits[A,B,C,D])). "
-            "Eval split is the released test set (the reference scored val); "
-            "score is the macro-average over the 52 subjects."
+            "Eval split is the released test set (reference scored val). Score "
+            "is the macro-average over the 52 subjects (C-Eval paper Table 3), "
+            "unlike lm-eval ceval-valid which micro-averages (weight_by_size)."
         ),
     ),
 )
-class CEvalFewShotPPLTask(
+class CEvalFewShotCLPTask(
     Task[
         CEvalDatasetSample,
         CEvalDatasetSample,
