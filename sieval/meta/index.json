@@ -631,7 +631,7 @@
       "reference_impl": {
         "source": "ceval",
         "url": "https://raw.githubusercontent.com/hkust-nlp/ceval/cba65ae93bcf189149ced9f66ae0c958201faed9/code/evaluator_series/evaluators/llama.py",
-        "notes": "Mirrors the non-CoT LLaMA evaluator: per-subject few-shot header with the English subject key, dev exemplars, and next-token A/B/C/D logprob argmax (equivalent to softmax(logits[A,B,C,D])). Eval split is the released test set (reference scored val). Score is the macro-average over the 52 subjects (C-Eval paper Table 3), unlike lm-eval ceval-valid which micro-averages (weight_by_size)."
+        "notes": "Mirrors the non-CoT LLaMA evaluator: per-subject few-shot header with the English subject key, dev exemplars, and next-token A/B/C/D logprob argmax (equivalent to softmax(logits[A,B,C,D])). Eval split is the released test set (reference scored val). Score is the macro-average over the 52 subjects (C-Eval paper Table 3), unlike lm-eval ceval-valid which micro-averages (weight_by_size). Comparison target: DeepSeek-V3 Table 3, C-Eval 5-shot 89.2 (Qwen2.5-72B-Base)."
       },
       "status": "stable"
     },

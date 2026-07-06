@@ -72,7 +72,9 @@ class Feedback(TypedDict):
             "A/B/C/D logprob argmax (equivalent to softmax(logits[A,B,C,D])). "
             "Eval split is the released test set (reference scored val). Score "
             "is the macro-average over the 52 subjects (C-Eval paper Table 3), "
-            "unlike lm-eval ceval-valid which micro-averages (weight_by_size)."
+            "unlike lm-eval ceval-valid which micro-averages (weight_by_size). "
+            "Comparison target: DeepSeek-V3 Table 3, C-Eval 5-shot 89.2 "
+            "(Qwen2.5-72B-Base)."
         ),
     ),
 )
@@ -129,7 +131,13 @@ class CEvalFewShotCLPTask(
     def _select_examples(self, subject: str) -> list[CEvalDatasetSample]:
         """First k same-subject dev exemplars, in dataset order (matches upstream)."""
         self._ensure_few_shot_pool()
-        return list(self._few_shot_by_subject.get(subject, []))[: self._k]
+        examples = self._few_shot_by_subject.get(subject, [])
+        if len(examples) < self._k:
+            raise ValueError(
+                f"C-Eval subject {subject!r} has {len(examples)} dev exemplars; "
+                f"need k={self._k}."
+            )
+        return list(examples)[: self._k]
 
     def _format_example(
         self, sample: CEvalDatasetSample, *, include_answer: bool = True
@@ -215,8 +223,7 @@ class CEvalFewShotCLPTask(
         by_subject: dict[str, list[bool]] = defaultdict(list)
         for ctx in finals:
             fb = ctx.feedback_result
-            if fb is not None:
-                by_subject[fb["subject"]].append(fb["correct"])
+            by_subject[fb["subject"]].append(fb["correct"])
         if not by_subject:
             return {"score": 0.0, "fails": len(fails), "macro_accuracy": 0.0}
         per_subject_acc = [sum(c) / len(c) for c in by_subject.values()]
