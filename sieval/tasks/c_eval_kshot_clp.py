@@ -12,7 +12,11 @@ Deviations from the reference:
   scored ``val``. Selectable via the dataset's ``eval_split``.
 - The per-letter logprob comes from four ``echo=True`` completion calls (one per
   candidate) rather than one full-vocab forward pass, because the backend is an
-  OpenAI-compatible completions API. Equivalent for the argmax.
+  OpenAI-compatible completions API. Equivalent for the argmax. This diverges
+  from the CMMLU sibling's single ``top_logprobs`` call: ``echo`` is
+  top-k-independent (no ``--max-logprobs`` tuning, hence 0 fails) at the cost of
+  4x requests, whereas ``top_logprobs`` is 1x but needs a large top-k to keep
+  all of A/B/C/D in range.
 - ``evaluator_series`` is per-subject and defines no cross-subject aggregation.
   ``score`` is the macro-average over the 52 subjects, following the C-Eval
   paper (Table 3: "average accuracy over all the subjects"; the reported 66.4
@@ -122,7 +126,10 @@ class CEvalFewShotCLPTask(
             return
         dataset_dict = self.dataset.dataset_dict
         if _FEWSHOT_SPLIT not in dataset_dict:
-            return
+            raise ValueError(
+                "C-Eval few-shot task requires a "
+                f"{_FEWSHOT_SPLIT!r} split for few-shot examples."
+            )
         # retrieve_samples() selects across a whole split and cannot express
         # C-Eval's same-subject, fixed-order few-shot, so group dev by subject.
         for sample in dataset_dict[_FEWSHOT_SPLIT]:
@@ -200,10 +207,21 @@ class CEvalFewShotCLPTask(
 
     @override
     async def postprocess(self, inf, ctx):
-        """Select the option with the highest log-probability."""
-        if not inf.value:
-            return ""
-        return max(inf.value.items(), key=lambda item: item[1])[0]
+        """Select the option with the highest log-probability.
+
+        Requires all four option tokens to be scored; a ``-inf`` (missing from
+        the echoed logprobs) fails the sample loudly rather than silently
+        defaulting to ``max()``'s first key.
+        """
+        scores = inf.value
+        missing = [c for c in CHOICES if scores.get(c, float("-inf")) == float("-inf")]
+        if missing:
+            raise RuntimeError(
+                f"C-Eval missing option-token logprob(s) {missing} from echo "
+                f"scoring (logprobs={self._logprobs}); check the model returns "
+                "prompt logprobs with echo=True."
+            )
+        return max(scores.items(), key=lambda item: item[1])[0]
 
     @override
     async def feedback(self, post, ctx):

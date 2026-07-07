@@ -125,6 +125,33 @@ async def test_report_is_macro_average_over_subjects():
 
 
 @pytest.mark.anyio
+async def test_postprocess_raises_on_missing_option_token():
+    # A letter whose logprob was never found comes back -inf; postprocess must
+    # fail loudly rather than silently returning max()'s first key ("A").
+    model = _ScriptedGenModel({"A": -0.1, "B": -1.0, "C": -1.0, "D": -1.0})
+    task = _task(model)
+    ctx = TaskContext(sample_id=0, raw_sample=_sample("law", "A"))
+    boxed = TaskStageOutput(
+        value={"A": float("-inf"), "B": -1.0, "C": -1.0, "D": float("-inf")}
+    )
+    with pytest.raises(RuntimeError, match=r"missing option-token logprob"):
+        await task.postprocess(boxed, ctx)
+
+
+@pytest.mark.anyio
+async def test_setup_raises_when_dev_split_absent():
+    # No `dev` split + k>0 must fail early at setup, like the CMMLU sibling.
+    dataset = CEvalDataset(
+        _hf_dict=HFDatasetDict(
+            {"test": HFDataset.from_list([dict(_sample("law", "A"))])}
+        )
+    )
+    task = CEvalFewShotCLPTask(dataset, _ScriptedGenModel({"A": 0.0}), k=5)
+    with pytest.raises(ValueError, match=r"requires a 'dev' split"):
+        await task.setup()
+
+
+@pytest.mark.anyio
 async def test_prompt_format_matches_upstream_byte_for_byte():
     # Pins the upstream evaluator_series prompt: subject header, "\nX. opt"
     # options, "\n答案：", "\n\n" exemplar separators, English subject key.
