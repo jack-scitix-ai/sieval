@@ -64,6 +64,9 @@ from .mbpp_kshot_base_gen import (
 from .mmlu_0shot_gen import (
     MMLUZeroShotGenTask,
 )
+from .mmlu_kshot_clp import (
+    MMLUFewShotCLPTask,
+)
 from .mmlu_pro_0shot_gen import (
     MMLUProZeroShotGenTask,
 )
@@ -101,6 +104,7 @@ __all__ = [
     "LiveCodeBenchCodeGenerationZeroShotGenTask",
     "MATH500ZeroShotGenTask",
     "MBPPFewShotBaseGenTask",
+    "MMLUFewShotCLPTask",
     "MMLUProZeroShotGenTask",
     "MMLUZeroShotGenTask",
     "MMMLUKShotClpTask",

@@ -59,12 +59,13 @@ class MMLUZeroShotGenTask(
 ):
     @override
     async def preprocess(self, raw, ctx):
+        choices = raw["choices"]
         data = {
-            "Question": raw["Question"],
-            "A": raw["A"],
-            "B": raw["B"],
-            "C": raw["C"],
-            "D": raw["D"],
+            "Question": raw["question"],
+            "A": choices[0],
+            "B": choices[1],
+            "C": choices[2],
+            "D": choices[3],
         }
         return [
             {"role": "user", "content": QUERY_TEMPLATE_MULTICHOICE.format(**data)},
@@ -88,8 +89,8 @@ class MMLUZeroShotGenTask(
 
     @override
     async def feedback(self, post, ctx):
-        answer = ctx.raw_sample["Answer"]
-        subject = ctx.raw_sample.get("Subject", "unknown")
+        answer = "ABCD"[ctx.raw_sample["answer"]]
+        subject = ctx.raw_sample.get("subject", "unknown")
         category = subject2category.get(subject, "other")
         return True, {
             "correct": post == answer,
@@ -110,7 +111,16 @@ class MMLUZeroShotGenTask(
                 category_metrics[category]["correct"] += 1
             category_metrics[category]["total"] += 1
 
-        score = 100 * correct_num / len(finals) if finals else 0.0
+        # Pipeline failures are scored wrong and kept in the denominator
+        # (full-set accuracy, aligned with the gsm8k_0shot_gen family): bucket
+        # each by its subject's category, incrementing total but never correct.
+        for ctx in fails:
+            subject = ctx.raw_sample.get("subject", "unknown")
+            category = subject2category.get(subject, "other")
+            category_metrics[category]["total"] += 1
+
+        total = len(finals) + len(fails)
+        score = 100 * correct_num / total if total else 0.0
         results = {"score": score}
         for category, metrics in category_metrics.items():
             category_score = (

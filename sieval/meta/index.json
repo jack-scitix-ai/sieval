@@ -383,7 +383,7 @@
       "display_name": "MMLU",
       "description": "Massive Multitask Language Understanding — 57 academic subjects, MCQ.",
       "source": [
-        "url:https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        "hf:cais/mmlu@c30699e8356da336a370243923dbaf21066bb9fe"
       ],
       "categories": [
         {
@@ -397,9 +397,7 @@
       ],
       "deps_group": null,
       "license": "MIT",
-      "checksums": {
-        "mmlu.csv": "sha256:15b6785d49e0012602e089558a7a0dfb916baf97e9295aa25b48062f13c6afbb"
-      }
+      "checksums": {}
     },
     {
       "name": "mmlu_pro",
@@ -946,6 +944,27 @@
         "source": "simple-evals",
         "url": "https://github.com/openai/simple-evals/blob/ee3b0318d8d1d9d72755a4120879be65f7c07e9e/mmlu_eval.py",
         "notes": "0-shot generative MMLU with letter extraction; aligned with simple-evals."
+      },
+      "status": "stable"
+    },
+    {
+      "name": "mmlu_kshot_clp",
+      "display_name": "MMLU (few-shot, base clp)",
+      "description": "MMLU few-shot MCQ, base-model next-token A/B/C/D logprob scoring.",
+      "dataset": "mmlu",
+      "eval_mode": "clp",
+      "n_shot": 5,
+      "tags": [
+        "english",
+        "multiple-choice",
+        "base-model"
+      ],
+      "deps_group": null,
+      "model_type": "gen",
+      "reference_impl": {
+        "source": "hendrycks/test",
+        "url": "https://github.com/hendrycks/test/blob/4450500f923c49f1fb1dd3d99108a0bd9717b660/evaluate_flan.py",
+        "notes": "Next-token A/B/C/D scoring via one alogprobs(echo=False) call, argmax over the option tokens in top_logprobs; equivalent to the reference softmax over the restricted letter logits (OpenCompass clp). Few-shot = first k dev examples per subject in dataset order. Requires all of A/B/C/D in the top-k and fails the sample otherwise (default logprobs=100; vLLM needs --max-logprobs 100, default 20; SGLang serves 100). Full-set micro-average score (pipeline failures scored wrong, kept in the denominator) + per-category via subject2category, matching evaluate_flan weighted_acc and the sibling mmlu_0shot_gen / gsm8k_0shot_gen family. No client-side 2048-token truncation."
       },
       "status": "stable"
     },

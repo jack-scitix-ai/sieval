@@ -414,10 +414,10 @@ def detect_empty_infer_gen(ctx: TaskContext) -> set[int]:
 
 
 @sieval_detection_rule(
-    description="Inference result is empty for perplexity tasks (logprobs=[])",
+    description="Inference result is empty for logprob tasks (logprobs=[])",
     category="output_quality",
     rationale=("Empty logprobs indicate API failures or unsupported model features."),
-    applies_to=["ppl"],
+    applies_to=["ppl", "clp"],
     tags=["perplexity", "api_failure", "empty_output"],
 )
 def detect_empty_infer_ppl(ctx: TaskContext) -> set[int]:
@@ -426,14 +426,21 @@ def detect_empty_infer_ppl(ctx: TaskContext) -> set[int]:
     result = _unwrap_result(ctx.infer_result)
     if not isinstance(result, ModelOutput):
         return set()
-    # For PPL tasks, we need both logprobs and logprobs_tokens
+    # ppl reads logprobs/logprobs_tokens; clp reads top_logprobs. Flag whichever
+    # field the task populated when it comes back empty.
     has_logprobs = result.logprobs is not None
     has_logprobs_tokens = result.logprobs_tokens is not None
-    if has_logprobs or has_logprobs_tokens:
+    has_top_logprobs = result.top_logprobs is not None
+    if has_logprobs or has_logprobs_tokens or has_top_logprobs:
         logprobs_empty = has_logprobs and not result.logprobs
         logprobs_tokens_empty = has_logprobs_tokens and not result.logprobs_tokens
-        # Report index 0 as sentinel if any field is empty
-        return {0} if (logprobs_empty or logprobs_tokens_empty) else set()
+        top_logprobs_empty = has_top_logprobs and not result.top_logprobs
+        # Report index 0 as sentinel if any populated field is empty
+        return (
+            {0}
+            if (logprobs_empty or logprobs_tokens_empty or top_logprobs_empty)
+            else set()
+        )
     return set()
 
 

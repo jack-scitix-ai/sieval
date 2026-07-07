@@ -99,6 +99,25 @@ class TestDetectEmptyInferPpl:
             ctx = _make_final_ctx(infer_result=infer_result)
             assert detect_empty_infer_ppl(ctx) == expected, case_name
 
+    def test_top_logprobs_variants(self, sample_model_meta):
+        """clp tasks populate top_logprobs; an empty list is flagged."""
+
+        def _make_output(top_logprobs):
+            return ModelOutput(
+                model=sample_model_meta,
+                texts=["x"],
+                top_logprobs=top_logprobs,
+            )
+
+        cases = [
+            (_make_output([]), {0}, "empty_top_logprobs"),
+            (_make_output([{"A": -0.1}]), set(), "non_empty_top_logprobs"),
+            (_make_output(None), set(), "no_top_logprobs"),
+        ]
+        for infer_result, expected, case_name in cases:
+            ctx = _make_final_ctx(infer_result=infer_result)
+            assert detect_empty_infer_ppl(ctx) == expected, case_name
+
 
 class TestDetectTruncatedOutput:
     def test_single_sample(self, sample_model_meta):
