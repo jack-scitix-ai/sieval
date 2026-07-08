@@ -65,6 +65,50 @@
       "checksums": {}
     },
     {
+      "name": "arc_challenge",
+      "display_name": "ARC-Challenge",
+      "description": "ARC-Challenge science MCQ split from AI2 ARC, normalized for evaluation.",
+      "source": [
+        "hf:allenai/ai2_arc@210d026faf9955653af8916fad021475a3f00453"
+      ],
+      "categories": [
+        {
+          "level1": "Knowledge",
+          "level2": "STEM"
+        }
+      ],
+      "tags": [
+        "english",
+        "science",
+        "multiple-choice"
+      ],
+      "deps_group": null,
+      "license": "cc-by-sa-4.0",
+      "checksums": {}
+    },
+    {
+      "name": "arc_easy",
+      "display_name": "ARC-Easy",
+      "description": "ARC-Easy science MCQ split from AI2 ARC, normalized for evaluation.",
+      "source": [
+        "hf:allenai/ai2_arc@210d026faf9955653af8916fad021475a3f00453"
+      ],
+      "categories": [
+        {
+          "level1": "Knowledge",
+          "level2": "STEM"
+        }
+      ],
+      "tags": [
+        "english",
+        "science",
+        "multiple-choice"
+      ],
+      "deps_group": null,
+      "license": "cc-by-sa-4.0",
+      "checksums": {}
+    },
+    {
       "name": "c_eval",
       "display_name": "C-Eval",
       "description": "C-Eval — Chinese multi-domain exam benchmark with 52 subjects.",
@@ -612,6 +656,94 @@
         "source": "matharena",
         "url": "https://github.com/eth-sri/matharena/blob/a11194deff8c67a232974a383795e8a2776b4c6f/configs/competitions/aime/aime_2026.yaml",
         "notes": "MathArena-aligned: boxed prompt + 0-999 integer hint, last-boxed extraction; equivalence via math-verify."
+      },
+      "status": "stable"
+    },
+    {
+      "name": "arc_challenge_kshot_clp",
+      "display_name": "ARC-Challenge (few-shot, conditional log-prob)",
+      "description": "ARC-Challenge few-shot options-format next-token letter accuracy.",
+      "dataset": "arc_challenge",
+      "eval_mode": "clp",
+      "n_shot": 25,
+      "tags": [
+        "english",
+        "science",
+        "multiple-choice",
+        "base-model"
+      ],
+      "deps_group": null,
+      "model_type": "gen",
+      "reference_impl": {
+        "source": "lm-evaluation-harness",
+        "url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/arc/arc_challenge.yaml",
+        "notes": "Shares the ARC-Challenge split/dataset/revision with lm-evaluation-harness. Uses the 'options' MCQ format (arXiv 2412.17758): options listed A/B/C/... in the prompt, answer is the option letter, scored by one-call next-token top_logprobs argmax (the clp protocol; mirrors cmmlu_kshot_base_gen). Requires all option letters in the top-k and fails the sample otherwise (default logprobs=100; SGLang serves 100, on vLLM use --max-logprobs 100). Comparison target: DeepSeek-V3 base ARC-Challenge 25-shot EM = 94.5 (DeepSeek switched separation->options after V1; the ppl sibling reproduces the separation number, e.g. the Qwen2.5 report's 72.4)."
+      },
+      "status": "stable"
+    },
+    {
+      "name": "arc_challenge_kshot_ppl",
+      "display_name": "ARC-Challenge (few-shot, perplexity)",
+      "description": "ARC-Challenge few-shot full-text unconditional-normalized accuracy.",
+      "dataset": "arc_challenge",
+      "eval_mode": "ppl",
+      "n_shot": 25,
+      "tags": [
+        "english",
+        "science",
+        "multiple-choice",
+        "base-model"
+      ],
+      "deps_group": null,
+      "model_type": "gen",
+      "reference_impl": {
+        "source": "lm-evaluation-harness",
+        "url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/arc/arc_challenge.yaml",
+        "notes": "Shares the ARC-Challenge split/dataset/revision with lm-evaluation-harness, but reproduces DeepSeek's scoring, not upstream acc/acc_norm: each option's full TEXT is scored as the continuation of 'Question: {q}\\nAnswer:' and normalized UNCONDITIONALLY (Brown et al. 2020) as logP(opt|context) - logP(opt|'Answer:'), argmax = prediction. This is the ppl protocol (one inference per option; full answer text), not the single-letter clp method. Requires the sglang server launched with --disable-radix-cache (SglangGenModel fails loud on a cache hit that truncates echoed logprobs). Comparison target: DeepSeek-V3 base ARC-Challenge 25-shot EM = 94.5 (DeepSeek-V3 report, Table 3)."
+      },
+      "status": "stable"
+    },
+    {
+      "name": "arc_easy_kshot_clp",
+      "display_name": "ARC-Easy (few-shot, conditional log-prob)",
+      "description": "ARC-Easy few-shot options-format next-token letter accuracy.",
+      "dataset": "arc_easy",
+      "eval_mode": "clp",
+      "n_shot": 25,
+      "tags": [
+        "english",
+        "science",
+        "multiple-choice",
+        "base-model"
+      ],
+      "deps_group": null,
+      "model_type": "gen",
+      "reference_impl": {
+        "source": "lm-evaluation-harness",
+        "url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/arc/arc_easy.yaml",
+        "notes": "Shares the ARC-Easy split/dataset/revision with lm-evaluation-harness. Uses the 'options' MCQ format (arXiv 2412.17758): options listed A/B/C/... in the prompt, answer is the option letter, scored by one-call next-token top_logprobs argmax (the clp protocol; mirrors cmmlu_kshot_base_gen). Requires all option letters in the top-k and fails the sample otherwise (default logprobs=100; SGLang serves 100, on vLLM use --max-logprobs 100). Comparison target: DeepSeek-V3 base ARC-Easy 25-shot EM = 98.4 (DeepSeek switched separation->options after V1; the ppl sibling reproduces the separation number)."
+      },
+      "status": "stable"
+    },
+    {
+      "name": "arc_easy_kshot_ppl",
+      "display_name": "ARC-Easy (few-shot, perplexity)",
+      "description": "ARC-Easy few-shot full-text unconditional-normalized accuracy.",
+      "dataset": "arc_easy",
+      "eval_mode": "ppl",
+      "n_shot": 25,
+      "tags": [
+        "english",
+        "science",
+        "multiple-choice",
+        "base-model"
+      ],
+      "deps_group": null,
+      "model_type": "gen",
+      "reference_impl": {
+        "source": "lm-evaluation-harness",
+        "url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/arc/arc_easy.yaml",
+        "notes": "Shares the ARC-Easy split/dataset/revision with lm-evaluation-harness, but reproduces DeepSeek's scoring, not upstream acc/acc_norm: each option's full TEXT is scored as the continuation of 'Question: {q}\\nAnswer:' and normalized UNCONDITIONALLY (Brown et al. 2020) as logP(opt|context) - logP(opt|'Answer:'), argmax = prediction. This is the ppl protocol (one inference per option; full answer text), not the single-letter clp method. Requires the sglang server launched with --disable-radix-cache (SglangGenModel fails loud on a cache hit that truncates echoed logprobs). Comparison target: DeepSeek-V3 base ARC-Easy 25-shot EM = 98.4 (DeepSeek-V3 report, Table 3)."
       },
       "status": "stable"
     },
