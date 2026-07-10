@@ -13,6 +13,10 @@ from .aime_2026 import (
     AIME2026Dataset,
     AIME2026DatasetSample,
 )
+from .c_eval import (
+    CEvalDataset,
+    CEvalDatasetSample,
+)
 from .cmmlu import (
     CMMLUDataset,
     CMMLUDatasetSample,
@@ -105,6 +109,8 @@ __all__ = [
     "AIME2025DatasetSample",
     "AIME2026Dataset",
     "AIME2026DatasetSample",
+    "CEvalDataset",
+    "CEvalDatasetSample",
     "CMMLUDataset",
     "CMMLUDatasetSample",
     "DROPDataset",
