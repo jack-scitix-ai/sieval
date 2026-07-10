@@ -177,3 +177,13 @@ async def test_setup_raises_when_dev_split_absent():
     task = CEvalFewShotCLPTask(dataset, _ScriptedGenModel({"A": 0.0}), k=5)
     with pytest.raises(ValueError, match=r"requires a 'dev' split"):
         await task.setup()
+
+
+@pytest.mark.anyio
+async def test_setup_raises_when_subject_has_too_few_dev_exemplars():
+    # `dev` has 1 "law" exemplar but k=5 → _select_examples must fail loudly
+    # rather than silently few-shot on fewer than k (matches the GSM8K
+    # sibling's early-fail; near-unreachable since C-Eval dev is 5/subject).
+    task = _task(_ScriptedGenModel({"A": 0.0}), k=5)
+    with pytest.raises(ValueError, match=r"has 1 dev exemplars; need k=5"):
+        await task.setup()
