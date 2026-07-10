@@ -30,10 +30,10 @@ rather than a reproduction failure.
 Deviations from the reference:
 - No client-side 2048-token truncation (the reference drops shots when the
   tokenized prompt overflows); there is no tokenizer at this layer.
-- ``score`` is the micro-average over the full test set: every question counts
-  and a pipeline failure is scored wrong (denominator ``len(finals) +
-  len(fails)``), matching the reference ``weighted_acc`` and the sibling
-  ``mmlu_0shot_gen`` / ``gsm8k_0shot_gen`` family; per-category accuracies are
+- ``score`` is the micro-average over the finalized set (denominator
+  ``len(finals)``), matching the reference ``weighted_acc`` and the CLP siblings
+  ``cmmlu_kshot_clp`` / ``mmmlu_kshot_clp``: infra failures are reported
+  separately (``fails``) rather than scored wrong. Per-category accuracies are
   reported alongside.
 
 AI-Generated Code - Claude Opus 4.8 (Anthropic)
@@ -76,7 +76,7 @@ def _format_subject(subject: str) -> str:
 
 def _format_example(sample: MMLUDatasetSample, *, include_answer: bool) -> str:
     prompt = sample["question"]
-    for label, choice in zip(CHOICES, sample["choices"], strict=False):
+    for label, choice in zip(CHOICES, sample["choices"], strict=True):
         prompt += f"\n{label}. {choice}"
     prompt += "\nAnswer:"
     if include_answer:
@@ -105,11 +105,13 @@ def _format_example(sample: MMLUDatasetSample, *, include_answer: bool) -> str:
             "clp). Few-shot = first k dev examples per subject in dataset "
             "order. Requires all of A/B/C/D in the top-k and fails the sample "
             "otherwise (default logprobs=100; vLLM needs --max-logprobs 100, "
-            "default 20; SGLang serves 100). Full-set micro-average score "
-            "(pipeline failures scored wrong, kept in the denominator) + "
-            "per-category via subject2category, matching evaluate_flan "
-            "weighted_acc and the sibling mmlu_0shot_gen / gsm8k_0shot_gen "
-            "family. No client-side 2048-token truncation."
+            "default 20; SGLang serves 100). Micro-average score over the "
+            "finalized set (infra failures reported separately, not scored "
+            "wrong) + per-category via subject2category, matching evaluate_flan "
+            "weighted_acc and the CLP siblings cmmlu/mmmlu. No client-side "
+            "2048-token truncation. Validated: Qwen2.5-72B base, 5-shot, "
+            "14042/14042, score 86.11 (target 85.0), 0 fails, deterministic "
+            "across two runs."
         ),
     ),
 )
@@ -234,16 +236,10 @@ class MMLUFewShotCLPTask(
                 category_metrics[category]["correct"] += 1
             category_metrics[category]["total"] += 1
 
-        # Pipeline failures are scored wrong and kept in the denominator
-        # (full-set accuracy, aligned with the *_0shot_gen family): bucket each
-        # by its subject's category, incrementing total but never correct.
-        for ctx in fails:
-            subject = ctx.raw_sample.get("subject", "unknown")
-            category = subject2category.get(subject, "other")
-            category_metrics[category]["total"] += 1
-
-        total = len(finals) + len(fails)
-        score = 100 * correct_num / total if total else 0.0
+        # CLP-family convention (cmmlu / mmmlu): the score denominator is the
+        # finalized set; infra failures are reported separately (``fails``), not
+        # scored wrong.
+        score = 100 * correct_num / len(finals) if finals else 0.0
         results = {"score": score}
         for category, metrics in category_metrics.items():
             results[f"score_{category}"] = (

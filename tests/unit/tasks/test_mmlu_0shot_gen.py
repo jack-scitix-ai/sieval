@@ -67,15 +67,15 @@ async def test_feedback_derives_letter_from_answer_index():
 
 
 @pytest.mark.anyio
-async def test_report_counts_fails_in_denominator():
-    # 1 correct final + 1 pipeline failure → 50% over the full set (1/(1+1)),
-    # not 100%. A len(finals)-only denominator would wrongly report 100.0, so
-    # this pins the failure into both the score denominator and its category.
+async def test_report_excludes_fails_from_denominator():
+    # 1 correct final + 1 pipeline failure → score 100.0 over the finalized set;
+    # the fail is reported separately (matches main's mmlu_0shot_gen). A
+    # len(finals)+len(fails) denominator would give 50.0.
     task = _task()
     report = await task.report(
         [TaskContext(sample_id=0, raw_sample=_sample(), feedback_result=_fb(True))],
         [TaskContext(sample_id=1, raw_sample=_sample("anatomy", 1))],
     )
     assert report["fails"] == 1
-    assert report["score"] == 50.0  # 1/(1+1); old len(finals) denom gives 100.0
-    assert report["score_other"] == 50.0  # anatomy → "other"; fail buckets here too
+    assert report["score"] == 100.0  # 1/1; fails excluded from the denominator
+    assert report["score_other"] == 100.0

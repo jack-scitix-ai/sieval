@@ -414,10 +414,10 @@ def detect_empty_infer_gen(ctx: TaskContext) -> set[int]:
 
 
 @sieval_detection_rule(
-    description="Inference result is empty for logprob tasks (logprobs=[])",
+    description="Inference result is empty for perplexity tasks (logprobs=[])",
     category="output_quality",
     rationale=("Empty logprobs indicate API failures or unsupported model features."),
-    applies_to=["ppl", "clp"],
+    applies_to=["ppl"],
     tags=["perplexity", "api_failure", "empty_output"],
 )
 def detect_empty_infer_ppl(ctx: TaskContext) -> set[int]:
@@ -426,21 +426,14 @@ def detect_empty_infer_ppl(ctx: TaskContext) -> set[int]:
     result = _unwrap_result(ctx.infer_result)
     if not isinstance(result, ModelOutput):
         return set()
-    # ppl reads logprobs/logprobs_tokens; clp reads top_logprobs. Flag whichever
-    # field the task populated when it comes back empty.
+    # For PPL tasks, we need both logprobs and logprobs_tokens
     has_logprobs = result.logprobs is not None
     has_logprobs_tokens = result.logprobs_tokens is not None
-    has_top_logprobs = result.top_logprobs is not None
-    if has_logprobs or has_logprobs_tokens or has_top_logprobs:
+    if has_logprobs or has_logprobs_tokens:
         logprobs_empty = has_logprobs and not result.logprobs
         logprobs_tokens_empty = has_logprobs_tokens and not result.logprobs_tokens
-        top_logprobs_empty = has_top_logprobs and not result.top_logprobs
-        # Report index 0 as sentinel if any populated field is empty
-        return (
-            {0}
-            if (logprobs_empty or logprobs_tokens_empty or top_logprobs_empty)
-            else set()
-        )
+        # Report index 0 as sentinel if any field is empty
+        return {0} if (logprobs_empty or logprobs_tokens_empty) else set()
     return set()
 
 
@@ -449,9 +442,12 @@ def detect_empty_infer_ppl(ctx: TaskContext) -> set[int]:
     category="output_quality",
     rationale=(
         "Truncated outputs may indicate insufficient max_tokens setting "
-        "or unexpectedly long responses."
+        "or unexpectedly long responses. Scoped to gen: single-token logprob "
+        "tasks (ppl/clp) infer with max_tokens=1 and always finish with "
+        "'length', so the signal is only meaningful for generation."
     ),
     severity="info",
+    applies_to=["gen"],
     tags=["truncation", "length_limit", "incomplete_output"],
 )
 def detect_truncated_output(ctx: TaskContext) -> set[int]:

@@ -43,7 +43,9 @@ class Feedback(TypedDict):
         source="simple-evals",
         url="https://github.com/openai/simple-evals/blob/ee3b0318d8d1d9d72755a4120879be65f7c07e9e/mmlu_eval.py",
         notes=(
-            "0-shot generative MMLU with letter extraction; aligned with simple-evals."
+            "0-shot generative MMLU with letter extraction; scoring aligned "
+            "with simple-evals, data loaded from cais/mmlu (same 14042-item "
+            "test set)."
         ),
     ),
 )
@@ -111,16 +113,7 @@ class MMLUZeroShotGenTask(
                 category_metrics[category]["correct"] += 1
             category_metrics[category]["total"] += 1
 
-        # Pipeline failures are scored wrong and kept in the denominator
-        # (full-set accuracy, aligned with the gsm8k_0shot_gen family): bucket
-        # each by its subject's category, incrementing total but never correct.
-        for ctx in fails:
-            subject = ctx.raw_sample.get("subject", "unknown")
-            category = subject2category.get(subject, "other")
-            category_metrics[category]["total"] += 1
-
-        total = len(finals) + len(fails)
-        score = 100 * correct_num / total if total else 0.0
+        score = 100 * correct_num / len(finals) if finals else 0.0
         results = {"score": score}
         for category, metrics in category_metrics.items():
             category_score = (

@@ -237,10 +237,10 @@ async def test_feedback_marks_wrong_prediction():
 
 
 @pytest.mark.anyio
-async def test_report_counts_fails_in_denominator():
-    # 1 correct final + 1 pipeline failure → 50% over the full set (1/(1+1)),
-    # not 100%. A len(finals)-only denominator would wrongly report 100.0, so
-    # this pins the failure into both the score denominator and its category.
+async def test_report_excludes_fails_from_denominator():
+    # CLP-family convention (cmmlu / mmmlu): 1 correct final + 1 pipeline failure
+    # → score 100.0 over the finalized set; the fail is reported separately, not
+    # scored wrong. A len(finals)+len(fails) denominator would give 50.0.
     good = _sample("anatomy", "Q", 0)  # gold "A"
     failed = _sample("anatomy", "Q2", 1)
     task = MMLUFewShotCLPTask(
@@ -259,8 +259,8 @@ async def test_report_counts_fails_in_denominator():
         [TaskContext(sample_id=1, raw_sample=failed)],
     )
     assert report["fails"] == 1
-    assert report["score"] == 50.0  # 1/(1+1); old len(finals) denom gives 100.0
-    assert report["score_other"] == 50.0  # anatomy → "other"; fail buckets here too
+    assert report["score"] == 100.0  # 1/1; a finals+fails denom would give 50.0
+    assert report["score_other"] == 100.0  # only the final buckets; fail excluded
 
 
 # --- Validation ---

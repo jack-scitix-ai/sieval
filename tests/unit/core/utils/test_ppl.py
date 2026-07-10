@@ -49,6 +49,7 @@ class TestChoiceScoresFromTopLogprobs:
         assert all_present is True
         assert set(scores) == set(CHOICES)
         assert max(scores, key=lambda k: scores[k]) == "B"
+
     def test_empty_or_none(self):
         expected = dict.fromkeys(CHOICES, float("-inf"))
         assert choice_scores_from_top_logprobs(None, CHOICES) == (expected, False)
