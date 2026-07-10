@@ -13,18 +13,19 @@ highest UNCONDITIONALLY-NORMALIZED sequence log-likelihood (Brown et al. 2020):
 This is the ``ppl`` protocol (one inference per candidate, full answer text) —
 distinct from the single-letter ``clp`` method (CMMLU/MMLU-Base). Because the
 per-option context is identical within a sample, its log-prob cancels in the
-argmax, so summing the full echoed sequence is exact for EM.
+argmax, so summing the echoed INPUT tokens (excluding the trailing generated
+token — see ``echoed_logprob``) is exact for EM.
 
 Scored via ``SglangGenModel``'s echoed-input logprobs (``engine: sglang``). The
 sglang server MUST be launched with ``--disable-radix-cache``: on a prefix-cache
 hit sglang drops logprobs for cached positions, and the model fails loud rather
 than score a truncated echoed sequence.
 
-Comparison target: DeepSeek-V3 base ARC-Challenge 25-shot EM = 94.5 (DeepSeek-V3
-report, Table 3). The DeepSeek prompt renders candidates as an OPTIONS block of
-option texts; this task scores each option text as the continuation after
-``"Answer:"`` (lm-eval convention). If the number is off, the exact continuation
-rendering is the first knob to check.
+Comparison target — the SEPARATION regime (arXiv 2412.17758), NOT the
+options/letter regime: Qwen2.5-72B-Base ARC-Challenge 25-shot ≈ 72.4 (Qwen2.5
+report). The 94.5 options/letter figure belongs to the ``clp`` sibling
+(``arc_challenge_kshot_clp``), not this task. Not yet validated against a run,
+so ``status="experimental"``.
 
 AI-Generated Code - Claude Opus 4.8 (1M context) (Anthropic)
 """
@@ -38,7 +39,6 @@ from sieval.core.tasks import (
     Task,
     sieval_task,
 )
-from sieval.core.utils.ppl import total_logprob
 from sieval.datasets import ARCChallengeDatasetSample
 
 from ._arc import (
@@ -48,6 +48,7 @@ from ._arc import (
     arc_report,
     build_arc_ppl_fewshot_prefix,
     choice_text,
+    echoed_logprob,
     format_arc_ppl_context,
     sample_arc_fewshot,
 )
@@ -63,6 +64,7 @@ N_SHOT = 25
     n_shot=N_SHOT,
     tags=("english", "science", "multiple-choice", "base-model"),
     model_type="gen",
+    status="experimental",
     reference_impl=ReferenceImpl(
         source="lm-evaluation-harness",
         url=(
@@ -78,9 +80,10 @@ N_SHOT = 25
             "protocol (one inference per option; full answer text), not the "
             "single-letter clp method. Requires the sglang server launched "
             "with --disable-radix-cache (SglangGenModel fails loud on a cache "
-            "hit that truncates echoed logprobs). Comparison target: "
-            "DeepSeek-V3 base ARC-Challenge 25-shot EM = 94.5 (DeepSeek-V3 "
-            "report, Table 3)."
+            "hit that truncates echoed logprobs). Comparison target — the "
+            "SEPARATION regime (arXiv 2412.17758): Qwen2.5-72B-Base "
+            "ARC-Challenge 25-shot ≈ 72.4 (Qwen2.5 report). The 94.5 "
+            "options/letter figure is the clp sibling, not this task."
         ),
     ),
 )
@@ -132,11 +135,17 @@ class ARCChallengeFewShotPplTask(
         # Per option: a conditional call (full context + option text) and an
         # unconditional call ("Answer:" + option text) for Brown-et-al.
         # normalization. echo=True returns the whole sequence's token logprobs.
+        # logprobs=0: ppl reads only token_logprobs, not top_logprobs (matches
+        # the hellaswag sibling and avoids requesting an unused top-k).
         outputs: list[ModelOutput] = []
         for choice in ctx.raw_sample["choices"]:
-            outputs.append(await self.model.alogprobs(f"{pre} {choice}", echo=True))
             outputs.append(
-                await self.model.alogprobs(f"{ARC_UNCOND_CONTEXT} {choice}", echo=True)
+                await self.model.alogprobs(f"{pre} {choice}", echo=True, logprobs=0)
+            )
+            outputs.append(
+                await self.model.alogprobs(
+                    f"{ARC_UNCOND_CONTEXT} {choice}", echo=True, logprobs=0
+                )
             )
         return outputs
 
@@ -145,15 +154,7 @@ class ARCChallengeFewShotPplTask(
         best_index = -1
         best_score: float | None = None
         for index in range(len(ctx.raw_sample["choices"])):
-            conditional = inf[2 * index]
-            unconditional = inf[2 * index + 1]
-            cond_lp, _ = total_logprob(
-                conditional.logprobs_tokens or [], conditional.logprobs or []
-            )
-            uncond_lp, _ = total_logprob(
-                unconditional.logprobs_tokens or [], unconditional.logprobs or []
-            )
-            score = cond_lp - uncond_lp
+            score = echoed_logprob(inf[2 * index]) - echoed_logprob(inf[2 * index + 1])
             if best_score is None or score > best_score:
                 best_score = score
                 best_index = index

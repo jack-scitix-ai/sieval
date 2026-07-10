@@ -14,6 +14,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any, TypedDict
 
 from sieval.core.datasets import Dataset
+from sieval.core.models import ModelOutput
+from sieval.core.utils.ppl import total_logprob
 
 DEFAULT_FEWSHOT_SEED = 1234
 
@@ -157,6 +159,26 @@ def sample_arc_fewshot(
         mode="random",
         seed=fewshot_seed,
     )
+
+
+def echoed_logprob(output: ModelOutput) -> float:
+    """Sum the logprobs of the ECHOED INPUT tokens only (exclude generation).
+
+    ``alogprobs(echo=True)`` returns the echoed prompt tokens' logprobs followed
+    by the generated token(s) (``max_tokens >= 1``, since sglang rejects 0). Only
+    the echoed input is the scored sequence; the trailing generated token differs
+    between the conditional and unconditional calls and would NOT cancel, so it
+    must be dropped. Slice to ``usage.input_tokens`` (the echoed length) before
+    summing so the shared context cancels exactly in ``cond - uncond``.
+    """
+    tokens = output.logprobs_tokens or []
+    logprobs = output.logprobs or []
+    input_tokens = output.usage["input_tokens"] if output.usage else None
+    if input_tokens is not None:
+        tokens = tokens[:input_tokens]
+        logprobs = logprobs[:input_tokens]
+    total, _ = total_logprob(tokens, logprobs)
+    return total
 
 
 def arc_report(

@@ -16,16 +16,17 @@ from sieval.datasets.arc_challenge import (
     ARCChallengeDataset,
     ARCChallengeDatasetSample,
 )
-from sieval.tasks._arc import ARC_UNCOND_CONTEXT
+from sieval.tasks._arc import ARC_UNCOND_CONTEXT, echoed_logprob
 from sieval.tasks.arc_challenge_kshot_ppl import ARCChallengeFewShotPplTask
 
 
 class _ScriptedGenModel(GenModel):
-    """Returns a single scripted logprob per (option, conditional/unconditional).
+    """Returns a scripted logprob per (option, conditional/unconditional).
 
     ``scores`` maps option text -> (conditional_total, unconditional_total). The
-    returned ModelOutput carries ``logprobs=[None, value]`` so ``total_logprob``
-    (skip_first) sums to exactly ``value``.
+    echoed input is 2 tokens (first ``None`` per skip_first) whose summed logprob
+    is ``value``; a 3rd, trailing GENERATED token (logprob -99) is appended and
+    must be excluded by ``echoed_logprob`` (``usage.input_tokens == 2``).
     """
 
     def __init__(self, scores: dict[str, tuple[float, float]]):
@@ -47,8 +48,9 @@ class _ScriptedGenModel(GenModel):
         temperature: float = 0.0,
         **kwargs,
     ) -> ModelOutput:
-        _ = (max_tokens, logprobs, temperature, kwargs)
+        _ = (max_tokens, temperature, kwargs)
         assert echo is True
+        assert logprobs == 0  # ppl requests no top-k (matches hellaswag sibling)
         self.prompts.append(prompt)
         option = prompt.split("Answer:")[-1].strip()
         cond_lp, uncond_lp = self._scores[option]
@@ -56,8 +58,9 @@ class _ScriptedGenModel(GenModel):
         return ModelOutput(
             model=self.meta(),
             texts=[""],
-            logprobs_tokens=["_", "_"],
-            logprobs=[None, value],
+            logprobs_tokens=["_ctx", "_opt", "_generated"],
+            logprobs=[None, value, -99.0],
+            usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
         )
 
 
@@ -147,6 +150,21 @@ async def test_unconditional_normalization_flips_argmax():
     assert feedback["correct"] is True
     assert feedback["prediction_choice"] == "copper"
     assert report == {"score": 100.0, "acc": 100.0, "fails": 0}
+
+
+def test_echoed_logprob_excludes_trailing_generated_token():
+    # echo=True + max_tokens>=1 returns the echoed input followed by a generated
+    # token; only the input (usage.input_tokens) is the scored sequence.
+    model = _ScriptedGenModel({})
+    out = ModelOutput(
+        model=model.meta(),
+        texts=[""],
+        logprobs_tokens=["a", "b", "GEN"],
+        logprobs=[None, -1.5, -99.0],
+        usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+    )
+    # first 2 tokens only (skip_first drops the None) → -1.5, NOT -1.5 + -99.0
+    assert echoed_logprob(out) == -1.5
 
 
 def test_negative_k_rejected():

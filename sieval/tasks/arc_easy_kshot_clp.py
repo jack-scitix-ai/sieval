@@ -12,11 +12,12 @@ serves 100 by default, on vLLM start with ``--max-logprobs 100``).
 
 This is the base-model options-format counterpart to the ``ppl`` separation task
 (``arc_easy_kshot_ppl``, which scores full option text). DeepSeek switched from
-separation to options after V1, so the DeepSeek-V3 number is the options target
+separation to options after V1, so the options-regime number is the target
 here; the Qwen2.5 report uses separation (see the ppl sibling).
 
-Comparison target: DeepSeek-V3 base ARC-Easy 25-shot EM = 98.4 (DeepSeek-V3
-report, Table 3).
+Comparison target: Qwen2.5-72B-Base ARC-Easy 25-shot EM = 98.4, taken from the
+DeepSeek-V3 report's Table 3 (the Qwen2.5-72B-Base column — DeepSeek-V3-Base's
+own entry is 98.9). Not yet validated against a run, so ``status="experimental"``.
 
 AI-Generated Code - Claude Opus 4.8 (1M context) (Anthropic)
 """
@@ -56,6 +57,7 @@ N_SHOT = 25
     n_shot=N_SHOT,
     tags=("english", "science", "multiple-choice", "base-model"),
     model_type="gen",
+    status="experimental",
     reference_impl=ReferenceImpl(
         source="lm-evaluation-harness",
         url=(
@@ -69,9 +71,10 @@ N_SHOT = 25
             "(the clp protocol; mirrors cmmlu_kshot_base_gen). Requires all "
             "option letters in the top-k and fails the sample otherwise "
             "(default logprobs=100; SGLang serves 100, on vLLM use "
-            "--max-logprobs 100). Comparison target: DeepSeek-V3 base ARC-Easy "
-            "25-shot EM = 98.4 (DeepSeek switched separation->options after V1; "
-            "the ppl sibling reproduces the separation number)."
+            "--max-logprobs 100). Comparison target: Qwen2.5-72B-Base ARC-Easy "
+            "25-shot EM = 98.4, from the DeepSeek-V3 report's Table 3 "
+            "(Qwen2.5-72B-Base column; DeepSeek switched separation->options "
+            "after V1, and the ppl sibling reproduces the separation number)."
         ),
     ),
 )
