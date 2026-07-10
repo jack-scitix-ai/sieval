@@ -1,35 +1,42 @@
-"""C-Eval few-shot next-token logprob task (base models).
+"""C-Eval few-shot conditional-log-prob (CLP) task (base models).
 
 Replicates the non-CoT path of the C-Eval ``evaluator_series`` LLaMA evaluator
 (``code/evaluator_series/evaluators/llama.py``): a per-subject few-shot header,
 ``k`` ``dev`` exemplars, then the question with its four options and a trailing
-``"答案："``. Each option letter A/B/C/D is scored by its conditional next-token
-log-probability and the argmax is taken — equivalent to the reference's
-single-pass ``softmax(logits[A,B,C,D])`` since argmax is invariant under softmax.
+``"答案："``. The answer is the argmax over the A/B/C/D next-token log-probs from
+a single inference (``EvalMode.CLP``) — equivalent to the reference's
+single-pass ``softmax(logits[A,B,C,D])`` since softmax is monotonic.
+
+Scoring reads one next token's ``top_logprobs`` and argmaxes over A/B/C/D
+(matching option tokens by stripped string). It *requires all four* option
+tokens to be in the returned top-k and raises otherwise, so a too-small top-k
+fails the sample loudly instead of argmax-ing a subset.
+
+Infra requirement for faithful reproduction: the serving backend must return a
+top-k large enough to always include A/B/C/D. SGLang serves ``logprobs=100`` out
+of the box; on vLLM start with ``--max-logprobs 100`` (default 20 can drop
+option tokens). ``DEFAULT_LOGPROBS`` is 100 to match.
 
 Deviations from the reference:
 - Eval split is ``test`` (its labels are now public); ``evaluator_series/eval.py``
   scored ``val``. Selectable via the dataset's ``eval_split``.
-- The per-letter logprob comes from four ``echo=True`` completion calls (one per
-  candidate) rather than one full-vocab forward pass, because the backend is an
-  OpenAI-compatible completions API. Equivalent for the argmax. This diverges
-  from the CMMLU sibling's single ``top_logprobs`` call: ``echo`` is
-  top-k-independent (no ``--max-logprobs`` tuning, hence 0 fails) at the cost of
-  4x requests, whereas ``top_logprobs`` is 1x but needs a large top-k to keep
-  all of A/B/C/D in range.
+- Uses the OpenAI-compatible API ``top_logprobs`` as a substitute for the
+  official raw last-token-logits argmax; equivalent while all four option tokens
+  are in the top-k.
 - ``evaluator_series`` is per-subject and defines no cross-subject aggregation.
   ``score`` is the macro-average over the 52 subjects, following the C-Eval
   paper (Table 3: "average accuracy over all the subjects"; the reported 66.4
   for GPT-4 equals the unweighted mean of the 52 per-subject accuracies). This
   differs from lm-eval ``ceval-valid``, which micro-averages (``weight_by_size``)
-  on the val split.
+  on the val split. Comparison target: DeepSeek-V3 Table 3, C-Eval 5-shot 89.2
+  (Qwen2.5-72B-Base).
 - The few-shot header uses the English subject key (e.g. ``operating_system``),
   matching ``evaluator_series/eval.py`` (``subject_name=args.subject``), not the
   Chinese-name variant used by C-Eval's other evaluator.
 
-Decoding is deterministic: argmax over candidate log-probabilities, no sampling
-(``temperature=0``, ``max_tokens=1``, ``echo=True``); ``top_p`` / ``max_gen_toks``
-do not apply.
+Decoding is deterministic: argmax over the next-token option log-probs, no
+sampling (``max_tokens=1``, ``temperature=0``); ``top_p`` / ``max_gen_toks`` do
+not apply.
 
 AI-Generated Code - Claude Opus 4.8 (Anthropic)
 """
@@ -37,19 +44,87 @@ AI-Generated Code - Claude Opus 4.8 (Anthropic)
 from collections import defaultdict
 from typing import TypedDict, override
 
+from sieval.core.models import ModelOutput
 from sieval.core.tasks import (
     EvalMode,
     ReferenceImpl,
     Task,
-    TaskStageOutput,
     sieval_task,
 )
-from sieval.core.utils.meta import build_stage_meta
-from sieval.core.utils.ppl import extract_option_logprob
+from sieval.core.utils.ppl import choice_scores_from_top_logprobs
 from sieval.datasets import CEvalDatasetSample
 
 CHOICES = ("A", "B", "C", "D")
 _FEWSHOT_SPLIT = "dev"
+# Must be large enough that all of A/B/C/D land in the returned top-k. The
+# validated run used 100; vLLM needs `--max-logprobs 100` (default 20).
+DEFAULT_LOGPROBS = 100
+
+# Subject → topic category from the C-Eval paper (Table 8 / Figure 1). Category
+# scores are macro-averaged within each category, matching the paper's
+# per-category "Average" columns; the overall score is the macro over all 52.
+CEVAL_CATEGORY_SUBJECTS = {
+    "STEM": (
+        "advanced_mathematics",
+        "college_chemistry",
+        "college_physics",
+        "college_programming",
+        "computer_architecture",
+        "computer_network",
+        "discrete_mathematics",
+        "electrical_engineer",
+        "high_school_biology",
+        "high_school_chemistry",
+        "high_school_mathematics",
+        "high_school_physics",
+        "metrology_engineer",
+        "middle_school_biology",
+        "middle_school_chemistry",
+        "middle_school_mathematics",
+        "middle_school_physics",
+        "operating_system",
+        "probability_and_statistics",
+        "veterinary_medicine",
+    ),
+    "Social Science": (
+        "business_administration",
+        "college_economics",
+        "education_science",
+        "high_school_geography",
+        "high_school_politics",
+        "mao_zedong_thought",
+        "marxism",
+        "middle_school_geography",
+        "middle_school_politics",
+        "teacher_qualification",
+    ),
+    "Humanities": (
+        "art_studies",
+        "chinese_language_and_literature",
+        "high_school_chinese",
+        "high_school_history",
+        "ideological_and_moral_cultivation",
+        "law",
+        "legal_professional",
+        "logic",
+        "middle_school_history",
+        "modern_chinese_history",
+        "professional_tour_guide",
+    ),
+    "Other": (
+        "accountant",
+        "basic_medicine",
+        "civil_servant",
+        "clinical_medicine",
+        "environmental_impact_assessment_engineer",
+        "fire_engineer",
+        "physician",
+        "plant_protection",
+        "sports_science",
+        "tax_accountant",
+        "urban_and_rural_planner",
+    ),
+}
 
 
 class Feedback(TypedDict):
@@ -73,20 +148,25 @@ class Feedback(TypedDict):
         notes=(
             "Mirrors the non-CoT LLaMA evaluator: per-subject few-shot header "
             "with the English subject key, dev exemplars, and next-token "
-            "A/B/C/D logprob argmax (equivalent to softmax(logits[A,B,C,D])). "
-            "Eval split is the released test set (reference scored val). Score "
-            "is the macro-average over the 52 subjects (C-Eval paper Table 3), "
-            "unlike lm-eval ceval-valid which micro-averages (weight_by_size). "
+            "A/B/C/D argmax via one-call top_logprobs (equivalent to the "
+            "reference's softmax(logits[A,B,C,D]) while all four option tokens "
+            "are in top-k; requires them present and fails otherwise). Faithful "
+            "reproduction needs a top-k covering A/B/C/D (default logprobs=100; "
+            "vLLM --max-logprobs 100, default 20; SGLang serves 100). Eval split "
+            "is the released test set (reference scored val). Score is the "
+            "macro-average over the 52 subjects (C-Eval paper Table 3), unlike "
+            "lm-eval ceval-valid which micro-averages (weight_by_size). "
             "Comparison target: DeepSeek-V3 Table 3, C-Eval 5-shot 89.2 "
-            "(Qwen2.5-72B-Base)."
+            "(Qwen2.5-72B-Base); the validated Qwen2.5-72B-Base 5-shot run on "
+            "the test split scores 90.19 (macro)."
         ),
     ),
 )
 class CEvalFewShotCLPTask(
     Task[
         CEvalDatasetSample,
-        CEvalDatasetSample,
-        TaskStageOutput[dict[str, float]],
+        str,
+        ModelOutput,
         str,
         Feedback,
         dict[str, float],
@@ -101,13 +181,15 @@ class CEvalFewShotCLPTask(
         name: str | None = None,
         *,
         k: int = 5,
-        logprobs: int = 5,
+        logprobs: int = DEFAULT_LOGPROBS,
     ):
         if k < 0:
             raise ValueError(f"k must be >= 0, got {k}")
+        if logprobs < 1:
+            raise ValueError(f"logprobs must be >= 1, got {logprobs}")
         super().__init__(dataset=dataset, model=model, name=name)
         self._k = k
-        self._logprobs = logprobs
+        self._logprobs = max(logprobs, len(CHOICES))
         self._few_shot_cache: dict[str, str] = {}
         self._few_shot_by_subject: dict[str, list[CEvalDatasetSample]] = {}
 
@@ -172,54 +254,33 @@ class CEvalFewShotCLPTask(
         self._few_shot_cache[subject] = prompt
         return prompt
 
-    def _build_prompt(
-        self, sample: CEvalDatasetSample, option_label: str | None = None
-    ) -> str:
-        """Build the prompt, optionally with a candidate answer-label continuation."""
+    def _build_prompt(self, sample: CEvalDatasetSample) -> str:
         few_shot = self._build_few_shot_prompt(sample["subject"])
-        question = self._format_example(sample, include_answer=False)
-        return few_shot + question + (option_label or "")
+        return few_shot + self._format_example(sample, include_answer=False)
 
     @override
     async def preprocess(self, raw, ctx):
-        return raw
+        return self._build_prompt(raw)
 
     @override
     async def infer(self, pre, ctx):
-        """Score each option letter by its conditional next-token logprob."""
-        scores: dict[str, float] = {}
-        model_outputs = []
-
-        for label in CHOICES:
-            prompt = self._build_prompt(pre, label)
-            # echo/max_tokens/logprobs are structural to logprob scoring (not
-            # user decode prefs): echo returns the appended letter's logprob.
-            lp_out = await self.model.alogprobs(
-                prompt, max_tokens=1, logprobs=self._logprobs, echo=True
-            )
-            logprob = extract_option_logprob(
-                lp_out.logprobs_tokens or [], lp_out.logprobs or [], label
-            )
-            scores[label] = logprob if logprob is not None else float("-inf")
-            model_outputs.append(lp_out)
-
-        return TaskStageOutput(value=scores, meta=build_stage_meta(*model_outputs))
+        # One next-token top_logprobs call (max_tokens=1, echo=False); these are
+        # structural to CLP scoring, not user decode prefs.
+        return await self.model.alogprobs(
+            pre, max_tokens=1, logprobs=self._logprobs, echo=False
+        )
 
     @override
     async def postprocess(self, inf, ctx):
-        """Select the option with the highest log-probability.
-
-        Requires all four option tokens to be scored; a ``-inf`` (missing from
-        the echoed logprobs) fails the sample loudly rather than silently
-        defaulting to ``max()``'s first key.
-        """
-        scores = inf.value
-        missing = [c for c in CHOICES if scores.get(c, float("-inf")) == float("-inf")]
-        if missing:
+        """Argmax over A/B/C/D; fail loudly if any option token is missing."""
+        scores, all_present = choice_scores_from_top_logprobs(inf.top_logprobs, CHOICES)
+        if not all_present:
+            missing = [c for c in CHOICES if scores[c] == float("-inf")]
             raise RuntimeError(
-                f"C-Eval missing option-token logprob(s) {missing} from echo "
-                f"scoring (logprobs={self._logprobs}); check the model returns "
-                "prompt logprobs with echo=True."
+                "C-Eval top_logprobs missing option token(s) "
+                f"{missing}; increase logprobs (got top-k of {self._logprobs}) "
+                "or raise the server's max-logprobs so all of A/B/C/D are "
+                "returned."
             )
         return max(scores.items(), key=lambda item: item[1])[0]
 
@@ -236,14 +297,32 @@ class CEvalFewShotCLPTask(
 
     @override
     async def report(self, finals, fails):
-        # score == macro-average: the mean of per-subject accuracy (the C-Eval
-        # paper's "average over all subjects"). Failures are reported separately.
+        # Per-subject accuracy → macro over subjects (the C-Eval paper's
+        # "average accuracy over all the subjects"); per-category scores are the
+        # macro-average within each category. Infra failures are reported
+        # separately in `fails`, not scored wrong (CLP-family convention).
         by_subject: dict[str, list[bool]] = defaultdict(list)
         for ctx in finals:
             fb = ctx.feedback_result
             by_subject[fb["subject"]].append(fb["correct"])
-        if not by_subject:
-            return {"score": 0.0, "fails": len(fails), "macro_accuracy": 0.0}
-        per_subject_acc = [sum(c) / len(c) for c in by_subject.values()]
-        score = 100 * sum(per_subject_acc) / len(per_subject_acc)
-        return {"score": score, "fails": len(fails), "macro_accuracy": score}
+
+        subject_acc = {
+            subject: 100 * sum(correct) / len(correct)
+            for subject, correct in by_subject.items()
+        }
+        overall = sum(subject_acc.values()) / len(subject_acc) if subject_acc else 0.0
+
+        metrics: dict[str, float] = {
+            "score": overall,
+            "fails": float(len(fails)),
+            "overall": overall,
+        }
+        # Only report categories with evaluated subjects, so a subject-subset
+        # run omits absent categories instead of a misleading 0.0.
+        for category, subjects in CEVAL_CATEGORY_SUBJECTS.items():
+            available = [subject_acc[s] for s in subjects if s in subject_acc]
+            if available:
+                metrics[category.lower().replace(" ", "_")] = sum(available) / len(
+                    available
+                )
+        return metrics

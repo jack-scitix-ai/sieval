@@ -631,7 +631,7 @@
       "reference_impl": {
         "source": "ceval",
         "url": "https://raw.githubusercontent.com/hkust-nlp/ceval/cba65ae93bcf189149ced9f66ae0c958201faed9/code/evaluator_series/evaluators/llama.py",
-        "notes": "Mirrors the non-CoT LLaMA evaluator: per-subject few-shot header with the English subject key, dev exemplars, and next-token A/B/C/D logprob argmax (equivalent to softmax(logits[A,B,C,D])). Eval split is the released test set (reference scored val). Score is the macro-average over the 52 subjects (C-Eval paper Table 3), unlike lm-eval ceval-valid which micro-averages (weight_by_size). Comparison target: DeepSeek-V3 Table 3, C-Eval 5-shot 89.2 (Qwen2.5-72B-Base)."
+        "notes": "Mirrors the non-CoT LLaMA evaluator: per-subject few-shot header with the English subject key, dev exemplars, and next-token A/B/C/D argmax via one-call top_logprobs (equivalent to the reference's softmax(logits[A,B,C,D]) while all four option tokens are in top-k; requires them present and fails otherwise). Faithful reproduction needs a top-k covering A/B/C/D (default logprobs=100; vLLM --max-logprobs 100, default 20; SGLang serves 100). Eval split is the released test set (reference scored val). Score is the macro-average over the 52 subjects (C-Eval paper Table 3), unlike lm-eval ceval-valid which micro-averages (weight_by_size). Comparison target: DeepSeek-V3 Table 3, C-Eval 5-shot 89.2 (Qwen2.5-72B-Base); the validated Qwen2.5-72B-Base 5-shot run on the test split scores 90.19 (macro)."
       },
       "status": "stable"
     },
