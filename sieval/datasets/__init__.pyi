@@ -13,6 +13,14 @@ from .aime_2026 import (
     AIME2026Dataset,
     AIME2026DatasetSample,
 )
+from .arc_challenge import (
+    ARCChallengeDataset,
+    ARCChallengeDatasetSample,
+)
+from .arc_easy import (
+    ARCEasyDataset,
+    ARCEasyDatasetSample,
+)
 from .c_eval import (
     CEvalDataset,
     CEvalDatasetSample,
@@ -109,6 +117,10 @@ __all__ = [
     "AIME2025DatasetSample",
     "AIME2026Dataset",
     "AIME2026DatasetSample",
+    "ARCChallengeDataset",
+    "ARCChallengeDatasetSample",
+    "ARCEasyDataset",
+    "ARCEasyDatasetSample",
     "CEvalDataset",
     "CEvalDatasetSample",
     "CMMLUDataset",

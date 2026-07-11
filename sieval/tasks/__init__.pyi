@@ -10,6 +10,18 @@ from .aime_2025_0shot_gen import (
 from .aime_2026_0shot_gen import (
     AIME2026ZeroShotGenTask,
 )
+from .arc_challenge_kshot_clp import (
+    ARCChallengeFewShotClpTask,
+)
+from .arc_challenge_kshot_ppl import (
+    ARCChallengeFewShotPplTask,
+)
+from .arc_easy_kshot_clp import (
+    ARCEasyFewShotClpTask,
+)
+from .arc_easy_kshot_ppl import (
+    ARCEasyFewShotPplTask,
+)
 from .c_eval_kshot_clp import (
     CEvalFewShotCLPTask,
 )
@@ -93,6 +105,10 @@ __all__ = [
     "AIME2024ZeroShotGenTask",
     "AIME2025ZeroShotGenTask",
     "AIME2026ZeroShotGenTask",
+    "ARCChallengeFewShotClpTask",
+    "ARCChallengeFewShotPplTask",
+    "ARCEasyFewShotClpTask",
+    "ARCEasyFewShotPplTask",
     "CEvalFewShotCLPTask",
     "CMMLUFewShotClpTask",
     "DROPFewShotGenTask",
