@@ -22,10 +22,12 @@ hit sglang drops logprobs for cached positions, and the model fails loud rather
 than score a truncated echoed sequence.
 
 Comparison target — the SEPARATION regime (arXiv 2412.17758), NOT the
-options/letter regime: Qwen2.5-report-style separation numbers (the Qwen2.5
-report's headline ARC figure is ARC-Challenge ≈ 72.4). The 98.4 options/letter
-figure belongs to the ``clp`` sibling (``arc_easy_kshot_clp``), not this task.
-Not yet validated against a run, so ``status="experimental"``.
+options/letter regime. No concrete ARC-Easy separation figure is cited as an
+anchor here: the Qwen2.5 report's headline ARC number is ARC-Challenge (≈ 72.4,
+see the ppl sibling), and neither it nor the DeepSeek reports give an ARC-Easy
+*separation* score to compare against. The 98.4 options/letter figure belongs to
+the ``clp`` sibling (``arc_easy_kshot_clp``), not this task. Not calibrated, so
+``status="experimental"``.
 
 AI-Generated Code - Claude Opus 4.8 (1M context) (Anthropic)
 """

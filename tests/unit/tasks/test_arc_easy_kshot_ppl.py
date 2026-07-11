@@ -45,6 +45,7 @@ class _ScriptedGenModel(GenModel):
             texts=[""],
             logprobs_tokens=["_", "_"],
             logprobs=[None, value],
+            usage={"input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
         )
 
 

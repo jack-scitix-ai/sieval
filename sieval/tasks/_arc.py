@@ -106,28 +106,6 @@ def build_arc_clp_fewshot_prefix(examples: Sequence[Mapping[str, Any]]) -> str:
     )
 
 
-def clp_scores_from_top_logprobs(
-    top_logprobs: list[dict[str, float]] | None, labels: Sequence[str]
-) -> tuple[dict[str, float], bool]:
-    """Map the first output token's top-k onto *labels* (``A``/``B``/...).
-
-    Returns ``(scores, all_present)``; *all_present* is ``True`` only when every
-    label appears in the top-k, so the caller can fail loud rather than argmax a
-    subset. Matching is by the stripped token string (``" A"`` → ``"A"``); when
-    a label appears under several tokens the highest log-prob is kept.
-    """
-    scores = {label: float("-inf") for label in labels}
-    if not top_logprobs:
-        return scores, False
-    seen: set[str] = set()
-    for token, logprob in top_logprobs[0].items():
-        label = token.strip()
-        if label in scores:
-            scores[label] = max(scores[label], logprob)
-            seen.add(label)
-    return scores, len(seen) == len(labels)
-
-
 # --------------------------------------------------------------------------- #
 # shared: few-shot sampling + accuracy report
 # --------------------------------------------------------------------------- #
@@ -169,15 +147,20 @@ def echoed_logprob(output: ModelOutput) -> float:
     the echoed input is the scored sequence; the trailing generated token differs
     between the conditional and unconditional calls and would NOT cancel, so it
     must be dropped. Slice to ``usage.input_tokens`` (the echoed length) before
-    summing so the shared context cancels exactly in ``cond - uncond``.
+    summing so the shared context cancels exactly in ``cond - uncond``. Raises if
+    ``usage`` is absent rather than fall back to a full-sequence sum (which would
+    silently reintroduce the trailing-token bug this function exists to prevent).
     """
-    tokens = output.logprobs_tokens or []
-    logprobs = output.logprobs or []
-    input_tokens = output.usage["input_tokens"] if output.usage else None
-    if input_tokens is not None:
-        tokens = tokens[:input_tokens]
-        logprobs = logprobs[:input_tokens]
-    total, _ = total_logprob(tokens, logprobs)
+    if output.usage is None:
+        raise RuntimeError(
+            "echoed_logprob requires usage.input_tokens to drop the generated "
+            "token from the echoed sequence, but the response carries no usage."
+        )
+    input_tokens = output.usage["input_tokens"]
+    total, _ = total_logprob(
+        (output.logprobs_tokens or [])[:input_tokens],
+        (output.logprobs or [])[:input_tokens],
+    )
     return total
 
 

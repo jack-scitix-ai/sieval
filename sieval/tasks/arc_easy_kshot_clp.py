@@ -1,8 +1,9 @@
 """
 ARC-Easy few-shot base-model conditional-log-prob task (options format).
 
-The "options" MCQ format (Wang et al. 2024, arXiv:2412.17758): the candidate
-options are listed ``A/B/C/...`` in the prompt and the answer is the option
+The "options" MCQ format (Borchmann, ARC "Challenge" Is Not That Challenging,
+Findings of ACL 2025; arXiv:2412.17758): the candidate options are listed
+``A/B/C/...`` in the prompt and the answer is the option
 LETTER. Scoring reads the first output token's ``top_logprobs`` in ONE
 inference and argmaxes over the option-letter log-probs — the ``clp`` protocol,
 mirroring ``cmmlu_kshot_base_gen``. Scoring requires every option letter to be
@@ -31,6 +32,7 @@ from sieval.core.tasks import (
     Task,
     sieval_task,
 )
+from sieval.core.utils.ppl import choice_scores_from_top_logprobs
 from sieval.datasets import ARCEasyDatasetSample
 
 from ._arc import (
@@ -41,7 +43,6 @@ from ._arc import (
     build_arc_clp_fewshot_prefix,
     choice_label,
     choice_text,
-    clp_scores_from_top_logprobs,
     format_arc_clp_item,
     sample_arc_fewshot,
 )
@@ -135,7 +136,9 @@ class ARCEasyFewShotClpTask(
     @override
     async def postprocess(self, inf, ctx):
         labels = [choice_label(i) for i in range(len(ctx.raw_sample["choices"]))]
-        scores, all_present = clp_scores_from_top_logprobs(inf.top_logprobs, labels)
+        scores, all_present = choice_scores_from_top_logprobs(
+            inf.top_logprobs, tuple(labels)
+        )
         if not all_present:
             missing = [label for label in labels if scores[label] == float("-inf")]
             raise RuntimeError(
