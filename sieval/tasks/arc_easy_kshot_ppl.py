@@ -1,7 +1,9 @@
 """
 ARC-Easy few-shot base-model perplexity task (full text, unconditional norm).
 
-Reproduces DeepSeek's base-model ARC-Easy setup. Each answer OPTION is scored as
+Scores ARC-Easy in the SEPARATION regime (Qwen2.5-report style; the setup
+DeepSeek used before switching to the options format after V1). Each answer
+OPTION is scored as
 a text continuation of ``"Question: {q}\nAnswer:"`` — no letters, no options
 listed in the prompt — and the prediction is the option with the highest
 UNCONDITIONALLY-NORMALIZED sequence log-likelihood (Brown et al. 2020):
@@ -74,8 +76,9 @@ N_SHOT = 25
         ),
         notes=(
             "Shares the ARC-Easy split/dataset/revision with "
-            "lm-evaluation-harness, but reproduces DeepSeek's scoring, not "
-            "upstream acc/acc_norm: each option's full TEXT is scored as the "
+            "lm-evaluation-harness, but scores in the SEPARATION regime "
+            "(Qwen2.5-report style), not upstream acc/acc_norm: each option's "
+            "full TEXT is scored as the "
             "continuation of 'Question: {q}\\nAnswer:' and normalized "
             "UNCONDITIONALLY (Brown et al. 2020) as logP(opt|context) - "
             "logP(opt|'Answer:'), argmax = prediction. This is the ppl "
