@@ -296,6 +296,28 @@
       "checksums": {}
     },
     {
+      "name": "hle",
+      "display_name": "Humanity's Last Exam",
+      "description": "HLE — multi-domain, closed-ended frontier academic benchmark.",
+      "source": [
+        "hf:cais/hle@5a81a4c7271a2a2a312b9a690f0c2fde837e4c29"
+      ],
+      "categories": [
+        {
+          "level1": "Knowledge",
+          "level2": "Multi-domain"
+        }
+      ],
+      "tags": [
+        "english",
+        "reasoning",
+        "academic"
+      ],
+      "deps_group": null,
+      "license": "MIT",
+      "checksums": {}
+    },
+    {
       "name": "hmmt_feb_2025",
       "display_name": "HMMT Feb 2025",
       "description": "Harvard-MIT Mathematics Tournament, February 2025, 30 problems.",
@@ -980,6 +1002,27 @@
         "source": "DeepSeek-Math",
         "url": "https://github.com/deepseek-ai/DeepSeek-Math/tree/b8b0f8ce093d80bf8e9a641e44142f06d092c305/evaluation",
         "notes": "math-cot-test path: MinervaMathPrompt 4-shot, extract_math_few_shot_cot_answer (list-valued) + eval_math/math_equal."
+      },
+      "status": "stable"
+    },
+    {
+      "name": "hle_0shot_gen",
+      "display_name": "Humanity's Last Exam (0-shot, generative)",
+      "description": "Multi-domain frontier academic QA graded by an LLM judge.",
+      "dataset": "hle",
+      "eval_mode": "gen",
+      "n_shot": 0,
+      "tags": [
+        "english",
+        "reasoning",
+        "academic"
+      ],
+      "deps_group": "hle",
+      "model_type": "chat",
+      "reference_impl": {
+        "source": "hle",
+        "url": "https://github.com/centerforaisafety/hle/tree/26dca2e253b405105b4c3d8c2f5af06f86f90c66/hle_eval",
+        "notes": "Generative port of Humanity's Last Exam (Center for AI Safety). SYSTEM_PROMPT and JUDGE_PROMPT are vendored byte-for-byte; the judge runs through sieval's ChatModel (text) rather than upstream's beta.chat.completions.parse structured output, and its correct/confidence fields are parsed from the reply. Metrics mirror upstream dump_metrics: accuracy, a 95% Wald confidence interval, and calibration error (calib_err, p=2, beta=100). Text-only subset by default (text_only=True); full set (text_only=False) is marked * in reports. Grader is a REAL LLM (upstream default o3-mini-2025-01-31) supplied via the `grader` task arg on its own api_base/api_key. REPRODUCIBILITY: scores depend on the judge endpoint's model version (not pinnable like a Hub revision) — pin the grader model; the per-sample correct/confidence and grader model id are persisted."
       },
       "status": "stable"
     },

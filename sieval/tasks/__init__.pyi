@@ -49,6 +49,9 @@ from .hellaswag_kshot_ppl import (
 from .hendrycks_math_kshot_base_gen import (
     HendrycksMathFewShotBaseGenTask,
 )
+from .hle_0shot_gen import (
+    HLEZeroShotGenTask,
+)
 from .hmmt_feb_2025_0shot_gen import (
     HMMTFeb2025ZeroShotGenTask,
 )
@@ -122,6 +125,7 @@ __all__ = [
     "GPQADiamondZeroShotGenTask",
     "GSM8KFewShotBaseGenTask",
     "GSM8KZeroShotGenTask",
+    "HLEZeroShotGenTask",
     "HMMTFeb2025ZeroShotGenTask",
     "HMMTFeb2026ZeroShotGenTask",
     "HellaSwagFewShotPPLTask",
