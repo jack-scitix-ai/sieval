@@ -53,6 +53,10 @@ from .hendrycks_math import (
     HendrycksMathDataset,
     HendrycksMathDatasetSample,
 )
+from .hle import (
+    HLEDataset,
+    HLEDatasetSample,
+)
 from .hmmt_feb_2025 import (
     HMMTFeb2025Dataset,
     HMMTFeb2025DatasetSample,
@@ -141,6 +145,8 @@ __all__ = [
     "GPQADiamondDatasetSample",
     "GSM8KDataset",
     "GSM8KDatasetSample",
+    "HLEDataset",
+    "HLEDatasetSample",
     "HMMTFeb2025Dataset",
     "HMMTFeb2025DatasetSample",
     "HMMTFeb2026Dataset",
