@@ -8,7 +8,8 @@
 
 - HumanEval（多语言：python / javascript / typescript）
 - LiveCodeBench（仅 python）
-说明：HumanEval 直接运行提交代码；LiveCodeBench 需函数名与输入输出用例比对。
+- SciCode（仅 python）
+说明：HumanEval / SciCode 直接运行提交代码；LiveCodeBench 需函数名与输入输出用例比对。SciCode 的程序自带内联测试用例，运行无异常即判通过。
 
 ## 环境准备
 
@@ -31,6 +32,15 @@ pip install -r requirements.txt
 pip install -r requirements/livecodebench.txt
 ```
 
+需要支持 SciCode（科学计算栈，要求 Python ≥ 3.11）：
+
+```sh
+python3.11 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements/scicode.txt
+```
+
 ### Node.js (JS / TS)
 
 需要 Node.js (推荐版本 >= 20)：
@@ -45,6 +55,7 @@ npm install -g ts-node
 docker build -f docker/Dockerfile.python -t code-evaluator-py .
 docker build -f docker/Dockerfile.javascript -t code-evaluator-js .
 docker build -f docker/Dockerfile.typescript -t code-evaluator-ts .
+docker build -f docker/Dockerfile.scicode -t code-evaluator-scicode .   # Python 3.11
 ```
 
 ## 启动服务
@@ -65,7 +76,7 @@ POST /evaluations
 字段：
 
 - uuid
-- source: "human-eval" | "livecodebench"
+- source: "human-eval" | "mbpp" | "livecodebench" | "scicode"
 - lang: python | javascript | typescript
 - code: 代码字符串
 - test: LiveCodeBench 专用测试描述（含 fn_name / inputs / outputs）
@@ -134,7 +145,7 @@ Node.js (JS/TS): 使用 `--max-old-space-size` 限制 V8 堆内存。
 
 - app/: 服务与执行逻辑
 - docker/: 各语言镜像文件
-- requirements/: 附加依赖（`livecodebench.txt`）
+- requirements/: 附加依赖（`livecodebench.txt` / `scicode.txt`）
 - README.md: 文档
 
 ## 备注

@@ -15,6 +15,11 @@ at `submodules/code-evaluator`; converted to a vendored copy so a plain
   opt-in float tolerance via `CODE_EVAL_FLOAT_TOL` (default off = exact `==`,
   matching official LiveCodeBench). Ported from the upstream fork branch
   `fix/checker-messages-float-tol` (`cfc47d8`).
+- **scicode support** (`app/server.py`, `requirements/scicode.txt`,
+  `docker/Dockerfile.scicode`): route `source="scicode"` through the
+  direct-execution path (a self-contained program with inlined test cases), add
+  the scientific stack the problems import (numpy / scipy / sympy / matplotlib),
+  and a Python 3.11 deployment image.
 
 ## Deployment note
 

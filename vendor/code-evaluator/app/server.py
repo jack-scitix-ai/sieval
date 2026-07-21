@@ -74,8 +74,10 @@ class Sample(BaseModel):
 
 @app.post("/evaluations")
 async def evaluate(sample: Sample) -> BasicResponse[ResourceMetrics]:
-    if sample.source in {"human-eval", "mbpp"}:
-        # 'human-eval' directly use the code
+    if sample.source in {"human-eval", "mbpp", "scicode"}:
+        # 'human-eval' / 'mbpp' / 'scicode': run the submitted code directly.
+        # scicode sends a self-contained program (inlined targets + test cases),
+        # so a clean run == pass, same as human-eval.
         logger.debug(f"code to exec:\n{sample.code}")
 
         CODE_EXECUTOR_MAP = {
