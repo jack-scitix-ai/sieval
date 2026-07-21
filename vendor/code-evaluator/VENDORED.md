@@ -1,29 +1,14 @@
 # Vendored: code-evaluator
 
-Self-contained, in-tree copy of the multi-language code-execution service that
-sieval talks to over HTTP (`SIEVAL_CODE_EVAL_API`, default
-`http://localhost:11451/evaluations`). Previously referenced as a git submodule
-at `submodules/code-evaluator`; converted to a vendored copy so a plain
-`git clone` of sieval is self-contained (no `git submodule update` required).
+- Upstream: <https://github.com/scitix/code-evaluator>
+- Vendored at commit: `e4802268f2b491c7ea3d7ed7704dd8582bc079be`
+  (previously a git submodule at `submodules/code-evaluator`)
 
-- **Upstream**: <https://github.com/scitix/code-evaluator>
-- **Vendored at commit**: `e4802268f2b491c7ea3d7ed7704dd8582bc079be`
+## Local patches on top of that commit
 
-## Local modifications on top of the vendored commit
-
-- **float-tol** (`app/exec_py_test.py`): clearer output-comparison messages +
-  opt-in float tolerance via `CODE_EVAL_FLOAT_TOL` (default off = exact `==`,
-  matching official LiveCodeBench). Ported from the upstream fork branch
-  `fix/checker-messages-float-tol` (`cfc47d8`).
-- **scicode support** (`app/server.py`, `requirements/scicode.txt`,
-  `docker/Dockerfile.scicode`): route `source="scicode"` through the
-  direct-execution path (a self-contained program with inlined test cases), add
-  the scientific stack the problems import (numpy / scipy / sympy / matplotlib),
-  and a Python 3.11 deployment image.
-
-## Deployment note
-
-`requirements/scicode.txt` pins `scipy==1.16.3`, which requires **Python ≥ 3.11**
-(and `numpy==1.26.4` requires **< 3.13**), so the SciCode execution environment
-must run on Python 3.11 or 3.12 — unlike the other Dockerfiles here, which use
-`python:3.10-slim`.
+- `app/exec_py_test.py` — clearer checker messages + opt-in float tolerance
+  (`CODE_EVAL_FLOAT_TOL`); from fork branch `fix/checker-messages-float-tol`
+  (`cfc47d8`), plus a docstring note on `_value_close`'s type-based tolerance.
+- `app/server.py`, `README.md`, `requirements/scicode.txt`,
+  `docker/Dockerfile.scicode` — SciCode support: `source="scicode"` direct-run
+  alias, scientific-stack pins, and a Python 3.11 image.

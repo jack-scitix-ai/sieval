@@ -47,7 +47,12 @@ def _decimals_match(out_decimals: list, exp_decimals: list) -> bool:
 
 def _value_close(a, b, tol) -> bool:
     """Recursive tolerant compare for function-call outputs (leetcode-style). Tolerance
-    applies only to fractional expected floats; integer expected values stay exact."""
+    applies only to fractional expected floats; integer expected values stay exact.
+
+    Note: "integer expected" here is keyed off Python *type* (``isinstance(b, int)``),
+    so a float ``1.0`` is treated as fractional and gets tolerance -- unlike the stdio
+    path (``_decimals_match``), which keys off *value* (``b.to_integral_value()``) and
+    treats ``1.0`` as exact. Behavior inherited from upstream ``cfc47d8``."""
     if isinstance(a, bool) or isinstance(b, bool):
         return a == b
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
