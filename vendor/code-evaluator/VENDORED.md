@@ -6,7 +6,7 @@ sieval talks to over HTTP (`SIEVAL_CODE_EVAL_API`, default
 at `submodules/code-evaluator`; converted to a vendored copy so a plain
 `git clone` of sieval is self-contained (no `git submodule update` required).
 
-- **Upstream**: https://github.com/scitix/code-evaluator
+- **Upstream**: <https://github.com/scitix/code-evaluator>
 - **Vendored at commit**: `e4802268f2b491c7ea3d7ed7704dd8582bc079be`
 
 ## Local modifications on top of the vendored commit
