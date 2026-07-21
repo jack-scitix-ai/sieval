@@ -11,7 +11,10 @@ at `submodules/code-evaluator`; converted to a vendored copy so a plain
 
 ## Local modifications on top of the vendored commit
 
-_None yet._
+- **float-tol** (`app/exec_py_test.py`): clearer output-comparison messages +
+  opt-in float tolerance via `CODE_EVAL_FLOAT_TOL` (default off = exact `==`,
+  matching official LiveCodeBench). Ported from the upstream fork branch
+  `fix/checker-messages-float-tol` (`cfc47d8`).
 
 ## Deployment note
 

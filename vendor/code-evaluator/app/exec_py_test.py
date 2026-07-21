@@ -2,6 +2,7 @@ import ast
 import asyncio
 import json
 import multiprocessing
+import os
 import sys
 from decimal import Decimal
 from io import StringIO
@@ -14,6 +15,48 @@ from loguru import logger
 from .exec_py_code import reliability_guard
 from .resource_monitor import ResourceStats, monitor_process_resources
 from .utils import kill_proc
+
+# Float-comparison tolerance is OFF by default to match official LiveCodeBench, which
+# compares Decimals with exact `==` (deliberately, to avoid false positives such as
+# isclose(50000000000000000, 50000000000000001) == True). Opt in by setting the env var
+# CODE_EVAL_FLOAT_TOL, e.g. "1e-6". When enabled, tolerance is applied ONLY to genuinely
+# fractional expected values; integer expected values always require exact equality, so a
+# large-integer answer can never be loosened.
+_FLOAT_TOL = (
+    Decimal(os.environ["CODE_EVAL_FLOAT_TOL"])
+    if os.environ.get("CODE_EVAL_FLOAT_TOL")
+    else None
+)
+
+
+def _decimals_match(out_decimals: list, exp_decimals: list) -> bool:
+    """Compare two decimal token lists. Exact by default; abs-or-rel tolerance for
+    fractional expected values only when CODE_EVAL_FLOAT_TOL is set."""
+    if len(out_decimals) != len(exp_decimals):
+        return False
+    for a, b in zip(out_decimals, exp_decimals):
+        if a == b:
+            continue
+        if _FLOAT_TOL is not None and b != b.to_integral_value():
+            diff = abs(a - b)
+            if diff <= _FLOAT_TOL or diff <= _FLOAT_TOL * abs(b):
+                continue
+        return False
+    return True
+
+
+def _value_close(a, b, tol) -> bool:
+    """Recursive tolerant compare for function-call outputs (leetcode-style). Tolerance
+    applies only to fractional expected floats; integer expected values stay exact."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        if isinstance(b, int):
+            return a == b
+        return abs(a - b) <= tol or abs(a - b) <= tol * abs(b)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_value_close(x, y, tol) for x, y in zip(a, b))
+    return a == b
 
 
 async def execute_test(
@@ -135,7 +178,9 @@ def _unsafe_execute_fn_call(
         if isinstance(outputs, tuple):
             outputs = list(outputs)
 
-        if outputs != exp_outputs:
+        if outputs != exp_outputs and not (
+            _FLOAT_TOL is not None and _value_close(outputs, exp_outputs, float(_FLOAT_TOL))
+        ):
             return False, f"output {outputs} != expect {exp_outputs}"
         return True, ""
     except Exception as e:
@@ -162,14 +207,15 @@ def _unsafe_execute_stdio(
         if out_line == exp_line:
             continue
 
-        ok, out_decimals = convert_line_to_decimals(out_line)
-        if not ok:
-            return False, "output line is not all decimals"
-        ok, exp_decimals = convert_line_to_decimals(exp_line)
-        if not ok:
-            return False, "expect output line is not all decimals"
-        if out_decimals != exp_decimals:
-            return False, "output line decimals mismatch"
+        ok_out, out_decimals = convert_line_to_decimals(out_line)
+        ok_exp, exp_decimals = convert_line_to_decimals(exp_line)
+        # A non-numeric line that didn't exactly match is a plain output mismatch.
+        # (Exact string comparison already ran above — this is NOT a checker limitation
+        # on strings; the produced answer simply differs from the expected one.)
+        if not ok_out or not ok_exp:
+            return False, f"output mismatch: got {out_line!r} expected {exp_line!r}"
+        if not _decimals_match(out_decimals, exp_decimals):
+            return False, f"numeric mismatch: got {out_line!r} expected {exp_line!r}"
 
     return True, ""
 
