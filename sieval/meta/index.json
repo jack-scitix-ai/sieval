@@ -2,6 +2,29 @@
   "schema_version": 1,
   "datasets": [
     {
+      "name": "aa_lcr",
+      "display_name": "AA-LCR",
+      "description": "AA-LCR — 100-question long-context multi-document reasoning.",
+      "source": [
+        "hf:ArtificialAnalysis/AA-LCR@bdae010bbce259820c0e34c1d7cce210d966fb75"
+      ],
+      "categories": [
+        {
+          "level1": "Logic",
+          "level2": "TextualReasoning"
+        }
+      ],
+      "tags": [
+        "english",
+        "long-context",
+        "reasoning",
+        "open-ended"
+      ],
+      "deps_group": null,
+      "license": "apache-2.0",
+      "checksums": {}
+    },
+    {
       "name": "aime_2024",
       "display_name": "AIME 2024",
       "description": "American Invitational Mathematics Examination 2024, 30 problems.",
@@ -621,6 +644,28 @@
     }
   ],
   "tasks": [
+    {
+      "name": "aa_lcr_0shot_gen",
+      "display_name": "AA-LCR (0-shot, generative)",
+      "description": "Long-context multi-document reasoning; LLM-graded free-form answers.",
+      "dataset": "aa_lcr",
+      "eval_mode": "gen",
+      "n_shot": 0,
+      "tags": [
+        "english",
+        "long-context",
+        "reasoning",
+        "open-ended"
+      ],
+      "deps_group": null,
+      "model_type": "chat",
+      "reference_impl": {
+        "source": "aa-lcr",
+        "url": "https://huggingface.co/datasets/ArtificialAnalysis/AA-LCR",
+        "notes": "Generative port of Artificial Analysis Long Context Reasoning (AA-LCR): 100 hard reasoning questions over 234 documents across 30 document sets (avg ~99k input tokens/set). No upstream eval code — the input prompt and the binary CORRECT/INCORRECT equality-checker prompt are the dataset card's own snippets (reproduced verbatim in sieval.community.aa_lcr, HF revision bdae010bbce259820c0e34c1d7cce210d966fb75). Headline metric = accuracy over the full set (pipeline failures counted INCORRECT). Grader is a REAL LLM (official checker: Qwen3 235B A22B 2507 Non-reasoning) supplied via the `grader` task arg on its own api_base/api_key. REPRODUCIBILITY: unlike deterministic-grader tasks, scores depend on the grader endpoint's model version (not pinnable like a Hub revision) — pin the grader model + temperature=0; the per-sample grade and grader model id are persisted in the feedback record. Documents are prompted in data_source_filenames order (loader-guaranteed), per the card."
+      },
+      "status": "experimental"
+    },
     {
       "name": "aime_2024_0shot_gen",
       "display_name": "AIME 2024 (0-shot, generative)",
