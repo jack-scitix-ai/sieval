@@ -9,6 +9,7 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.community.hle import (
+    JUDGE_PROMPT,
     SYSTEM_PROMPT,
     aggregate_metrics,
     calib_err,
@@ -241,6 +242,31 @@ async def test_report_empty_is_zero():
     assert report["n"] == 0
     assert report["accuracy"] == 0.0
     assert report["calibration_error"] == 0.0
+
+
+# --- prompt fidelity: byte-for-byte pins on the vendored HLE prompts ---
+# These lock the reproduction invariant so any drift from upstream
+# (centerforaisafety/hle @ 26dca2e) fails loudly. `test_preprocess_*` above
+# compare against the constants by reference and cannot catch such drift.
+
+
+def test_system_prompt_pinned():
+    assert SYSTEM_PROMPT == (
+        "Your response should be in the following format:\n"
+        "Explanation: {your explanation for your answer choice}\n"
+        "Answer: {your chosen answer}\n"
+        "Confidence: {your confidence score between 0% and 100% for your answer}"
+    )
+
+
+def test_judge_prompt_pinned():
+    # Upstream ships a duplicated-word typo and pipe-escaped percent signs;
+    # both are preserved verbatim.
+    assert "i.e. if there if there is any inconsistency" in JUDGE_PROMPT
+    assert r"confidence score between 0|\%| and 100|\%| from [response]" in JUDGE_PROMPT
+    assert "extracted_final_answer:" in JUDGE_PROMPT
+    for field in ("{question}", "{response}", "{correct_answer}"):
+        assert field in JUDGE_PROMPT
 
 
 # --- metric kernel: parse_judge, calib_err, aggregate_metrics ---
