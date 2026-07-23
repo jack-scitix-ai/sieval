@@ -52,7 +52,8 @@ def _value_close(a, b, tol) -> bool:
     Note: "integer expected" here is keyed off Python *type* (``isinstance(b, int)``),
     so a float ``1.0`` is treated as fractional and gets tolerance -- unlike the stdio
     path (``_decimals_match``), which keys off *value* (``b.to_integral_value()``) and
-    treats ``1.0`` as exact. Behavior inherited from upstream ``cfc47d8``."""
+    treats ``1.0`` as exact. Behavior inherited from vendored patch ``cfc47d8``
+    (fork branch ``fix/checker-messages-float-tol``; see VENDORED.md)."""
     if isinstance(a, bool) or isinstance(b, bool):
         return a == b
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
