@@ -126,7 +126,6 @@ class HLEZeroShotGenTask(
             dataset = self._select_text_only(dataset)
         super().__init__(dataset=dataset, model=model, name=name)
         self._n = n
-        self._text_only = text_only
         self._grader = self._build_grader(grader)
 
     @staticmethod
