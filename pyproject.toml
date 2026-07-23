@@ -51,6 +51,7 @@ math = [
   "math-verify[antlr4-11-0]==0.8.0",
   "regex>=2024.0.0",
 ]
+scicode = ["h5py>=3.11", "numpy<=2.2", "scipy>=1.16.3"]
 t-eval = ["numpy<=2.2", "sentence-transformers>=5.1.2"]
 
 [project.scripts]

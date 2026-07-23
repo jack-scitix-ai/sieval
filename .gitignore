@@ -188,3 +188,10 @@ docs/handover/
 
 # Local-only model reference (not for OSS distribution)
 models.yaml
+
+# Local-only eval run configs (may contain live API keys)
+scicode-kimi.yaml
+scicode-kimi-slice.yaml
+scicode-kimi-p13.yaml
+scicode-kimi-bg-slice.yaml
+scicode-kimi-full-bg.yaml

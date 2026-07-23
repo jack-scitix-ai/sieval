@@ -105,6 +105,10 @@ from .openbookqa import (
     OpenBookQADataset,
     OpenBookQADatasetSample,
 )
+from .scicode import (
+    SciCodeDataset,
+    SciCodeDatasetSample,
+)
 from .simpleqa_verified import (
     SimpleQAVerifiedDataset,
     SimpleQAVerifiedDatasetSample,
@@ -171,6 +175,8 @@ __all__ = [
     "MMMLUDatasetSample",
     "OpenBookQADataset",
     "OpenBookQADatasetSample",
+    "SciCodeDataset",
+    "SciCodeDatasetSample",
     "SimpleQAVerifiedDataset",
     "SimpleQAVerifiedDatasetSample",
     "TEvalBeforeCallingDataset",

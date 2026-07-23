@@ -575,6 +575,34 @@
       "checksums": {}
     },
     {
+      "name": "scicode",
+      "display_name": "SciCode",
+      "description": "Research coding benchmark: 80 problems decomposed into 338 dependent sub-steps.",
+      "source": [
+        "url:https://raw.githubusercontent.com/scicode-bench/SciCode/69a8cfc829fe8788a426ce8b5de6292366dce7ef/eval/data/problems_all.jsonl",
+        "url:https://raw.githubusercontent.com/scicode-bench/SciCode/69a8cfc829fe8788a426ce8b5de6292366dce7ef/eval/data/problems_dev.jsonl",
+        "url:https://huggingface.co/datasets/akshathmangudi/SciCode/resolve/526f6cbf273fc2b134444104fd1979a013e95d39/raw/raw_ground.h5"
+      ],
+      "categories": [
+        {
+          "level1": "Code",
+          "level2": "CodeGeneration"
+        }
+      ],
+      "tags": [
+        "english",
+        "python",
+        "code-exec"
+      ],
+      "deps_group": null,
+      "license": "apache-2.0",
+      "checksums": {
+        "problems_all.jsonl": "sha256:38797fef78f434720be6d053b4f3a86839d6f8ea5fb9115450677cd3a6edf81d",
+        "problems_dev.jsonl": "sha256:193968aff23b7ed931c8f6d196b611e2f6694adb49e6cc085444a60ad2fc4f7b",
+        "raw_ground.h5": "sha256:48b0272a88b17dbd29777c217e1b4fb2b019b92e11cc2add847409db9541b890"
+      }
+    },
+    {
       "name": "simpleqa_verified",
       "display_name": "SimpleQA Verified",
       "description": "SimpleQA Verified — 1,000-prompt short-form factuality benchmark.",
@@ -1310,6 +1338,27 @@
         "source": "opencompass",
         "url": "https://github.com/open-compass/opencompass/blob/5767b74899806c0c37efdc5529ffea01e7340e48/opencompass/configs/datasets/obqa/obqa_gen_9069e4.py",
         "notes": "Prompt template (main variant) and first_option_postprocess vendored from OpenCompass. At k=0 the prompt and extraction match the upstream 0-shot config; k>0 is a sieval extension (fixed first-k train rows)."
+      },
+      "status": "stable"
+    },
+    {
+      "name": "scicode_0shot_gen",
+      "display_name": "SciCode (0-shot, generative)",
+      "description": "SciCode — research coding benchmark with dependent sub-steps; sub-problem and main-problem accuracy.",
+      "dataset": "scicode",
+      "eval_mode": "gen",
+      "n_shot": 0,
+      "tags": [
+        "english",
+        "python",
+        "code-exec"
+      ],
+      "deps_group": "scicode",
+      "model_type": "chat",
+      "reference_impl": {
+        "source": "scicode",
+        "url": "https://github.com/scicode-bench/SciCode/tree/69a8cfc829fe8788a426ce8b5de6292366dce7ef/eval/scripts",
+        "notes": "Prompt assembly (gencode_json.py), code/h5 parsers, comparison helpers, and the 3 gold steps vendored into community/scicode. h5 targets are inlined into the sandbox program instead of read via process_hdf5_to_tuple in-sandbox."
       },
       "status": "stable"
     },
