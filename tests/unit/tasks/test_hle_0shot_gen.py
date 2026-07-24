@@ -208,8 +208,10 @@ async def test_report_accuracy_and_counts_fails_in_denominator():
     # n = (2 finals + 1 fail) * 1 = 3; 1 correct => 33.33%.
     # The old len(finals)=2 denominator would give 50.0, so this discriminates.
     assert report["n"] == 3
-    assert report["n_judged"] == 2
+    assert report["n_graded"] == 2
     assert report["fails"] == 1
+    # No infer_result on these contexts -> no truncation surfaced.
+    assert report["truncated"] == 0
     assert report["accuracy"] == pytest.approx(33.33, abs=1e-2)
     assert report["score"] == report["accuracy"]
 
@@ -231,8 +233,41 @@ async def test_report_fails_weighted_by_n():
     # n = (1 final + 1 fail) * 2 = 4; 2 correct => 50.0%.
     # An unweighted (n=1) denominator would give 3 and 66.67%.
     assert report["n"] == 4
-    assert report["n_judged"] == 2
+    assert report["n_graded"] == 2
     assert report["accuracy"] == pytest.approx(50.0)
+
+
+@pytest.mark.anyio
+async def test_report_counts_truncated_outputs():
+    # A length-capped attempt (finish_reason "length") is surfaced as
+    # `truncated` so the accuracy headline is self-documenting on this
+    # collapse-prone benchmark. Counted per-attempt from infer_result.
+    task, model, _ = _task()  # n=1
+    meta = model.meta()
+    fb = {
+        "correct": False,
+        "confidence": 100,
+        "gold": "",
+        "predicted": "",
+        "grader_model": "m",
+    }
+    finals = [
+        TaskContext(
+            sample_id=0,
+            infer_result=ModelOutput(model=meta, texts=[""], finish_reasons=["length"]),
+            feedback_result=[dict(fb)],
+        ),
+        TaskContext(
+            sample_id=1,
+            infer_result=ModelOutput(
+                model=meta, texts=["Answer: 4"], finish_reasons=["stop"]
+            ),
+            feedback_result=[{**fb, "correct": True}],
+        ),
+    ]
+    report = await task.report(finals, [])
+    assert report["truncated"] == 1
+    assert report["n_graded"] == 2
 
 
 @pytest.mark.anyio
@@ -242,6 +277,7 @@ async def test_report_empty_is_zero():
     assert report["n"] == 0
     assert report["accuracy"] == 0.0
     assert report["calibration_error"] == 0.0
+    assert report["truncated"] == 0
 
 
 # --- prompt fidelity: byte-for-byte pins on the vendored HLE prompts ---
@@ -281,6 +317,10 @@ def test_parse_judge_last_field_wins():
         True,
         30,
     )
+    # `\b` anchor: "incorrect: yes" must NOT be read as the `correct` field.
+    # Without the anchor the substring "correct: yes" would match -> (True, 100);
+    # with no real verdict field the parse must default to (False, 100).
+    assert parse_judge("extracted_final_answer: 42 is incorrect: yes") == (False, 100)
 
 
 def test_calib_err_matches_hand_computation():

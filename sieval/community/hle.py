@@ -67,7 +67,8 @@ confidence: The extracted confidence score between 0|\%| and 100|\%| from [respo
 # Target bin size for calibration error (upstream default).
 BETA = 100
 
-_CORRECT_RE = re.compile(r"correct\s*:\s*\**\s*(yes|no)", re.IGNORECASE)
+# `\b` anchors the field name so it never matches inside "incorrect:".
+_CORRECT_RE = re.compile(r"\bcorrect\s*:\s*\**\s*(yes|no)", re.IGNORECASE)
 _CONFIDENCE_RE = re.compile(r"confidence\s*:\s*\**\s*(\d+)", re.IGNORECASE)
 
 
