@@ -17,6 +17,7 @@ Deviations from upstream (``hle_eval`` @ 26dca2e; see ``sieval.community.hle``):
 
 * The upstream o1-only ``system``→``user`` role swap is dropped; the system
   prompt is always sent as ``system`` (correct for general instruct models).
+  o1-family candidates that require the swap are therefore out of scope.
 * The judge is reached through ``ChatModel`` (text), not upstream's
   ``beta.chat.completions.parse`` structured output; its ``correct``/``confidence``
   fields are parsed from the reply (see ``sieval.community.hle.parse_judge``).

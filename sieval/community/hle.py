@@ -6,7 +6,7 @@
 #     confidence-interval / calibration-error formulas: hle_eval/run_judge_results.py
 #     (JUDGE_PROMPT, ExtractedAnswer, dump_metrics)
 #   - calib_err (verbatim): hle_eval/run_judge_results.py, itself vendored from
-#     https://github.com/hendrycks/outlier-exposure/blob/master/utils/calibration_tools.py
+#     https://github.com/hendrycks/outlier-exposure/blob/404c6268865e84dbab5ab4ccf855e8ae39de853f/utils/calibration_tools.py
 """Humanity's Last Exam (HLE) prompt + grading assets.
 
 HLE (Center for AI Safety) is a ~2,500-question, multi-domain, closed-ended
@@ -89,7 +89,7 @@ def parse_judge(reply: str) -> tuple[bool, int]:
     return correct, confidence
 
 
-# source: https://github.com/hendrycks/outlier-exposure/blob/master/utils/calibration_tools.py
+# source: https://github.com/hendrycks/outlier-exposure/blob/404c6268865e84dbab5ab4ccf855e8ae39de853f/utils/calibration_tools.py
 def calib_err(confidence, correct, p="2", beta=100):
     # beta is target bin size
     idxs = np.argsort(confidence)
