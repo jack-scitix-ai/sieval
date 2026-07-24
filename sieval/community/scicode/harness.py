@@ -18,11 +18,13 @@ the problems import (numpy / scipy / sympy / ...); h5py is NOT needed there.
 AI-Generated Code - Claude Opus 4.8 (1M context) (Anthropic)
 """
 import base64
+import functools
 import pickle
 import zlib
 from importlib import resources
 
 
+@functools.lru_cache(maxsize=1)
 def _cmp_source() -> str:
     return (
         resources.files("sieval.community.scicode")

@@ -25,9 +25,7 @@ from sieval.community.scicode.harness import (
     encode_targets,
 )
 from sieval.community.scicode.parse import (
-    extract_function_name,
     extract_python_script,
-    get_function_from_code,
     process_hdf5_to_tuple,
 )
 from sieval.community.scicode.prompts import (
@@ -39,9 +37,7 @@ from sieval.community.scicode.prompts import (
 __all__ = [
     "build_test_program",
     "encode_targets",
-    "extract_function_name",
     "extract_python_script",
-    "get_function_from_code",
     "process_hdf5_to_tuple",
     "generate_prompt_with_steps",
     "is_special_step",

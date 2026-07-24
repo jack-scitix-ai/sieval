@@ -23,7 +23,7 @@
 # (scientist background injected); "without background" selects the
 # background-comment template (the model must produce its own background).
 
-from importlib import resources
+from ._gold_steps import GOLD_STEP_CODE
 
 # eval/data/multistep_template.txt (used when with_background=True)
 MULTISTEP_TEMPLATE = """PROBLEM DESCRIPTION:
@@ -96,14 +96,10 @@ def is_special_step(problem_id: str, step_idx: int) -> bool:
 def special_step_code(step_number: str) -> str:
     """Return the scientist-authored gold code for a special step.
 
-    *step_number* is the ``sub_steps[i]["step_number"]`` value (e.g. ``"13.6"``),
-    which also names the vendored ``data/{step_number}.txt`` file.
+    *step_number* is the ``sub_steps[i]["step_number"]`` value (e.g. ``"13.6"``);
+    the gold code is inlined verbatim in :data:`GOLD_STEP_CODE`.
     """
-    return (
-        resources.files("sieval.community.scicode")
-        .joinpath("data", f"{step_number}.txt")
-        .read_text(encoding="utf-8")
-    )
+    return GOLD_STEP_CODE[step_number]
 
 
 def prompt_template(with_background: bool) -> str:

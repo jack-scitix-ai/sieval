@@ -87,10 +87,20 @@ class StepFeedback(TypedDict):
         source="scicode",
         url="https://github.com/scicode-bench/SciCode/tree/69a8cfc829fe8788a426ce8b5de6292366dce7ef/eval/scripts",
         notes=(
-            "Prompt assembly (gencode_json.py), code/h5 parsers, comparison "
-            "helpers, and the 3 gold steps vendored into community/scicode. "
-            "h5 targets are inlined into the sandbox program instead of read via "
-            "process_hdf5_to_tuple in-sandbox."
+            "Vendored from upstream eval/scripts into community/scicode: prompt "
+            "templates, code/h5 parsers, comparison helpers, and the 3 "
+            "non-generated gold steps (13.6/62.1/76.3, embedded verbatim as "
+            "context; inlined in _gold_steps.py). Deviations from upstream: "
+            "(1) numeric h5 targets are read eval-side and inlined into the "
+            "sandbox program (upstream reads test_data.h5 in-subprocess); "
+            "(2) execution runs on a remote code-eval service over HTTP, not an "
+            "in-process subprocess; (3) pipeline failures count as unsolved "
+            "problems in main-problem accuracy. Reproducing official numbers "
+            "requires greedy decoding (temperature=0) in the model config; "
+            "with_background defaults to False (the official headline mode). The "
+            "code-eval service image must provide the sandbox scientific stack "
+            "including sympy, which the vendored comparison shim injects — see "
+            "the evaluator's requirements/scicode.txt."
         ),
     ),
 )
@@ -112,7 +122,7 @@ class SciCodeZeroShotGenTask(
         with_background: bool = False,
         h5_path: str | None = None,
         max_concurrency: int = 4,
-        timeout: float = 300.0,
+        timeout: float = 1800.0,  # matches upstream test_generated_code.py
     ):
         super().__init__(dataset=dataset, model=model, name=name)
         self._with_background = with_background
