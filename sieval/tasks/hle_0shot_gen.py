@@ -99,7 +99,10 @@ class JudgeFeedback(TypedDict):
             "supplied via the `grader` task arg on its own api_base/api_key. "
             "REPRODUCIBILITY: scores depend on the judge endpoint's model version "
             "(not pinnable like a Hub revision) — pin the grader model; the "
-            "per-sample correct/confidence and grader model id are persisted."
+            "per-sample correct/confidence and grader model id are persisted. "
+            "VALIDATION: gpt-oss-20b scored 12.14 / 3.61 (reasoning=high / low, "
+            "judge GPT-5.2, text-only, no tools) vs the gpt-oss model card "
+            "(arXiv:2508.10925) 10.9 / 4.2 — within <3pp."
         ),
     ),
 )
@@ -229,8 +232,18 @@ class HLEZeroShotGenTask(
         ]
         # Denominator spans the full requested set; pipeline failures (candidate
         # produced no gradeable answer) count as incorrect — matching upstream
-        # (n = total questions) and the *_gen family, not just judged attempts.
+        # (n = total questions) and the *_gen family, not just graded attempts.
         n = (len(finals) + len(fails)) * self._n
+        # Length-capped attempts: a reasoning model can burn the whole token
+        # budget and emit no answer, then get graded incorrect. Surface the
+        # count so the headline is self-documenting on this collapse-prone
+        # benchmark (upstream reports only accuracy).
+        truncated = 0
+        for f in finals:
+            out = f.infer_result
+            if out is None or out.finish_reasons is None:
+                continue
+            truncated += sum(reason == "length" for reason in out.finish_reasons)
         m = aggregate_metrics(correct, confidence, n)
         return {
             "score": m["accuracy"],
@@ -238,6 +251,7 @@ class HLEZeroShotGenTask(
             "confidence_interval": m["confidence_interval"],
             "calibration_error": m["calibration_error"],
             "n": n,
-            "n_judged": len(correct),
+            "n_graded": len(correct),
             "fails": len(fails),
+            "truncated": truncated,
         }
