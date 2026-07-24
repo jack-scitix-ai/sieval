@@ -1,7 +1,7 @@
-# prompt template + equality-checker prompt: AA-LCR dataset card (Apache-2.0)
-# https://huggingface.co/datasets/ArtificialAnalysis/AA-LCR
-#   revision bdae010bbce259820c0e34c1d7cce210d966fb75, README "Prompt Template"
-#   and "Scoring Approach" sections — reproduced verbatim.
+# prompt template + equality-checker prompt: AA-LCR dataset card (Apache-2.0),
+# reproduced verbatim from the "Prompt Template" and "Scoring Approach" sections
+# at the pinned revision:
+# https://huggingface.co/datasets/ArtificialAnalysis/AA-LCR/blob/bdae010bbce259820c0e34c1d7cce210d966fb75/README.md
 """Artificial Analysis Long Context Reasoning (AA-LCR) prompt + scoring assets.
 
 AA-LCR (Artificial Analysis) is a 100-question long-context reasoning benchmark:
