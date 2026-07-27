@@ -92,9 +92,13 @@ class GradeFeedback(TypedDict):
             "temperature=0; the per-sample grade and grader model id are "
             "persisted in the feedback record. Documents are prompted in "
             "data_source_filenames order (loader-guaranteed), per the card. "
-            "VALIDATION: reproduced gpt-oss-120b / gpt-oss-20b (reasoning=high) "
-            "within ~2-3 pts of the AA public leaderboard (official 50.7 / 30.7), "
-            "grader Qwen3-235B-A22B-Instruct-2507 at temperature 0, n=3."
+            "DEVIATION (the port's only score-affecting one): empty/whitespace "
+            "candidates are graded INCORRECT without invoking the checker — the "
+            "checker returns CORRECT on an empty candidate, which would inflate "
+            "accuracy. VALIDATION: reproduced gpt-oss-120b / gpt-oss-20b "
+            "(reasoning=high) within ~2-3 pts of the AA public leaderboard "
+            "(official 50.7 / 30.7), grader Qwen3-235B-A22B-Instruct-2507 at "
+            "temperature 0, n=3."
         ),
     ),
 )
@@ -163,13 +167,11 @@ class AALCRZeroShotGenTask(
 
         feedbacks: list[GradeFeedback] = []
         for predicted in post:
-            # An empty/whitespace answer is definitionally INCORRECT (e.g. the
-            # model exhausted its token budget mid-reasoning and never emitted a
-            # final answer). Grade it directly — never send an empty candidate to
-            # the grader, which can spuriously return CORRECT and inflate accuracy.
-            # aa_lcr-specific by design: sibling gen tasks (simpleqa_verified,
-            # browsecomp) omit this guard, but AA-LCR's ~100k-token prompts make
-            # budget-exhausted empty answers a real, frequent case here.
+            # Defensive, aa_lcr-specific by design (simpleqa_verified/browsecomp
+            # omit it): the checker returns CORRECT on an empty candidate, which
+            # would inflate accuracy. Not observed in the 4x300 validation runs
+            # (0 empty, 0 length-truncated), but tight output budgets on these
+            # ~100k-token prompts can yield empty answers.
             if not predicted.strip():
                 grade = "INCORRECT"
             else:

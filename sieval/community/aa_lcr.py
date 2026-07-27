@@ -12,7 +12,7 @@ sources rather than directly retrieved.
 The upstream repo ships no evaluation code — only the dataset card. Both the
 input ``PROMPT_TEMPLATE`` (with per-document ``BEGIN DOCUMENT``/``END DOCUMENT``
 wrapping via ``DOCUMENT_TEMPLATE``) and the ``GRADER_TEMPLATE`` below are the
-card's own snippets reproduced verbatim. Deviations from upstream:
+card's own snippets reproduced verbatim. Implementation notes:
 
 * ``build_prompt`` mirrors the card's two-step assembly (join documents, then
   fill the outer template); documents are joined in the given order — the card
@@ -21,6 +21,9 @@ card's own snippets reproduced verbatim. Deviations from upstream:
   so ``parse_grade`` maps an unrecognized reply to ``INCORRECT`` (conservative),
   and ``aggregate_metrics`` reports plain accuracy — unlike the SimpleQA-style
   A/B/C + F1 aggregation in ``sieval.community.simpleqa_verified``.
+* The port's one score-affecting deviation from the card lives in the task
+  module (``sieval.tasks.aa_lcr_0shot_gen``): empty/whitespace candidates are
+  graded INCORRECT without invoking the checker.
 
 The official equality checker is Qwen3 235B A22B 2507 Non-reasoning; the checker
 model is a runtime choice supplied by the task, not pinned here.
@@ -75,24 +78,29 @@ def build_prompt(documents: list[str], question: str) -> str:
     return PROMPT_TEMPLATE.format(documents_text=documents_text, question=question)
 
 
+# Verdict phrase, negation-aware: matches CORRECT / INCORRECT / NOT CORRECT
+# (input is uppercased before matching).
+_VERDICT_RE = re.compile(r"\b(?:NOT\s+)?(?:IN)?CORRECT\b")
+
+
 def parse_grade(grading_response: str) -> str:
     """Map an equality-checker reply to ``CORRECT`` / ``INCORRECT``.
 
-    The grader is instructed to reply with only ``CORRECT`` or ``INCORRECT``, so
-    the leading verdict wins. ``INCORRECT`` takes precedence over ``CORRECT``:
-    it contains ``CORRECT`` as a substring, and a reply that mentions both
-    (e.g. "not CORRECT, so INCORRECT") is a negative verdict. Anything without a
-    recognizable verdict — empty or malformed — is ``INCORRECT``; AA-LCR has no
-    not-attempted tier.
+    The grader is instructed to reply with only ``CORRECT`` or ``INCORRECT``,
+    so a reply that *starts* with a verdict is taken at face value. Otherwise
+    the **last** verdict phrase wins — models that reason before answering put
+    the verdict at the end — and negated phrasings ("not correct") count as
+    INCORRECT rather than falling through to the bare ``CORRECT`` token.
+    Replies with no recognizable verdict — empty or malformed — are INCORRECT;
+    AA-LCR has no not-attempted tier.
     """
     text = grading_response.strip().upper()
     if text.startswith("INCORRECT"):
         return "INCORRECT"
     if text.startswith("CORRECT"):
         return "CORRECT"
-    if re.search(r"\bINCORRECT\b", text):
-        return "INCORRECT"
-    if re.search(r"\bCORRECT\b", text):
+    matches = _VERDICT_RE.findall(text)
+    if matches and matches[-1] == "CORRECT":
         return "CORRECT"
     return "INCORRECT"
 

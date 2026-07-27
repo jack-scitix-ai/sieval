@@ -39,9 +39,14 @@ def test_build_prompt_single_document_no_join_separator():
         ("INCORRECT", "INCORRECT"),
         # "INCORRECT" contains "correct" as a substring — must not misread.
         ("incorrect", "INCORRECT"),
-        # Verbose replies mentioning both: INCORRECT verdict must win.
+        # Verbose replies mentioning both: the last verdict wins.
         ("This is not correct, so INCORRECT", "INCORRECT"),
         ("INCORRECT — the candidate contradicts the official answer", "INCORRECT"),
+        # Negated phrasing must NOT fall through to the bare CORRECT token.
+        ("The candidate answer is not correct.", "INCORRECT"),
+        ("Not correct", "INCORRECT"),
+        # Reasoning-then-verdict: the final verdict wins over earlier mentions.
+        ("<think>maybe INCORRECT?</think>\nCORRECT", "CORRECT"),
         ("", "INCORRECT"),
         ("gibberish", "INCORRECT"),
     ],
