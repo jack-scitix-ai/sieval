@@ -11,7 +11,10 @@ Subset: the **text-only** subset is graded by default (``text_only=True``);
 technical reports mark full-set (text + image) numbers with ``*``. Image
 questions carry a base64 data URI in the ``image`` column; ``text_only`` drops
 them, and with ``text_only=False`` the image is attached as an ``image_url``
-content block (requires a vision-capable candidate + judge).
+content block (requires a vision-capable candidate + judge). Ordering caveat:
+``text_only`` selection runs at task construction, *after* any session-level
+dataset sampling — a sampling budget therefore applies to the full set and
+``text_only`` shrinks it further, so size the budget against the full set.
 
 Deviations from upstream (``hle_eval`` @ 26dca2e; see ``sieval.community.hle``):
 
@@ -32,8 +35,10 @@ override these (e.g. a technical report may evaluate at ``temperature=1.0``,
 Grader is a REAL LLM supplied via the ``grader`` task arg on its own
 ``api_base``/``api_key``. Correctness depends on the judge endpoint's model
 version (not pinnable like a Hub revision) — pin the grader model for
-reproducibility; each sample's ``correct``, ``confidence`` and grader model id
-are persisted in the feedback record.
+reproducibility; each sample's ``correct``, ``confidence``, ``judge_parsed`` and
+grader model id are persisted in the feedback record. The judge's decoding is
+likewise model-layer (set via the ``grader`` config); upstream runs it at
+``max_completion_tokens=4096``.
 
 Target: report against technical-report HLE numbers (e.g. the GLM series
 evaluates the text-only subset with a strong LLM judge, such as GPT-5.2); the
@@ -69,6 +74,7 @@ from sieval.datasets import HLEDatasetSample
 class JudgeFeedback(TypedDict):
     correct: bool
     confidence: int
+    judge_parsed: bool
     gold: str
     predicted: str
     grader_model: str
@@ -213,11 +219,12 @@ class HLEZeroShotGenTask(
             )
             out = await self._grader.agenerate(prompt)
             reply = out.texts[0] if out.texts else ""
-            correct, confidence = parse_judge(reply)
+            correct, confidence, parsed = parse_judge(reply)
             feedbacks.append(
                 {
                     "correct": correct,
                     "confidence": confidence,
+                    "judge_parsed": parsed,
                     "gold": gold,
                     "predicted": predicted,
                     "grader_model": grader_model,
@@ -227,10 +234,20 @@ class HLEZeroShotGenTask(
 
     @override
     async def report(self, finals, fails):
-        correct = [fb["correct"] for f in finals for fb in (f.feedback_result or [])]
-        confidence = [
-            fb["confidence"] for f in finals for fb in (f.feedback_result or [])
-        ]
+        # Only parsed judge replies feed the grading/calibration arrays. An
+        # unparseable reply is kept in `n` (counted incorrect) but dropped here,
+        # mirroring upstream's None on judge failure — it must not contribute a
+        # spurious max-confidence point that would inflate calibration_error.
+        correct: list[bool] = []
+        confidence: list[int] = []
+        judge_unparsed = 0
+        for f in finals:
+            for fb in f.feedback_result or []:
+                if fb["judge_parsed"]:
+                    correct.append(fb["correct"])
+                    confidence.append(fb["confidence"])
+                else:
+                    judge_unparsed += 1
         # Denominator spans the full requested set; pipeline failures (candidate
         # produced no gradeable answer) count as incorrect — matching upstream
         # (n = total questions) and the *_gen family, not just graded attempts.
@@ -254,5 +271,6 @@ class HLEZeroShotGenTask(
             "n": n,
             "n_graded": len(correct),
             "fails": len(fails),
+            "judge_unparsed": judge_unparsed,
             "truncated": truncated,
         }

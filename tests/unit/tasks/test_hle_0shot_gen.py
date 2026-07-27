@@ -163,16 +163,19 @@ async def test_feedback_parses_correct_and_confidence():
     fb: JudgeFeedback = feedbacks[0]
     assert fb["correct"] is True
     assert fb["confidence"] == 90
+    assert fb["judge_parsed"] is True
     assert fb["gold"] == "4"
     assert fb["predicted"] == "Answer: 4"
     assert fb["grader_model"] == "judge-5.2"
 
 
 @pytest.mark.anyio
-async def test_feedback_unparseable_reply_is_incorrect_default_confidence():
+async def test_feedback_unparseable_reply_flagged_not_graded():
     task, _, _ = _task(grader_reply="the judge rambled without the fields")
     ctx = TaskContext(sample_id=0, raw_sample=_row())
     _, feedbacks = await task.feedback(["whatever"], ctx)
+    # Unparseable -> flagged so report() drops it from grading (not a verdict).
+    assert feedbacks[0]["judge_parsed"] is False
     assert feedbacks[0]["correct"] is False
     assert feedbacks[0]["confidence"] == 100
 
@@ -188,6 +191,7 @@ def _finals(grades: list[tuple[bool, int]]) -> list[TaskContext]:
                 {
                     "correct": c,
                     "confidence": conf,
+                    "judge_parsed": True,
                     "gold": "",
                     "predicted": "",
                     "grader_model": "m",
@@ -212,6 +216,7 @@ async def test_report_accuracy_and_counts_fails_in_denominator():
     assert report["fails"] == 1
     # No infer_result on these contexts -> no truncation surfaced.
     assert report["truncated"] == 0
+    assert report["judge_unparsed"] == 0
     assert report["accuracy"] == pytest.approx(33.33, abs=1e-2)
     assert report["score"] == report["accuracy"]
 
@@ -223,6 +228,7 @@ async def test_report_fails_weighted_by_n():
     fb = {
         "correct": True,
         "confidence": 90,
+        "judge_parsed": True,
         "gold": "",
         "predicted": "",
         "grader_model": "m",
@@ -247,6 +253,7 @@ async def test_report_counts_truncated_outputs():
     fb = {
         "correct": False,
         "confidence": 100,
+        "judge_parsed": True,
         "gold": "",
         "predicted": "",
         "grader_model": "m",
@@ -271,6 +278,32 @@ async def test_report_counts_truncated_outputs():
 
 
 @pytest.mark.anyio
+async def test_report_drops_unparsed_judge_from_grading():
+    # Unparseable judge replies stay in `n` (counted incorrect) but must not
+    # enter the grading/calibration arrays or they would inflate metrics.
+    task, _, _ = _task()  # n=1
+    parsed = {
+        "correct": True,
+        "confidence": 90,
+        "judge_parsed": True,
+        "gold": "",
+        "predicted": "",
+        "grader_model": "m",
+    }
+    unparsed = {**parsed, "correct": False, "confidence": 100, "judge_parsed": False}
+    finals = [
+        TaskContext(sample_id=0, feedback_result=[parsed]),
+        TaskContext(sample_id=1, feedback_result=[unparsed]),
+    ]
+    report = await task.report(finals, [])
+    assert report["judge_unparsed"] == 1
+    assert report["n_graded"] == 1  # only the parsed reply is graded
+    assert report["n"] == 2  # both stay in the denominator
+    # 1 correct / 2 => 50.0; the dropped record counts as incorrect via `n`.
+    assert report["accuracy"] == pytest.approx(50.0)
+
+
+@pytest.mark.anyio
 async def test_report_empty_is_zero():
     task, _, _ = _task()
     report = await task.report([], [])
@@ -278,6 +311,7 @@ async def test_report_empty_is_zero():
     assert report["accuracy"] == 0.0
     assert report["calibration_error"] == 0.0
     assert report["truncated"] == 0
+    assert report["judge_unparsed"] == 0
 
 
 # --- prompt fidelity: byte-for-byte pins on the vendored HLE prompts ---
@@ -309,18 +343,34 @@ def test_judge_prompt_pinned():
 
 
 def test_parse_judge_last_field_wins():
-    assert parse_judge("correct: yes\nconfidence: 85") == (True, 85)
-    assert parse_judge("correct: no") == (False, 100)
-    assert parse_judge("no recognizable fields") == (False, 100)
+    # Returns (correct, confidence, parsed); parsed is True when `correct` matched.
+    assert parse_judge("correct: yes\nconfidence: 85") == (True, 85, True)
+    assert parse_judge("correct: no") == (False, 100, True)
     # reasoning may mention "correct:"; the trailing field value wins.
     assert parse_judge("reasoning: correct: no\ncorrect: yes\nconfidence: 30") == (
         True,
         30,
+        True,
     )
     # `\b` anchor: "incorrect: yes" must NOT be read as the `correct` field.
-    # Without the anchor the substring "correct: yes" would match -> (True, 100);
-    # with no real verdict field the parse must default to (False, 100).
-    assert parse_judge("extracted_final_answer: 42 is incorrect: yes") == (False, 100)
+    # Without the anchor the substring "correct: yes" would match -> parsed True;
+    # with no real verdict field the parse is not graded (parsed False).
+    assert parse_judge("extracted_final_answer: 42 is incorrect: yes") == (
+        False,
+        100,
+        False,
+    )
+
+
+def test_parse_judge_unparseable_flags_not_parsed():
+    # No `correct` field -> parsed False so report() drops it from grading.
+    assert parse_judge("the judge rambled without the fields") == (False, 100, False)
+
+
+def test_parse_judge_tolerates_markdown_bold():
+    # Markdown-bold field names / values must still parse (portability).
+    assert parse_judge("**correct:** yes\n**confidence:** 70") == (True, 70, True)
+    assert parse_judge("correct: **no**") == (False, 100, True)
 
 
 def test_calib_err_matches_hand_computation():

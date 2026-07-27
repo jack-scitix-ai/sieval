@@ -24,8 +24,11 @@ Deviations from upstream (``hle_eval/run_judge_results.py`` @ 26dca2e):
   prompt already specifies. Why: the judge runs on an arbitrary ``api_base`` and
   not every endpoint enforces a JSON schema — parsing the prompted field format
   keeps the judge endpoint-agnostic. Correctness follows upstream semantics
-  (``"yes" in judge_response["correct"]``); an unparseable reply is scored
-  incorrect with confidence 100 (upstream's "no confidence score" default).
+  (``"yes" in judge_response["correct"]``). An unparseable reply (no ``correct``
+  field) returns ``parsed=False`` and is dropped from the grading arrays by the
+  caller — mirroring upstream's ``None`` on judge failure: it stays in ``n``
+  (counted incorrect) but out of the confidence/calibration arrays, rather than
+  being scored as a spurious max-confidence verdict.
 * ``aggregate_metrics`` returns a dict instead of printing, and guards
   ``len(confidence) < beta``: the vendored ``calib_err`` indexes ``bins[-1]`` and
   raises ``IndexError`` below ``beta`` judged records — unreachable for the full
@@ -67,26 +70,33 @@ confidence: The extracted confidence score between 0|\%| and 100|\%| from [respo
 # Target bin size for calibration error (upstream default).
 BETA = 100
 
-# `\b` anchors the field name so it never matches inside "incorrect:".
-_CORRECT_RE = re.compile(r"\bcorrect\s*:\s*\**\s*(yes|no)", re.IGNORECASE)
-_CONFIDENCE_RE = re.compile(r"confidence\s*:\s*\**\s*(\d+)", re.IGNORECASE)
+# `\b` anchors the field name so it never matches inside "incorrect:"; the
+# `\**` runs tolerate markdown bold around the field name and its value.
+_CORRECT_RE = re.compile(r"\bcorrect\**\s*:\s*\**\s*(yes|no)", re.IGNORECASE)
+_CONFIDENCE_RE = re.compile(r"\bconfidence\**\s*:\s*\**\s*(\d+)", re.IGNORECASE)
 
 
-def parse_judge(reply: str) -> tuple[bool, int]:
-    """Extract ``(correct, confidence)`` from a judge reply.
+def parse_judge(reply: str) -> tuple[bool, int, bool]:
+    """Extract ``(correct, confidence, parsed)`` from a judge reply.
 
     The judge is prompted (see ``JUDGE_PROMPT``) to emit ``correct: yes|no`` and
     ``confidence: <int>`` fields. Both appear after the free-form ``reasoning``
-    field, so the last match of each pattern wins. Follows upstream semantics
-    (``"yes" in judge_response["correct"]``); an unrecognizable reply is scored
-    incorrect with confidence 100 (upstream's "no confidence score" default).
+    field, so the last match of each pattern wins. ``parsed`` is ``True`` only
+    when the ``correct`` field was found (upstream semantics:
+    ``"yes" in judge_response["correct"]``); on an unparseable reply it is
+    ``False`` so the caller can drop the record from the grading arrays —
+    mirroring upstream's ``None`` on judge failure — rather than materializing a
+    spurious verdict. ``confidence`` falls back to 100 only when ``correct``
+    parsed but no ``confidence`` field is present (the prompt's own "Put 100 if
+    there is no confidence score" case, which is about the candidate's score).
     """
     correct_matches = _CORRECT_RE.findall(reply)
-    correct = bool(correct_matches) and correct_matches[-1].lower() == "yes"
+    parsed = bool(correct_matches)
+    correct = parsed and correct_matches[-1].lower() == "yes"
 
     confidence_matches = _CONFIDENCE_RE.findall(reply)
     confidence = int(confidence_matches[-1]) if confidence_matches else 100
-    return correct, confidence
+    return correct, confidence, parsed
 
 
 # source: https://github.com/hendrycks/outlier-exposure/blob/404c6268865e84dbab5ab4ccf855e8ae39de853f/utils/calibration_tools.py

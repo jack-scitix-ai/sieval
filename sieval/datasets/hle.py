@@ -6,6 +6,9 @@ frontier-difficulty questions (mathematics, sciences, humanities), each with an
 LLM-judge grading. The Hub repo exposes a single ``test`` split; this loader
 mirrors it as-is.
 
+Access: ``cais/hle`` is a gated Hub repo — downloading requires accepting the
+gate on the dataset page and an authenticated ``HF_TOKEN`` in the environment.
+
 The model-facing image is the ``image`` column — a plain string (a base64 data
 URI, ``""`` when absent), preserved untouched. The repo also ships two auxiliary
 ``Image`` feature columns (``image_preview``, ``rationale_image``) that default
