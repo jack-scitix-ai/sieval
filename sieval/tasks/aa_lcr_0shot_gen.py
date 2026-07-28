@@ -24,10 +24,14 @@ Deviations / by-design behavior worth knowing:
   inflate accuracy. Pipeline failures are likewise counted INCORRECT (full-set
   metric).
 
-Reproduction decoding is a model-layer concern (set via ``models:`` /
-``infer_args``, never in this task): AA runs reasoning models at
-``temperature=0.6`` with 3 repeats (``n=3``), aggregating pass@1 across the
-attempts. Comparison target is the Artificial Analysis public leaderboard
+Reproduction decoding: ``n`` (repeats) is a **task arg** — set it in
+``tasks.<name>.args.n`` (AA-LCR uses ``n=3``). ``infer`` forwards it as a
+call-time kwarg to ``agenerate``, and call-time wins over model config
+(``{**self._kwargs, **kwargs}``), so setting ``n`` on the model is silently
+overridden by the task default (``_n=1``). Temperature stays model-layer (set
+via ``models:`` / ``infer_args``): AA runs reasoning models at
+``temperature=0.6``. pass@1 is aggregated across the ``n`` attempts.
+Comparison target is the Artificial Analysis public leaderboard
 (https://artificialanalysis.ai/evaluations/artificial-analysis-long-context-reasoning);
 scoring protocol at https://artificialanalysis.ai/methodology/intelligence-benchmarking.
 
@@ -95,10 +99,13 @@ class GradeFeedback(TypedDict):
             "DEVIATION (the port's only score-affecting one): empty/whitespace "
             "candidates are graded INCORRECT without invoking the checker — the "
             "checker returns CORRECT on an empty candidate, which would inflate "
-            "accuracy. VALIDATION: reproduced gpt-oss-120b / gpt-oss-20b "
-            "(reasoning=high) within ~2-3 pts of the AA public leaderboard "
-            "(official 50.7 / 30.7), grader Qwen3-235B-A22B-Instruct-2507 at "
-            "temperature 0, n=3."
+            "accuracy. REPEATS: AA-LCR uses n=3 (pass@1 aggregated across "
+            "attempts); `n` is a task arg (tasks.<name>.args.n), NOT a model "
+            "arg — infer forwards it call-time and call-time wins, so setting "
+            "`n` on the model is overridden by the task default n=1. "
+            "VALIDATION: reproduced gpt-oss-120b / gpt-oss-20b (reasoning=high) "
+            "within ~2-3 pts of the AA public leaderboard (official 50.7 / "
+            "30.7), grader Qwen3-235B-A22B-Instruct-2507 at temperature 0, n=3."
         ),
     ),
 )

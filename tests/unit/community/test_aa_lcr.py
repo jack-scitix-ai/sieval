@@ -47,6 +47,9 @@ def test_build_prompt_single_document_no_join_separator():
         ("Not correct", "INCORRECT"),
         # Reasoning-then-verdict: the final verdict wins over earlier mentions.
         ("<think>maybe INCORRECT?</think>\nCORRECT", "CORRECT"),
+        # A word starting with "CORRECT" must not match the CORRECT token.
+        ("CORRECTNESS: INCORRECT", "INCORRECT"),
+        ("correctness: incorrect", "INCORRECT"),
         ("", "INCORRECT"),
         ("gibberish", "INCORRECT"),
     ],

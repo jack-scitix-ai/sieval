@@ -86,20 +86,15 @@ _VERDICT_RE = re.compile(r"\b(?:NOT\s+)?(?:IN)?CORRECT\b")
 def parse_grade(grading_response: str) -> str:
     """Map an equality-checker reply to ``CORRECT`` / ``INCORRECT``.
 
-    The grader is instructed to reply with only ``CORRECT`` or ``INCORRECT``,
-    so a reply that *starts* with a verdict is taken at face value. Otherwise
-    the **last** verdict phrase wins — models that reason before answering put
-    the verdict at the end — and negated phrasings ("not correct") count as
-    INCORRECT rather than falling through to the bare ``CORRECT`` token.
+    The grader is instructed to reply with only ``CORRECT`` or ``INCORRECT``.
+    The **last** verdict phrase wins — a model that reasons before answering
+    puts the verdict at the end. Matching is word-bounded and negation-aware:
+    ``CORRECTNESS`` never matches the ``CORRECT`` token, and ``not correct``
+    counts as INCORRECT rather than falling through to a bare ``CORRECT``.
     Replies with no recognizable verdict — empty or malformed — are INCORRECT;
     AA-LCR has no not-attempted tier.
     """
-    text = grading_response.strip().upper()
-    if text.startswith("INCORRECT"):
-        return "INCORRECT"
-    if text.startswith("CORRECT"):
-        return "CORRECT"
-    matches = _VERDICT_RE.findall(text)
+    matches = _VERDICT_RE.findall(grading_response.upper())
     if matches and matches[-1] == "CORRECT":
         return "CORRECT"
     return "INCORRECT"
