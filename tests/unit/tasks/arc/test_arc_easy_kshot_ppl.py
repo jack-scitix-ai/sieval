@@ -8,44 +8,41 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response, TokenLogprob, UsageStats
 from sieval.core.models.gen_model import GenModel
+from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import EvalMode, TaskContext
 from sieval.core.tasks.meta import get_task_meta
 from sieval.datasets.arc_easy import ARCEasyDataset, ARCEasyDatasetSample
 from sieval.tasks.arc._base import ARC_UNCOND_CONTEXT
 from sieval.tasks.arc.arc_easy_kshot_ppl import ARCEasyFewShotPplTask
+from tests.conftest import HandlerTransport
 
 
 class _ScriptedGenModel(GenModel):
     def __init__(self, scores: dict[str, tuple[float, float]]):
-        super().__init__(model="mock-gen", api_key="fake")
         self._scores = scores
+        super().__init__(model="mock-gen", api_key="fake")
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(
+            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
+        )
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (max_tokens, logprobs, temperature, echo, kwargs)
-        option = prompt.split("Answer:")[-1].strip()
+    async def _stub_arun(self, req: Request) -> Response:
+        if not (req.return_logprobs or req.score_input):
+            return Response(texts=("",))
+        assert isinstance(req.input, str)
+        option = req.input.split("Answer:")[-1].strip()
         cond_lp, uncond_lp = self._scores[option]
-        value = uncond_lp if prompt.startswith(ARC_UNCOND_CONTEXT) else cond_lp
-        return ModelOutput(
-            model=self.meta(),
-            texts=[""],
-            logprobs_tokens=["_", "_"],
-            logprobs=[None, value],
-            usage={"input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
+        value = uncond_lp if req.input.startswith(ARC_UNCOND_CONTEXT) else cond_lp
+        return Response(
+            texts=("",),
+            logprobs=(
+                TokenLogprob(token="_", logprob=None),
+                TokenLogprob(token="_", logprob=value),
+            ),
+            usage=UsageStats(input_tokens=2, output_tokens=0, total_tokens=2),
         )
 
 

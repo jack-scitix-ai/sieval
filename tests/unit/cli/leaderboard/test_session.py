@@ -1160,8 +1160,8 @@ class TestSetupModels:
         # child should share parent_limiter = base._limiter
         assert child._parent_limiter is base._limiter
 
-    def test_derived_model_with_type_conversion(self):
-        """A derived model with 'type' should call as_type on the base."""
+    def test_derived_model_matching_type_is_accepted(self):
+        """`type:` on a derived model is a no-op when it matches the base kind."""
         base = MockChatModel(concurrency_limit=64)
         runner = self._make_runner(
             {
@@ -1177,23 +1177,18 @@ class TestSetupModels:
         )
         runner.models["base"] = base
 
-        mock_converted = MagicMock()
-        mock_converted.with_args.return_value = mock_converted
-
-        with (
-            patch.object(base, "as_type", return_value=mock_converted) as mock_as_type,
-            patch(
-                "sieval.cli.leaderboard.session.ChatModel",
-                return_value=base,
-            ) as mock_chat_cls,
+        with patch(
+            "sieval.cli.leaderboard.session.ChatModel",
+            return_value=base,
         ):
             runner._setup_models()
 
-        mock_as_type.assert_called_once_with(mock_chat_cls)
-        assert runner.models["child"] is mock_converted
+        # No conversion machinery: the child derives directly from the base
+        # (no args → no with_args fork either).
+        assert runner.models["child"] is base
 
-    def test_derived_model_with_gen_type_conversion(self):
-        """Derived model with type='gen' should request GenModel conversion."""
+    def test_derived_model_cross_kind_type_raises(self):
+        """RFC #25 dropped as_type: cross-kind derived `type:` is a config error."""
         base = MockChatModel(concurrency_limit=64)
         runner = self._make_runner(
             {
@@ -1209,22 +1204,14 @@ class TestSetupModels:
         )
         runner.models["base"] = base
 
-        mock_converted = MagicMock()
-        mock_converted.with_args.return_value = mock_converted
-
         with (
-            patch.object(base, "as_type", return_value=mock_converted) as mock_as_type,
             patch(
                 "sieval.cli.leaderboard.session.ChatModel",
                 return_value=base,
             ),
+            pytest.raises(ValueError, match="cross-kind conversion was removed"),
         ):
             runner._setup_models()
-
-        from sieval.core.models.gen_model import GenModel
-
-        mock_as_type.assert_called_once_with(GenModel)
-        assert runner.models["child"] is mock_converted
 
     def test_derived_model_validation_errors(self):
         """Derived model should reject unknown base and invalid type."""

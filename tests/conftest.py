@@ -34,9 +34,20 @@ from datasets import DatasetDict as HFDatasetDict
 from loguru import logger as _loguru_logger
 
 from sieval.core.datasets import Dataset
-from sieval.core.models import ModelOutput
+from sieval.core.models import (
+    Capability,
+    ModelOutput,
+    Request,
+    Response,
+    TokenLogprob,
+    UsageStats,
+)
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.models.gen_model import GenModel
+from sieval.core.models.transports import (
+    OpenAIChatTransport,
+    OpenAICompletionsTransport,
+)
 from sieval.core.runners.runner import TaskRunnerConfig
 from sieval.core.tasks.context import TaskContext, TaskStage
 from sieval.core.tasks.saver import TaskSaver
@@ -271,7 +282,47 @@ class MockDataset(Dataset):
 
 # ===================================================================
 # Mock Models
+#
+# RFC #25: mocks stub at the Transport seam. Each mock model overrides
+# ``_build_default_transport`` to return a ``HandlerTransport`` bound to
+# its ``_stub_arun(Request) -> Response`` handler, so ``agenerate`` /
+# ``alogprobs`` exercise the real request builders and Response bridge
+# while the wire layer stays canned. Subclass mocks override
+# ``_stub_arun`` and chain via ``super()``.
 # ===================================================================
+class HandlerTransport:
+    """Transport double: forwards ``arun`` to a handler coroutine.
+
+    Records every Request in ``self.requests`` so tests can assert on the
+    lowered IR instead of legacy kwargs.
+    """
+
+    def __init__(self, handler, capabilities: frozenset[Capability]):
+        self._handler = handler
+        self._capabilities = frozenset(capabilities)
+        self.requests: list[Request] = []
+
+    @property
+    def capabilities(self) -> frozenset[Capability]:
+        return self._capabilities
+
+    async def arun(self, req: Request) -> Response:
+        self.requests.append(req)
+        return await self._handler(req)
+
+
+def prompt_of(req: Request) -> str:
+    """Extract the flat question text from a Request input (str or messages)."""
+    if isinstance(req.input, str):
+        return req.input
+    return req.input[-1]["content"] if req.input else ""
+
+
+def n_of(req: Request) -> int:
+    """Number of samples requested."""
+    return req.sampling.n if req.sampling is not None else 1
+
+
 class MockChatModel(ChatModel):
     """ChatModel that returns deterministic answers without calling any API."""
 
@@ -281,36 +332,29 @@ class MockChatModel(ChatModel):
         default_answer: str = "unknown",
         **kwargs,
     ):
-        super().__init__(model="mock-chat", api_key="fake", **kwargs)
         self._answers = answers or {}
         self._default_answer = default_answer
+        super().__init__(model="mock-chat", api_key="fake", **kwargs)
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        # Extract question from messages
-        if isinstance(prompt, str):
-            q = prompt
-        else:
-            msgs = list(prompt)
-            q = msgs[-1]["content"] if msgs else ""
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
 
+    async def _stub_arun(self, req: Request) -> Response:
+        q = prompt_of(req)
         answer = self._answers.get(q, self._default_answer)
 
-        n = kwargs.get("n", 1)
+        n = n_of(req)
         if isinstance(answer, list):
             texts = answer[:n] if len(answer) >= n else answer
         else:
             texts = [answer] * n
 
-        return ModelOutput(
-            model=self.meta(),
-            texts=texts,
-            finish_reasons=["stop"] * len(texts),
-            usage={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+        return Response(
+            texts=tuple(texts),
+            finish_reasons=("stop",) * len(texts),
+            usage=UsageStats(input_tokens=10, output_tokens=2, total_tokens=12),
             request_params={"model": "mock-chat", "n": n},
         )
-
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        raise NotImplementedError
 
 
 class MockGenModel(GenModel):
@@ -322,31 +366,35 @@ class MockGenModel(GenModel):
         default_answer: str = "unknown",
         **kwargs,
     ):
-        super().__init__(model="mock-gen", api_key="fake", **kwargs)
         self._logprob_scores = logprob_scores or {}
         self._default_answer = default_answer
+        super().__init__(model="mock-gen", api_key="fake", **kwargs)
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        return ModelOutput(
-            model=self.meta(),
-            texts=[self._default_answer],
-            finish_reasons=["stop"],
-            usage={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(
+            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
         )
 
-    async def _alogprobs_impl(self, prompt: str, **kwargs) -> ModelOutput:
+    async def _stub_arun(self, req: Request) -> Response:
+        if not (req.return_logprobs or req.score_input):
+            return Response(
+                texts=(self._default_answer,),
+                finish_reasons=("stop",),
+                usage=UsageStats(input_tokens=10, output_tokens=2, total_tokens=12),
+            )
+
         # Extract the last character as the option label
+        prompt = prompt_of(req)
         option_label = prompt.rstrip()[-1] if prompt.strip() else "A"
         score = self._logprob_scores.get(option_label, -10.0)
+        max_tokens = req.sampling.max_tokens if req.sampling is not None else None
 
-        return ModelOutput(
-            model=self.meta(),
-            texts=[""],
-            finish_reasons=["stop"],
-            logprobs_tokens=[f" {option_label}"],
-            logprobs=[score],
-            usage={"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
-            request_params={"max_tokens": kwargs.get("max_tokens", 1)},
+        return Response(
+            texts=("",),
+            finish_reasons=("stop",),
+            logprobs=(TokenLogprob(token=f" {option_label}", logprob=score),),
+            usage=UsageStats(input_tokens=10, output_tokens=1, total_tokens=11),
+            request_params={"max_tokens": max_tokens},
         )
 
 
@@ -354,70 +402,68 @@ class MockJudgeModel(ChatModel):
     """ChatModel that acts as a judge, returning configurable verdicts."""
 
     def __init__(self, verdict: str = "yes", **kwargs):
-        super().__init__(model="mock-judge", api_key="fake", **kwargs)
         self._verdict = verdict
+        super().__init__(model="mock-judge", api_key="fake", **kwargs)
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        return ModelOutput(
-            model=self.meta(),
-            texts=[self._verdict],
-            finish_reasons=["stop"],
-            usage={"input_tokens": 20, "output_tokens": 1, "total_tokens": 21},
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+
+    async def _stub_arun(self, req: Request) -> Response:
+        return Response(
+            texts=(self._verdict,),
+            finish_reasons=("stop",),
+            usage=UsageStats(input_tokens=20, output_tokens=1, total_tokens=21),
             request_params={"model": "mock-judge"},
         )
-
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        raise NotImplementedError
 
 
 class MockFailingChatModel(ChatModel):
     """ChatModel that fails for specified number of calls, then succeeds."""
 
     def __init__(self, fail_count: int = 1, success_answer: str = "42", **kwargs):
-        super().__init__(model="mock-failing", api_key="fake", **kwargs)
         self._call_count = 0
         self._fail_count = fail_count
         self._success_answer = success_answer
+        super().__init__(model="mock-failing", api_key="fake", **kwargs)
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+
+    async def _stub_arun(self, req: Request) -> Response:
         self._call_count += 1
         if self._call_count <= self._fail_count:
             raise TimeoutError(f"Simulated failure #{self._call_count}")
-        return ModelOutput(
-            model=self.meta(),
-            texts=[self._success_answer],
-            finish_reasons=["stop"],
-            usage={"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+        return Response(
+            texts=(self._success_answer,),
+            finish_reasons=("stop",),
+            usage=UsageStats(input_tokens=5, output_tokens=1, total_tokens=6),
         )
-
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        raise NotImplementedError
 
 
 class MockAlwaysFailModel(ChatModel):
     """ChatModel that always raises an exception."""
 
     def __init__(self, error: type[Exception] = TimeoutError, **kwargs):
-        super().__init__(model="mock-always-fail", api_key="fake", **kwargs)
         self._error = error
+        super().__init__(model="mock-always-fail", api_key="fake", **kwargs)
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+
+    async def _stub_arun(self, req: Request) -> Response:
         raise self._error("Always fails")
-
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        raise NotImplementedError
 
 
 class MockCountingChatModel(MockChatModel):
-    """MockChatModel that counts how many times _agenerate_impl is called."""
+    """MockChatModel that counts how many times the transport is hit."""
 
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
         self.call_count = 0
+        super().__init__(**kwargs)
 
-    async def _agenerate_impl(self, prompt, **kwargs):
+    async def _stub_arun(self, req: Request) -> Response:
         self.call_count += 1
-        return await super()._agenerate_impl(prompt, **kwargs)
+        return await super()._stub_arun(req)
 
 
 class MockSelectiveFailModel(ChatModel):
@@ -430,14 +476,17 @@ class MockSelectiveFailModel(ChatModel):
         default_answer: str = "42",
         **kwargs,
     ):
-        super().__init__(model="mock-selective", api_key="fake", **kwargs)
         self._fail_samples = fail_samples or set()
         self._answers = answers or {}
         self._default_answer = default_answer
         self._call_counts: dict[str, int] = {}
+        super().__init__(model="mock-selective", api_key="fake", **kwargs)
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        q = prompt if isinstance(prompt, str) else list(prompt)[-1]["content"]
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+
+    async def _stub_arun(self, req: Request) -> Response:
+        q = prompt_of(req)
         self._call_counts[q] = self._call_counts.get(q, 0) + 1
 
         # Fail on first call if prompt matches any fail pattern
@@ -445,15 +494,11 @@ class MockSelectiveFailModel(ChatModel):
             raise TimeoutError(f"Simulated first-time failure for: {q}")
 
         answer = self._answers.get(q, self._default_answer)
-        return ModelOutput(
-            model=self.meta(),
-            texts=[answer],
-            finish_reasons=["stop"],
-            usage={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+        return Response(
+            texts=(answer,),
+            finish_reasons=("stop",),
+            usage=UsageStats(input_tokens=10, output_tokens=2, total_tokens=12),
         )
-
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        raise NotImplementedError
 
 
 # ===================================================================
@@ -577,27 +622,26 @@ class LatencyMockChatModel(ChatModel):
         self._output_size = output_size
         self._output_text = default_answer or ("x" * max(1, output_size))
 
-    async def _agenerate_impl(self, prompt: Any, **kwargs: Any) -> ModelOutput:
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+
+    async def _stub_arun(self, req: Request) -> Response:
         jitter = random.uniform(-self._latency_jitter, self._latency_jitter)
         await anyio.sleep(max(0, self._latency_s + jitter))
-        n = kwargs.get("n", 1)
-        texts = [self._output_text] * n
-        input_tokens = max(1, len(prompt) // 4) if isinstance(prompt, str) else 10
+        n = n_of(req)
+        prompt = prompt_of(req)
+        input_tokens = max(1, len(prompt) // 4) if prompt else 10
         output_tokens = max(1, self._output_size)
-        return ModelOutput(
-            model=self.meta(),
-            texts=texts,
-            finish_reasons=["stop"] * n,
-            usage={
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-            },
+        return Response(
+            texts=(self._output_text,) * n,
+            finish_reasons=("stop",) * n,
+            usage=UsageStats(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+            ),
             request_params={"model": "mock-latency", "n": n},
         )
-
-    async def _alogprobs_impl(self, prompt: Any, **kwargs: Any) -> ModelOutput:
-        raise NotImplementedError
 
     @classmethod
     def from_profile(cls, profile: IOProfile, **kwargs: Any) -> "LatencyMockChatModel":

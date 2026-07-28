@@ -31,7 +31,7 @@ from sieval.cli.resolution import (
     validate_named_config_map,
 )
 from sieval.core.datasets import Dataset
-from sieval.core.models import ChatModel, GenModel, Model, SglangGenModel
+from sieval.core.models import Capability, ChatModel, GenModel, Model, SglangGenModel
 from sieval.core.runners import (
     MultiTaskRunner,
     ResumeAction,
@@ -963,41 +963,28 @@ class EvalSession:
                 # Extract concurrency_limit separately for with_args
                 concurrency_limit = args.pop("concurrency_limit", None)
 
-                # Check if type conversion is needed
+                # RFC #25 dropped cross-kind model conversion (as_type): a
+                # derived model always inherits its base's kind. `type:` on a
+                # derived model is accepted only when it matches the base.
                 target_type = cfg.get("type")
-                if target_type == "gen":
-                    # An sglang-backed base is already "gen"; as_type(GenModel)
-                    # would swap it to the OpenAI /v1/completions path (which
-                    # rejects echo+logprobs), silently defeating engine: sglang.
-                    # Preserve it. A plain GenModel base is unaffected.
-                    if isinstance(base_model, SglangGenModel):
-                        new_model = base_model
-                    else:
-                        new_model = base_model.as_type(GenModel)
-                    logger.info(
-                        "Created derived model '{}' from '{}' "
-                        "with type conversion to '{}'",
-                        name,
-                        base_name,
-                        target_type,
+                if target_type:
+                    if target_type not in ("chat", "gen"):
+                        raise ValueError(
+                            f"Model '{name}' has invalid type '{target_type}'. "
+                            "Expected 'chat' or 'gen'"
+                        )
+                    base_kind = (
+                        "chat" if Capability.Chat in base_model.capabilities else "gen"
                     )
-                elif target_type == "chat":
-                    new_model = base_model.as_type(ChatModel)
-                    logger.info(
-                        "Created derived model '{}' from '{}' "
-                        "with type conversion to '{}'",
-                        name,
-                        base_name,
-                        target_type,
-                    )
-                elif target_type:
-                    raise ValueError(
-                        f"Model '{name}' has invalid type '{target_type}'. "
-                        "Expected 'chat' or 'gen'"
-                    )
-                else:
-                    # No type conversion, just derive
-                    new_model = base_model
+                    if target_type != base_kind:
+                        raise ValueError(
+                            f"Derived model '{name}' cannot convert base "
+                            f"'{base_name}' from '{base_kind}' to "
+                            f"'{target_type}': cross-kind conversion was "
+                            "removed (RFC #25). Define a separate base model "
+                            "with the desired type instead."
+                        )
+                new_model = base_model
 
                 # Apply additional args (including concurrency_limit)
                 if concurrency_limit is not None or args:

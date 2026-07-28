@@ -7,8 +7,9 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response, TopKEntry
 from sieval.core.models.gen_model import GenModel
+from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     JudgementRecord,
     TaskContext,
@@ -18,34 +19,37 @@ from sieval.core.tasks import (
 )
 from sieval.datasets.c_eval import CEvalDataset, CEvalDatasetSample
 from sieval.tasks.c_eval_kshot_clp import CEvalFewShotCLPTask
+from tests.conftest import HandlerTransport
 
 
 class _ScriptedGenModel(GenModel):
     """Returns a fixed next-token top_logprobs map for every alogprobs call."""
 
     def __init__(self, top_logprobs: dict[str, float]):
-        super().__init__(model="mock-gen", api_key="fake")
         self._top_logprobs = top_logprobs
         self.calls = 0
         self.prompts: list[str] = []
+        super().__init__(model="mock-gen", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs):  # pragma: no cover
-        raise AssertionError("clp task must not call agenerate")
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(
+            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
+        )
 
-    async def _alogprobs_impl(
-        self,
-        prompt,
-        *,
-        max_tokens=1,
-        logprobs=100,
-        echo=False,
-        temperature=0.0,
-        **kwargs,
-    ) -> ModelOutput:
+    async def _stub_arun(self, req: Request) -> Response:
+        if not (req.return_logprobs or req.score_input):  # pragma: no cover
+            raise AssertionError("clp task must not call agenerate")
+        assert isinstance(req.input, str)
         self.calls += 1
-        self.prompts.append(prompt)
-        return ModelOutput(
-            model=self.meta(), texts=[""], top_logprobs=[dict(self._top_logprobs)]
+        self.prompts.append(req.input)
+        return Response(
+            texts=("",),
+            top_logprobs=(
+                tuple(
+                    TopKEntry(token=t, logprob=lp)
+                    for t, lp in self._top_logprobs.items()
+                ),
+            ),
         )
 
 
@@ -125,8 +129,8 @@ async def test_postprocess_raises_when_option_token_missing():
 
 @pytest.mark.anyio
 async def test_infer_does_not_generate():
-    # _agenerate_impl raises if touched; reaching the assert proves only
-    # alogprobs ran and top_logprobs are returned.
+    # The stub's generation branch raises if touched; reaching the assert
+    # proves only alogprobs ran and top_logprobs are returned.
     model = _ScriptedGenModel({"A": -0.1, "B": -1.0, "C": -1.0, "D": -1.0})
     task = _task(model)
     raw = _sample("law", "A")

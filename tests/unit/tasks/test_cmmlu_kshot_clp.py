@@ -8,8 +8,15 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import (
+    ModelOutput,
+    Request,
+    Response,
+    TokenLogprob,
+    TopKEntry,
+)
 from sieval.core.models.gen_model import GenModel
+from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     TaskContext,
     build_judgement_record,
@@ -23,36 +30,36 @@ from sieval.tasks.cmmlu_kshot_clp import (
     CMMLU_SUBJECT_DISPLAY_NAMES,
     CMMLUFewShotClpTask,
 )
+from tests.conftest import HandlerTransport
 
 
 class _DummyGenModel(GenModel):
     def __init__(self):
-        super().__init__(model="mock-gen", api_key="fake")
         self.logprob_prompts: list[str] = []
+        super().__init__(model="mock-gen", api_key="fake")
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(
+            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
+        )
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (max_tokens, logprobs, temperature, kwargs)
-        self.logprob_prompts.append(prompt)
-        assert echo is False
-        return ModelOutput(
-            model=self.meta(),
-            texts=["B"],
-            logprobs_tokens=["B"],
-            logprobs=[-0.1],
-            top_logprobs=[{"A": -1.0, "B": -0.1, "C": -2.0, "D": -3.0}],
+    async def _stub_arun(self, req: Request) -> Response:
+        if not (req.return_logprobs or req.score_input):
+            return Response(texts=("",))
+        assert isinstance(req.input, str)
+        self.logprob_prompts.append(req.input)
+        assert req.score_input is False
+        return Response(
+            texts=("B",),
+            logprobs=(TokenLogprob(token="B", logprob=-0.1),),
+            top_logprobs=(
+                (
+                    TopKEntry(token="A", logprob=-1.0),
+                    TopKEntry(token="B", logprob=-0.1),
+                    TopKEntry(token="C", logprob=-2.0),
+                    TopKEntry(token="D", logprob=-3.0),
+                ),
+            ),
         )
 
 

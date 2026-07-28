@@ -15,15 +15,16 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response, SamplingParams
 from sieval.core.models.gen_model import GenModel
+from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     build_judgement_record,
     build_prediction_record,
     build_rollout_judgement,
 )
 from sieval.core.tasks.context import TaskContext
-from tests.conftest import ModuleIsolation
+from tests.conftest import HandlerTransport, ModuleIsolation
 
 _TASK_MODULE = "sieval.tasks.theoremqa_kshot_base_gen"
 _DATASET_MODULE = "sieval.datasets.theoremqa"
@@ -72,26 +73,19 @@ def _preserve_registries():
 
 class _MockGenModel(GenModel):
     def __init__(self):
+        self.last_req: Request | None = None
         super().__init__(model="mock-gen", api_key="fake")
-        self.last_kwargs: dict[str, object] = {}
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(model=self.meta(), texts=["The answer is 4"])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(
+            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
+        )
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        raise NotImplementedError
+    async def _stub_arun(self, req: Request) -> Response:
+        if req.return_logprobs or req.score_input:
+            raise NotImplementedError  # the gen task never requests logprobs
+        self.last_req = req
+        return Response(texts=("The answer is 4",))
 
 
 def _task_module():
@@ -170,9 +164,11 @@ async def test_infer_only_forwards_prompt_coupled_stop():
         TaskContext(sample_id=0, raw_sample={"Question": "What is 2+2?"}),
     )
 
-    # `n` rides along because it is the sampling budget rather than a decoding
-    # param; `stop` is prompt-coupled and everything else stays the caller's.
-    assert model.last_kwargs == {"n": 1, "stop": task_module._STOP_TOKENS}
+    req = model.last_req
+    assert req is not None
+    # Only the prompt-coupled stop is forwarded — no other sampling params.
+    assert req.sampling == SamplingParams(stop=tuple(task_module._STOP_TOKENS))
+    assert req.extra_wire_params is None
 
 
 @pytest.mark.anyio

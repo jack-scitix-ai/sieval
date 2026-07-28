@@ -1,38 +1,52 @@
 """
-Unit tests for Model.with_args, Model.as_type, and meta() derivation logic.
+Unit tests for Model.with_args and meta() derivation logic.
 
-Covers parent limiter wiring, type conversion, nested derivation,
-and meta() field presence — paths not exercised by test_model.py.
+Covers parent limiter wiring, nested derivation, and meta() field presence —
+paths not exercised by test_model.py. (The as_type coverage that used to live
+here was removed with the method itself; RFC #25 dropped cross-kind model
+conversion.)
 
-AI-Generated Code - Claude Sonnet 4.6 (Anthropic)
+AI-Generated Code - Claude Fable 5 (Anthropic)
 """
 
 import pytest
 
-from sieval.core.models import ChatModel, GenModel
+from sieval.core.models import ChatModel, GenModel, Request, Response
+from sieval.core.models.transports import (
+    OpenAIChatTransport,
+    OpenAICompletionsTransport,
+)
 
 
 # ---------------------------------------------------------------------------
 # Stub implementations — no real API calls
 # ---------------------------------------------------------------------------
+class _NeverCallTransport:
+    """Transport double that fails loudly if any wire call is attempted."""
+
+    def __init__(self, capabilities):
+        self._capabilities = frozenset(capabilities)
+
+    @property
+    def capabilities(self):
+        return self._capabilities
+
+    async def arun(self, req: Request) -> Response:
+        raise RuntimeError("Stub must not be called in unit tests")
+
+
 class StubGenModel(GenModel):
     """GenModel stub that never hits a real API."""
 
-    async def _agenerate_impl(self, prompt, **kwargs):
-        raise RuntimeError("Stub must not be called in unit tests")
-
-    async def _alogprobs_impl(self, prompt, **kwargs):
-        raise RuntimeError("Stub must not be called in unit tests")
+    def _build_default_transport(self):
+        return _NeverCallTransport(OpenAICompletionsTransport.CAPABILITIES)
 
 
 class StubChatModel(ChatModel):
     """ChatModel stub that never hits a real API."""
 
-    async def _agenerate_impl(self, prompt, **kwargs):
-        raise RuntimeError("Stub must not be called in unit tests")
-
-    async def _alogprobs_impl(self, prompt, **kwargs):
-        raise RuntimeError("Stub must not be called in unit tests")
+    def _build_default_transport(self):
+        return _NeverCallTransport(OpenAIChatTransport.CAPABILITIES)
 
 
 # ---------------------------------------------------------------------------
@@ -48,12 +62,6 @@ def base_gen():
 def base_gen_no_limit():
     """GenModel without any concurrency limiter."""
     return StubGenModel(model="base-gen-unlimited", api_key="fake")
-
-
-@pytest.fixture
-def base_chat():
-    """ChatModel with a concurrency limiter (total_tokens=32)."""
-    return StubChatModel(model="base-chat", api_key="fake", concurrency_limit=32)
 
 
 # ===================================================================
@@ -97,56 +105,12 @@ class TestModelDerivation:
 
         assert child._limiter.total_tokens == 16
 
-    # ------------------------------------------------------------------
-    # as_type — type conversion
-    # ------------------------------------------------------------------
+    def test_with_args_shares_transport(self, base_gen):
+        """Derived models reuse the same Transport (same client, same wire)."""
+        child = base_gen.with_args(temperature=0.7)
 
-    def test_as_type_conversion_chat_to_gen(self, base_chat):
-        """as_type(GenModel) returns a GenModel instance."""
-        gen = base_chat.as_type(GenModel)
-
-        assert isinstance(gen, GenModel)
-        assert not isinstance(gen, ChatModel)
-
-    def test_as_type_conversion_gen_to_chat(self, base_gen):
-        """as_type(ChatModel) returns a ChatModel instance."""
-        chat = base_gen.as_type(ChatModel)
-
-        assert isinstance(chat, ChatModel)
-        assert not isinstance(chat, GenModel)
-
-    def test_as_type_preserves_parent_limiter(self, base_gen):
-        """as_type does not alter _parent_limiter."""
-        child = base_gen.with_args(concurrency_limit=8)
-        converted = child.as_type(ChatModel)
-
-        # The converted model must carry the same parent limiter reference
-        assert converted._parent_limiter is child._parent_limiter
-        assert converted._parent_limiter is base_gen._limiter
-
-    def test_as_type_preserves_own_limiter(self, base_gen):
-        """as_type does not alter _limiter."""
-        child = base_gen.with_args(concurrency_limit=8)
-        converted = child.as_type(ChatModel)
-
-        assert converted._limiter is child._limiter
-        assert converted._limiter.total_tokens == 8
-
-    def test_as_type_preserves_model_name(self, base_gen):
-        """as_type does not change the model name."""
-        chat = base_gen.as_type(ChatModel)
-
-        assert chat._model == base_gen._model
-
-    def test_as_type_invalid_type_raises(self, base_gen):
-        """as_type with a non-Model type raises TypeError."""
-        with pytest.raises(TypeError, match="Model subclass"):
-            base_gen.as_type(str)
-
-    def test_as_type_invalid_non_type_raises(self, base_gen):
-        """as_type with a non-type value raises TypeError."""
-        with pytest.raises(TypeError, match="Model subclass"):
-            base_gen.as_type(42)
+        assert child._transport is base_gen._transport
+        assert child.capabilities == base_gen.capabilities
 
     # ------------------------------------------------------------------
     # Nested derivation
@@ -289,13 +253,6 @@ class TestModelExtra:
         extra = {"sequence_wrappers": {"dna": "<dna>{seq}</dna>"}}
         model = StubGenModel(model="test", api_key="fake", extra=extra)
         assert "extra" not in model.meta()["default_params"]
-
-    def test_as_type_preserves_extra(self):
-        """as_type() must preserve extra."""
-        extra = {"sequence_wrappers": {"dna": "<dna>{seq}</dna>"}}
-        model = StubGenModel(model="test", api_key="fake", extra=extra)
-        chat = model.as_type(StubChatModel)
-        assert chat.extra == extra
 
     def test_with_args_extra_not_in_child_kwargs(self):
         """with_args(extra=...) must not leak into child _kwargs."""

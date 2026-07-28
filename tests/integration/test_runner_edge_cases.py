@@ -14,13 +14,13 @@ Covers:
 AI-Generated Code - Claude Sonnet 4.6 (Anthropic)
 """
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
 
-from sieval.core.models import ModelOutput
 from sieval.core.runners.runner import TaskRunner
 from sieval.core.tasks.consts import TaskStage
 from sieval.core.tasks.task import Task
@@ -269,15 +269,11 @@ class TestRunnerAnomalyOnResume:
 
         # --- Mock model that returns truncated outputs ---
         class MockTruncatedModel(MockChatModel):
-            async def _agenerate_impl(self, prompt, **kwargs):
-                result = await super()._agenerate_impl(prompt, **kwargs)
+            async def _stub_arun(self, req):
+                resp = await super()._stub_arun(req)
                 # Return truncated finish_reason
-                return ModelOutput(
-                    model=result.model,
-                    texts=result.texts,
-                    finish_reasons=["length"] * len(result.texts),
-                    usage=result.usage,
-                    request_params=result.request_params,
+                return dataclasses.replace(
+                    resp, finish_reasons=("length",) * len(resp.texts)
                 )
 
         # --- First run: complete 2 samples with truncated outputs ---
@@ -286,12 +282,12 @@ class TestRunnerAnomalyOnResume:
                 super().__init__(**kwargs)
                 self._call_count = 0
 
-            async def _agenerate_impl(self, prompt, **kwargs):
+            async def _stub_arun(self, req):
                 self._call_count += 1
                 # Fail on third sample (E3)
                 if self._call_count >= 3:
                     raise TimeoutError("Simulated failure on E3")
-                return await super()._agenerate_impl(prompt, **kwargs)
+                return await super()._stub_arun(req)
 
         model1 = PartialFailTruncatedModel(answers=EDGE_ANSWERS)
         task1 = EdgeTask(dataset=dataset, model=model1, name="anomaly_resume_test")

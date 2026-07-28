@@ -12,7 +12,7 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.core.datasets import Dataset
-from sieval.core.models import ModelOutput
+from sieval.core.models import Capability, CapabilityError
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.models.gen_model import GenModel
 from sieval.core.models.sglang_gen_model import SglangGenModel
@@ -38,36 +38,24 @@ class _SimpleDataset(Dataset):
 
 
 class _MockChatModel(ChatModel):
+    """Construction-only mock: Task validation never invokes the wire."""
+
     def __init__(self):
         super().__init__(model="mock", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        return ModelOutput(model=self.meta(), texts=["ok"])
-
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        raise NotImplementedError
-
 
 class _MockGenModel(GenModel):
+    """Construction-only mock: Task validation never invokes the wire."""
+
     def __init__(self):
         super().__init__(model="mock-gen", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        return ModelOutput(model=self.meta(), texts=["ok"])
-
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        raise NotImplementedError
-
 
 class _MockSglangGenModel(SglangGenModel):
+    """Construction-only mock: Task validation never invokes the wire."""
+
     def __init__(self):
         super().__init__(model="mock-sglang", api_key="fake")
-
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        return ModelOutput(model=self.meta(), texts=["ok"])
-
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        raise NotImplementedError
 
 
 class _ConcreteTask(Task):
@@ -97,6 +85,18 @@ class _ChatOnlyTask(_ConcreteTask):
 
 class _GenOnlyTask(_ConcreteTask):
     model_type = "gen"
+
+
+class _ScoringTask(_ConcreteTask):
+    """Declares an IR capability requirement (prompt-side scoring)."""
+
+    requires = frozenset({Capability.InputScoring})
+
+
+class _TokenIdTask(_ConcreteTask):
+    """Requires native token ids (only the sglang transport supplies them)."""
+
+    requires = frozenset({Capability.SampledLogprobsWithTokenIds})
 
 
 # ===================================================================
@@ -152,18 +152,48 @@ class TestValidateModelType:
 
     def test_unrecognized_model_type_raises(self):
         """A model that is neither ChatModel nor GenModel should raise TypeError."""
-        from sieval.core.models.model import Model, ModelOutput
+        from sieval.core.models.model import Model
 
         class _CustomModel(Model):
-            async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-                return ModelOutput(model=self.meta(), texts=["ok"])
-
-            async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-                raise NotImplementedError
+            """Bare Model subclass: no transport, no kind."""
 
         custom = _CustomModel(model="custom", api_key="fake")
         with pytest.raises(TypeError, match="requires a ChatModel or GenModel"):
             _ChatOnlyTask(_SimpleDataset(), custom)
+
+
+# ===================================================================
+# requires (IR capability gate)
+# ===================================================================
+class TestRequiresCapabilityGate:
+    def test_no_requires_accepts_any_model(self):
+        """The default empty `requires` gates nothing."""
+        _ConcreteTask(_SimpleDataset(), _MockChatModel())
+        _ConcreteTask(_SimpleDataset(), _MockGenModel())
+
+    def test_input_scoring_task_with_gen_model_ok(self):
+        """GenModel's completions transport supplies InputScoring."""
+        _ScoringTask(_SimpleDataset(), _MockGenModel())
+
+    def test_input_scoring_task_with_sglang_model_ok(self):
+        _ScoringTask(_SimpleDataset(), _MockSglangGenModel())
+
+    def test_input_scoring_task_with_chat_model_raises(self):
+        """Chat completions cannot score the prompt — fail loud at construction."""
+        with pytest.raises(CapabilityError, match="InputScoring"):
+            _ScoringTask(_SimpleDataset(), _MockChatModel())
+
+    def test_token_id_task_with_sglang_model_ok(self):
+        """Only the sglang transport populates token ids."""
+        _TokenIdTask(_SimpleDataset(), _MockSglangGenModel())
+
+    def test_token_id_task_with_gen_model_raises(self):
+        with pytest.raises(CapabilityError, match="SampledLogprobsWithTokenIds"):
+            _TokenIdTask(_SimpleDataset(), _MockGenModel())
+
+    def test_token_id_task_with_chat_model_raises(self):
+        with pytest.raises(CapabilityError, match="SampledLogprobsWithTokenIds"):
+            _TokenIdTask(_SimpleDataset(), _MockChatModel())
 
 
 # ===================================================================

@@ -28,9 +28,10 @@ models:
         args:
             concurrency_limit: 64
 
-    # Derived model with type conversion (ChatModel -> GenModel)
+    # A different kind needs its own base model — a derived model always
+    # inherits its base's kind (cross-kind `type:` removed by RFC #25)
     gen_model:
-        base: base_model
+        name: "gpt-4o"
         type: "gen"
         args:
             concurrency_limit: 32
@@ -53,8 +54,8 @@ tasks:
 
 ### Key Concepts
 
-- **Model derivation**: `base: parent_model` inherits client, limiter, and args
-- **Type conversion**: `type: "gen"` switches between ChatModel and GenModel
+- **Model derivation**: `base: parent_model` inherits client, limiter, args — and always the base's kind
+- **Model kind**: `type: "chat"` / `type: "gen"` selects ChatModel or GenModel on a base model only; cross-kind `type:` conversion on derived models was removed by RFC #25 — define a separate base model instead
 - **Quota allocation**: `concurrency_limit` in `args` reserves capacity from base
 - **Class resolution**: built-in classes (exported by `sieval.tasks` / `sieval.datasets`) use short names; custom classes must use full module paths (`my_pkg.my_module.MyTask`)
 
@@ -81,16 +82,17 @@ preprocess -> infer -> postprocess -> feedback -> report
 Hierarchical concurrency control — derive child models from a base and allocate API quotas:
 
 ```python
-from sieval.core.models import ChatModel, GenModel
+from sieval.core.models import ChatModel
 
 base = ChatModel("gpt-4o", concurrency_limit=128)
 
 math_model = base.with_args(concurrency_limit=64)   # reserves 64
 code_model = base.with_args(concurrency_limit=32)   # reserves 32
-gen_model = base.as_type(GenModel)                   # same quota, different type
 
 # base uses remaining elastic capacity (128 - 64 - 32 = 32)
 ```
+
+A derived model always keeps its base's kind. Cross-kind conversion (`as_type`) was removed by RFC #25 — to reach the same endpoint through a `GenModel`, define a separate base model instead.
 
 ## Anomaly Detection
 

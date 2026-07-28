@@ -7,8 +7,9 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response, TokenLogprob
 from sieval.core.models.gen_model import GenModel
+from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     PromptRecord,
     TaskContext,
@@ -22,6 +23,7 @@ from sieval.tasks.hellaswag_kshot_ppl import (
     _argmax,
     _continuation_logprob,
 )
+from tests.conftest import HandlerTransport
 
 QUERY = "Activity label: a person"
 # Chosen so raw-LL argmax (acc) and length-normalized argmax (acc_norm) DIVERGE.
@@ -56,9 +58,7 @@ RENDERED_A = "Cooking: She cracks an egg. The woman pours it in."
 RENDERED_B = "Driving: He starts the car. The man drives away."
 
 
-def _crafted_output(
-    model: GenModel, prompt: str, choice: str, ll: float
-) -> ModelOutput:
+def _crafted_response(prompt: str, choice: str, ll: float) -> Response:
     """Echoed logprobs for *prompt* (= context + ' ' + choice) summing to *ll*.
 
     Layout stresses the helper: a non-empty leading BOS token, the (arbitrary,
@@ -71,43 +71,38 @@ def _crafted_output(
     part1, part2 = cont[:mid], cont[mid:]
     tokens = ["<s>", context, part1, part2, "<gen>"]
     logprobs = [None, -42.0, ll / 2, ll / 2, -99.0]
-    return ModelOutput(
-        model=model.meta(),
-        texts=["<gen>"],
-        logprobs_tokens=tokens,
-        logprobs=logprobs,
+    return Response(
+        texts=("<gen>",),
+        logprobs=tuple(
+            TokenLogprob(token=t, logprob=lp)
+            for t, lp in zip(tokens, logprobs, strict=True)
+        ),
     )
 
 
 class _PPLMockModel(GenModel):
     def __init__(self, choices: list[str], lls: list[float]):
-        super().__init__(model="mock-gen", api_key="fake")
         self._ll_by_choice: dict[str, float] = dict(zip(choices, lls, strict=True))
         self.calls: list[str] = []
         self.echos: list[bool] = []
         self.logprobs_args: list[int] = []
+        super().__init__(model="mock-gen", api_key="fake")
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(
+            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
+        )
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (max_tokens, temperature, kwargs)
-        self.calls.append(prompt)
-        self.echos.append(echo)
-        self.logprobs_args.append(logprobs)
+    async def _stub_arun(self, req: Request) -> Response:
+        if not (req.return_logprobs or req.score_input):
+            return Response(texts=("",))
+        assert isinstance(req.input, str)
+        self.calls.append(req.input)
+        self.echos.append(req.score_input)
+        self.logprobs_args.append(req.top_k)
         # CHOICES are mutually non-suffix, so exactly one endswith-matches.
-        choice = next(c for c in self._ll_by_choice if prompt.endswith(c))
-        return _crafted_output(self, prompt, choice, self._ll_by_choice[choice])
+        choice = next(c for c in self._ll_by_choice if req.input.endswith(c))
+        return _crafted_response(req.input, choice, self._ll_by_choice[choice])
 
 
 def _make_task(

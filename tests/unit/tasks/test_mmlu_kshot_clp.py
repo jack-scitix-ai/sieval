@@ -7,8 +7,9 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response, TopKEntry
 from sieval.core.models.gen_model import GenModel
+from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import TaskContext, build_prediction_record
 from sieval.datasets.mmlu import MMLUDataset, MMLUDatasetSample
 from sieval.tasks.mmlu_kshot_clp import (
@@ -17,6 +18,7 @@ from sieval.tasks.mmlu_kshot_clp import (
     _format_example,
     _format_subject,
 )
+from tests.conftest import HandlerTransport
 
 
 class _ScriptedGenModel(GenModel):
@@ -26,34 +28,34 @@ class _ScriptedGenModel(GenModel):
     """
 
     def __init__(self, winner: str = "A", drop: str | None = None):
-        super().__init__(model="mock-gen", api_key="fake")
         self._winner = winner
         self._drop = drop
         self.prompts: list[str] = []
         self.call_count = 0
+        super().__init__(model="mock-gen", api_key="fake")
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        return ModelOutput(model=self.meta(), texts=[""])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(
+            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
+        )
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        self.prompts.append(prompt)
+    async def _stub_arun(self, req: Request) -> Response:
+        if not (req.return_logprobs or req.score_input):
+            return Response(texts=("",))
+        assert isinstance(req.input, str)
+        self.prompts.append(req.input)
         self.call_count += 1
-        assert echo is False  # clp reads the next-token distribution, no echo
-        dist = {
-            f" {label}": (-0.1 if label == self._winner else -5.0)
+        # clp reads the next-token distribution, no echo
+        assert req.score_input is False
+        dist = tuple(
+            TopKEntry(
+                token=f" {label}",
+                logprob=-0.1 if label == self._winner else -5.0,
+            )
             for label in CHOICES
             if label != self._drop
-        }
-        return ModelOutput(model=self.meta(), texts=[""], top_logprobs=[dist])
+        )
+        return Response(texts=("",), top_logprobs=(dist,))
 
 
 def _sample(

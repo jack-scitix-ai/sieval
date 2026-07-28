@@ -1,4 +1,7 @@
-"""Abstract base class for the five-stage evaluation pipeline."""
+"""Abstract base class for the five-stage evaluation pipeline.
+
+AI-Generated Code - Claude Fable 5 (Anthropic)
+"""
 
 import re
 from abc import ABC, abstractmethod
@@ -6,7 +9,7 @@ from collections.abc import Set as AbstractSet
 from typing import ClassVar, Literal
 
 from sieval.core.datasets import Dataset
-from sieval.core.models import Model
+from sieval.core.models import Capability, Model
 
 from .context import TaskContext
 
@@ -44,10 +47,17 @@ class Task[
             *cli/session*).
         tags: Free-form tag set describing the task (e.g. ``{"gen", "zero_shot"}``).
             Used by the anomaly-detection framework to decide which rules apply.
+        requires: IR :class:`~sieval.core.models.Capability` set the task needs
+            from its model's Transport. Checked at construction via
+            :meth:`~sieval.core.models.Model.assert_capability`, so a model that
+            cannot honour a required feature (e.g. a chat backend asked for
+            ``InputScoring``) fails loud at setup rather than silently producing
+            wrong results. Defaults to the empty set (no IR requirement).
     """
 
     model_type: ClassVar[Literal["chat", "gen"] | None] = None
     tags: ClassVar[AbstractSet[str]] = frozenset()  # override in subclasses
+    requires: ClassVar[frozenset[Capability]] = frozenset()  # override in subclasses
 
     def __init__(
         self, dataset: Dataset[TRawSample], model: Model, name: str | None = None
@@ -58,6 +68,8 @@ class Task[
 
         if self.model_type is not None:
             self._validate_model_type()
+        if self.requires:
+            self._model.assert_capability(*self.requires)
 
     def _validate_model_type(self) -> None:
         """Raise ``TypeError`` if the model's kind does not match :attr:`model_type`."""

@@ -9,8 +9,9 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response, TokenLogprob, TopKEntry
 from sieval.core.models.gen_model import GenModel
+from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     JudgementRecord,
     PredictionRecord,
@@ -26,6 +27,7 @@ from sieval.tasks.mmmlu_kshot_clp import (
     MMMLUKShotClpTask,
     OfficialScores,
 )
+from tests.conftest import HandlerTransport
 
 _FinalCtx = TaskContext[
     MMMLUDatasetSample,
@@ -37,30 +39,26 @@ _FinalCtx = TaskContext[
 
 
 class _TopLogprobGenModel(GenModel):
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(
+            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
+        )
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(
-            model=self.meta(),
-            texts=[" C"],
-            finish_reasons=["length"],
-            logprobs_tokens=[" C"],
-            logprobs=[-0.1],
-            top_logprobs=[
-                {" A": -3.0, " B": -2.0, " C": -0.1, " D": -4.0},
-            ],
+    async def _stub_arun(self, req: Request) -> Response:
+        if not (req.return_logprobs or req.score_input):
+            return Response(texts=("",))
+        return Response(
+            texts=(" C",),
+            finish_reasons=("length",),
+            logprobs=(TokenLogprob(token=" C", logprob=-0.1),),
+            top_logprobs=(
+                (
+                    TopKEntry(token=" A", logprob=-3.0),
+                    TopKEntry(token=" B", logprob=-2.0),
+                    TopKEntry(token=" C", logprob=-0.1),
+                    TopKEntry(token=" D", logprob=-4.0),
+                ),
+            ),
         )
 
 
