@@ -8,8 +8,9 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.community.browsecomp import aggregate_metrics, parse_grade
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response
 from sieval.core.models.chat_model import ChatModel
+from sieval.core.models.transports import OpenAIChatTransport
 from sieval.core.tasks import (
     TaskContext,
     build_judgement_record,
@@ -23,31 +24,24 @@ from sieval.datasets.browsecomp import (
 from sieval.tasks.browsecomp_0shot_gen import (
     BrowseCompZeroShotGenTask,
 )
+from tests.conftest import HandlerTransport, n_of
 
 
 class _ScriptedChatModel(ChatModel):
-    """ChatModel returning a fixed reply, recording the last agenerate kwargs."""
+    """ChatModel returning a fixed reply, recording the last Request seen."""
 
     def __init__(self, reply: str, model: str = "mock"):
-        super().__init__(model=model, api_key="fake")
         self._reply = reply
-        self.last_kwargs: dict[str, object] = {}
+        self.last_req: Request | None = None
+        super().__init__(model=model, api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        # `finish_reasons` is set because the judge-family migration exists to
-        # persist the grader's WHOLE ModelOutput -- #51's flat `grader_reply`
-        # dropped everything but the text.
-        return ModelOutput(
-            model=self.meta(), texts=[self._reply], finish_reasons=["stop"]
-        )
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
 
-    async def _alogprobs_impl(
-        self, prompt, *, max_tokens=1, logprobs=5, echo=True, temperature=0.0, **kwargs
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_req = req
+        n = n_of(req)
+        return Response(texts=(self._reply,) * n, finish_reasons=("stop",) * n)
 
 
 def _sample() -> BrowseCompDatasetSample:
@@ -121,7 +115,9 @@ async def test_infer_forwards_n():
     await task.infer(
         {"prompt": [{"role": "user", "content": "q"}]}, TaskContext(sample_id=0)
     )
-    assert model.last_kwargs.get("n") == 3
+    assert model.last_req is not None
+    assert model.last_req.sampling is not None
+    assert model.last_req.sampling.n == 3
 
 
 # --- feedback: yes/no grading + confidence + provenance ---

@@ -26,5 +26,6 @@ class TestDefaultTransport:
 
     def test_transport_bound_to_shared_client_and_model(self):
         m = GenModel(model="m", api_key="k")
+        assert isinstance(m._transport, OpenAICompletionsTransport)
         assert m._transport._client is m._client
         assert m._transport._model == "m"

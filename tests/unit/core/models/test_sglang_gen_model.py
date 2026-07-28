@@ -24,6 +24,7 @@ class TestDefaultTransport:
 
     def test_transport_bound_to_shared_client_model_and_api_base(self):
         m = SglangGenModel(model="m", api_base="http://host:8000/v1", api_key="local")
+        assert isinstance(m._transport, SglangTransport)
         assert m._transport._client is m._client
         assert m._transport._model == "m"
         assert m._transport._api_base == "http://host:8000/v1"

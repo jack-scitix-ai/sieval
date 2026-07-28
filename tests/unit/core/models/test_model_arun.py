@@ -93,7 +93,7 @@ class TestAlogprobsEchoGate:
 
     @pytest.mark.anyio
     async def test_echo_false_on_chat_skips_the_gate(self):
-        from tests.conftest import MockChatModel
+        from tests.conftest import HandlerTransport, MockChatModel
 
         m = MockChatModel()
         # echo=False must skip the InputScoring gate and reach the transport.
@@ -101,4 +101,5 @@ class TestAlogprobsEchoGate:
         # check fires — proving the gate was bypassed and the request ran.
         with pytest.raises(RuntimeError, match="server returned none"):
             await m.alogprobs("prompt", echo=False)
+        assert isinstance(m._transport, HandlerTransport)
         assert m._transport.requests[0].score_input is False

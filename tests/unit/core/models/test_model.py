@@ -223,25 +223,28 @@ class TestConcurrencyPaths:
     @pytest.mark.anyio
     async def test_alogprobs_lowers_echo_to_score_input(self):
         """alogprobs args land on the Request the transport receives."""
-        from tests.conftest import MockGenModel
+        from tests.conftest import HandlerTransport, MockGenModel
 
         model = MockGenModel()
         await model.alogprobs("A", echo=False, max_tokens=2, logprobs=3)
 
+        assert isinstance(model._transport, HandlerTransport)
         req = model._transport.requests[0]
         assert req.score_input is False
         assert req.return_logprobs is True
         assert req.top_k == 3
+        assert req.sampling is not None
         assert req.sampling.max_tokens == 2
         assert req.sampling.temperature == 0.0
 
     @pytest.mark.anyio
     async def test_alogprobs_echo_true_sets_score_input(self):
-        from tests.conftest import MockGenModel
+        from tests.conftest import HandlerTransport, MockGenModel
 
         model = MockGenModel()
         await model.alogprobs("A", echo=True)
 
+        assert isinstance(model._transport, HandlerTransport)
         req = model._transport.requests[0]
         assert req.score_input is True
 
@@ -392,6 +395,7 @@ class TestBuilderValidation:
         assert req.return_logprobs is True
         assert req.top_k == 5
         assert req.score_input is True
+        assert req.sampling is not None
         assert req.sampling.max_tokens == 1
 
 

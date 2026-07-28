@@ -24,5 +24,6 @@ class TestDefaultTransport:
 
     def test_transport_bound_to_shared_client_and_model(self):
         m = ChatModel(model="m", api_key="k")
+        assert isinstance(m._transport, OpenAIChatTransport)
         assert m._transport._client is m._client
         assert m._transport._model == "m"

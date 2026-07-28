@@ -44,6 +44,14 @@ def _meta(**overrides: Any) -> dict:
     return meta
 
 
+def _sampling(body: dict) -> dict:
+    """Narrow ``body["sampling_params"]`` (typed JSONValue) to a dict for the
+    type checker; the sglang lower() always nests a dict there."""
+    sp = body["sampling_params"]
+    assert isinstance(sp, dict)
+    return sp
+
+
 # ===================================================================
 # URL derivation (moved from the legacy SglangGenModel tests)
 # ===================================================================
@@ -93,7 +101,7 @@ class TestLower:
     def test_max_tokens_maps_to_max_new_tokens(self):
         t, _ = _make_transport({"text": "", "meta_info": _meta()})
         body = t._lower(Request(input="hi", sampling=SamplingParams(max_tokens=7)))
-        assert body["sampling_params"]["max_new_tokens"] == 7
+        assert _sampling(body)["max_new_tokens"] == 7
 
     def test_score_input_sets_logprob_start_len_0(self):
         t, _ = _make_transport({"text": "", "meta_info": _meta()})
@@ -123,17 +131,17 @@ class TestLower:
         t, _ = _make_transport({"text": "", "meta_info": _meta()})
         body = t._lower(Request(input="hi", score_input=True))
         assert "echo" not in body
-        assert "echo" not in body["sampling_params"]
+        assert "echo" not in _sampling(body)
 
     def test_prefix_maps_to_prefill(self):
         t, _ = _make_transport({"text": "", "meta_info": _meta()})
         body = t._lower(Request(input="hi", prefix="PRE"))
-        assert body["sampling_params"]["prefill"] == "PRE"
+        assert _sampling(body)["prefill"] == "PRE"
 
     def test_score_input_forces_min_one_new_token(self):
         t, _ = _make_transport({"text": "", "meta_info": _meta()})
         body = t._lower(Request(input="hi", score_input=True))
-        assert body["sampling_params"]["max_new_tokens"] == 1
+        assert _sampling(body)["max_new_tokens"] == 1
 
     def test_all_sampling_params_map(self):
         t, _ = _make_transport({"text": "", "meta_info": _meta()})
@@ -151,7 +159,7 @@ class TestLower:
                 ),
             )
         )
-        sp = body["sampling_params"]
+        sp = _sampling(body)
         assert sp["temperature"] == 0.7
         assert sp["top_p"] == 0.9
         assert sp["top_k"] == 40
@@ -174,7 +182,7 @@ class TestExtraWireParams:
         body = t._lower(
             Request(input="hi", extra_wire_params={"repetition_penalty": 1.1})
         )
-        assert body["sampling_params"]["repetition_penalty"] == 1.1
+        assert _sampling(body)["repetition_penalty"] == 1.1
         assert "repetition_penalty" not in body  # nested, never top-level
 
     def test_unknown_keys_dropped(self):
@@ -183,9 +191,9 @@ class TestExtraWireParams:
             Request(input="hi", extra_wire_params={"seed": 1, "custom_flag": True})
         )
         assert "seed" not in body
-        assert "seed" not in body["sampling_params"]
+        assert "seed" not in _sampling(body)
         assert "custom_flag" not in body
-        assert "custom_flag" not in body["sampling_params"]
+        assert "custom_flag" not in _sampling(body)
 
     def test_explicit_ir_field_wins_over_extra_wire_params(self):
         t, _ = _make_transport({"text": "", "meta_info": _meta()})
@@ -196,7 +204,7 @@ class TestExtraWireParams:
                 extra_wire_params={"max_tokens": 99},
             )
         )
-        assert body["sampling_params"]["max_new_tokens"] == 7
+        assert _sampling(body)["max_new_tokens"] == 7
 
 
 # ===================================================================
