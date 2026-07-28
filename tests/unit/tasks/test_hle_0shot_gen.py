@@ -217,6 +217,7 @@ async def test_report_accuracy_and_counts_fails_in_denominator():
     # No infer_result on these contexts -> no truncation surfaced.
     assert report["truncated"] == 0
     assert report["judge_unparsed"] == 0
+    assert report["subset"] == "text_only"  # _task() defaults text_only=True
     assert report["accuracy"] == pytest.approx(33.33, abs=1e-2)
     assert report["score"] == report["accuracy"]
 
@@ -309,9 +310,17 @@ async def test_report_empty_is_zero():
     report = await task.report([], [])
     assert report["n"] == 0
     assert report["accuracy"] == 0.0
-    assert report["calibration_error"] == 0.0
+    assert report["calibration_error"] is None
     assert report["truncated"] == 0
     assert report["judge_unparsed"] == 0
+
+
+@pytest.mark.anyio
+async def test_report_subset_reflects_full_set():
+    # `subset` must distinguish a full-set run from the text-only default.
+    task, _, _ = _task(text_only=False)
+    report = await task.report([], [])
+    assert report["subset"] == "full"
 
 
 # --- prompt fidelity: byte-for-byte pins on the vendored HLE prompts ---
@@ -367,10 +376,11 @@ def test_parse_judge_unparseable_flags_not_parsed():
     assert parse_judge("the judge rambled without the fields") == (False, 100, False)
 
 
-def test_parse_judge_tolerates_markdown_bold():
-    # Markdown-bold field names / values must still parse (portability).
+def test_parse_judge_tolerates_markdown_bold_and_quotes():
+    # Markdown-bold and JSON-shaped (quoted) replies must still parse.
     assert parse_judge("**correct:** yes\n**confidence:** 70") == (True, 70, True)
     assert parse_judge("correct: **no**") == (False, 100, True)
+    assert parse_judge('{"correct": "yes", "confidence": "90"}') == (True, 90, True)
 
 
 def test_calib_err_matches_hand_computation():
@@ -390,13 +400,13 @@ def test_aggregate_metrics_accuracy_ci_and_calibration_guard():
     m = aggregate_metrics([True, False], [100, 50], n=4)
     assert m["accuracy"] == pytest.approx(25.0)
     assert m["confidence_interval"] == pytest.approx(42.44, abs=1e-2)
-    # Fewer than BETA judged records -> calibration guarded to 0.0.
-    assert m["calibration_error"] == 0.0
+    # Fewer than BETA graded records -> not computable, None (not a real 0.0).
+    assert m["calibration_error"] is None
 
 
 def test_aggregate_metrics_zero_n():
     assert aggregate_metrics([], [], n=0) == {
         "accuracy": 0.0,
         "confidence_interval": 0.0,
-        "calibration_error": 0.0,
+        "calibration_error": None,
     }

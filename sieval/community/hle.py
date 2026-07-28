@@ -32,8 +32,9 @@ Deviations from upstream (``hle_eval/run_judge_results.py`` @ 26dca2e):
 * ``aggregate_metrics`` returns a dict instead of printing, and guards
   ``len(confidence) < beta``: the vendored ``calib_err`` indexes ``bins[-1]`` and
   raises ``IndexError`` below ``beta`` judged records — unreachable for the full
-  HLE test set (~2.5k) but reachable via slices/tests, where it reports a
-  calibration error of 0.0. Numerator (correct count) and calibration arrays are
+  HLE test set (~2.5k) but reachable via slices/tests, where ``calibration_error``
+  is ``None`` (not computed, distinct from a real 0.0). Numerator (correct count)
+  and calibration arrays are
   built only from judged attempts while the denominator ``n`` is supplied by the
   caller (finals + failures), mirroring upstream where unjudged/failed
   predictions stay in ``n`` but out of the ``correct`` array.
@@ -71,9 +72,10 @@ confidence: The extracted confidence score between 0|\%| and 100|\%| from [respo
 BETA = 100
 
 # `\b` anchors the field name so it never matches inside "incorrect:"; the
-# `\**` runs tolerate markdown bold around the field name and its value.
-_CORRECT_RE = re.compile(r"\bcorrect\**\s*:\s*\**\s*(yes|no)", re.IGNORECASE)
-_CONFIDENCE_RE = re.compile(r"\bconfidence\**\s*:\s*\**\s*(\d+)", re.IGNORECASE)
+# bracketed runs tolerate markdown bold (`*`), quotes (JSON-shaped replies) and
+# whitespace around the field name, the colon and the value.
+_CORRECT_RE = re.compile(r"\bcorrect[\s\"'*]*:[\s\"'*]*(yes|no)", re.IGNORECASE)
+_CONFIDENCE_RE = re.compile(r"\bconfidence[\s\"'*]*:[\s\"'*]*(\d+)", re.IGNORECASE)
 
 
 def parse_judge(reply: str) -> tuple[bool, int, bool]:
@@ -135,7 +137,7 @@ def calib_err(confidence, correct, p="2", beta=100):
 
 def aggregate_metrics(
     correct: list[bool], confidence: list[int], n: int
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     """Aggregate judged ``correct``/``confidence`` into HLE metrics.
 
     Mirrors upstream ``dump_metrics``: ``correct``/``confidence`` are the judged
@@ -143,17 +145,22 @@ def aggregate_metrics(
     count (denominator) so failed/ungraded attempts count as incorrect.
 
     Returns accuracy (%), the 95% Wald half-width (``confidence_interval``, in
-    percentage points), and ``calibration_error`` (0..100). ``n == 0`` yields
-    all-zero metrics; fewer than ``BETA`` judged attempts yields
-    ``calibration_error`` 0.0 (see module docstring).
+    percentage points), and ``calibration_error`` (0..100), which is ``None``
+    when it cannot be computed — ``n == 0`` or fewer than ``BETA`` graded
+    attempts — so "not computed" is not conflated with a real 0.0.
     """
     if n == 0:
-        return {"accuracy": 0.0, "confidence_interval": 0.0, "calibration_error": 0.0}
+        return {
+            "accuracy": 0.0,
+            "confidence_interval": 0.0,
+            "calibration_error": None,
+        }
 
     accuracy = round(100 * sum(correct) / n, 2)
     # Wald estimator, 95% confidence interval
     confidence_interval = round(1.96 * math.sqrt(accuracy * (100 - accuracy) / n), 2)
 
+    calibration_error: float | None
     if len(confidence) >= BETA:
         confidence_arr = np.array(confidence) / 100
         correct_arr = np.array(correct)
@@ -161,7 +168,7 @@ def aggregate_metrics(
             float(calib_err(confidence_arr, correct_arr, p="2", beta=BETA)), 2
         )
     else:
-        calibration_error = 0.0
+        calibration_error = None
 
     return {
         "accuracy": accuracy,

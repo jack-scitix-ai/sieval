@@ -7,11 +7,14 @@ judge** decides whether the free-form answer matches the gold. Headline metric
 is accuracy; the judge also extracts the model's confidence, from which a
 calibration error is computed (alongside a 95% Wald confidence interval).
 
-Subset: the **text-only** subset is graded by default (``text_only=True``);
-technical reports mark full-set (text + image) numbers with ``*``. Image
-questions carry a base64 data URI in the ``image`` column; ``text_only`` drops
-them, and with ``text_only=False`` the image is attached as an ``image_url``
-content block (requires a vision-capable candidate + judge). Ordering caveat:
+Subset: the **text-only** subset is graded by default (``text_only=True``)
+because the full text+image set requires a vision-capable candidate *and*
+judge, so text-only is the broadly reproducible default. Reports that evaluate
+only text-only mark those numbers with ``*`` (flagging that the multimodal
+questions are excluded); the full text+image set is the unmarked headline.
+Image questions carry a base64 data URI in the ``image`` column; ``text_only``
+drops them, and with ``text_only=False`` the image is attached as an
+``image_url`` content block. Ordering caveat:
 ``text_only`` selection runs at task construction, *after* any session-level
 dataset sampling — a sampling budget therefore applies to the full set and
 ``text_only`` shrinks it further, so size the budget against the full set.
@@ -25,6 +28,9 @@ Deviations from upstream (``hle_eval`` @ 26dca2e; see ``sieval.community.hle``):
   ``beta.chat.completions.parse`` structured output; its ``correct``/``confidence``
   fields are parsed from the reply (see ``sieval.community.hle.parse_judge``).
 * Calibration error is guarded below the bin size for slices/tests (docs there).
+* Subset selection (``text_only``, default ``True``) is a sieval addition —
+  upstream has no subset flag and always grades the full set; kept task-side so
+  ``HLEDataset`` stays a thin loader.
 
 Decoding params are model-layer, set via ``models:`` / ``infer_args`` — never by
 this task. Upstream HLE defaults to ``temperature=0`` and advises
@@ -101,8 +107,10 @@ class JudgeFeedback(TypedDict):
             "confidence fields are parsed from the reply. Metrics mirror upstream "
             "dump_metrics: accuracy, a 95% Wald confidence interval, and "
             "calibration error (calib_err, p=2, beta=100). Text-only subset by "
-            "default (text_only=True); full set (text_only=False) is marked * in "
-            "reports. Grader is a REAL LLM (upstream default o3-mini-2025-01-31) "
+            "default (text_only=True; the full text+image set needs a vision-"
+            "capable candidate + judge); text-only numbers are the asterisked "
+            "variant in reports, the full set being the unmarked headline. "
+            "Grader is a REAL LLM (upstream default o3-mini-2025-01-31) "
             "supplied via the `grader` task arg on its own api_base/api_key. "
             "REPRODUCIBILITY: scores depend on the judge endpoint's model version "
             "(not pinnable like a Hub revision) — pin the grader model; the "
@@ -120,7 +128,7 @@ class HLEZeroShotGenTask(
         ModelOutput,
         list[str],
         list[JudgeFeedback],
-        dict[str, float],
+        dict[str, float | str | None],
     ]
 ):
     def __init__(
@@ -136,6 +144,7 @@ class HLEZeroShotGenTask(
             dataset = self._select_text_only(dataset)
         super().__init__(dataset=dataset, model=model, name=name)
         self._n = n
+        self._text_only = text_only  # reported as the `subset` field
         self._grader = self._build_grader(grader)
 
     @staticmethod
@@ -164,7 +173,9 @@ class HLEZeroShotGenTask(
                 "source may lack the 'image' column or contain only multi-modal "
                 "questions."
             )
-        return type(dataset)(_hf_dict=filtered)
+        # `_clone_with_new_dict` is core's shallow-clone idiom (see repeat/slice/
+        # shuffle); it preserves subclass identity without touching the ctor.
+        return dataset._clone_with_new_dict(filtered)
 
     @staticmethod
     def _build_grader(grader: Mapping | Model | None) -> Model:
@@ -263,6 +274,10 @@ class HLEZeroShotGenTask(
                 continue
             truncated += sum(reason == "length" for reason in out.finish_reasons)
         m = aggregate_metrics(correct, confidence, n)
+        # `truncated` / `judge_unparsed` are counts over the graded attempts in
+        # `finals`, not rates over `n` (which also spans `fails`). `subset`
+        # records which set was evaluated so a text-only run is distinguishable
+        # from a full-set one in the report alone.
         return {
             "score": m["accuracy"],
             "accuracy": m["accuracy"],
@@ -273,4 +288,5 @@ class HLEZeroShotGenTask(
             "fails": len(fails),
             "judge_unparsed": judge_unparsed,
             "truncated": truncated,
+            "subset": "text_only" if self._text_only else "full",
         }
