@@ -7,17 +7,11 @@ judge** decides whether the free-form answer matches the gold. Headline metric
 is accuracy; the judge also extracts the model's confidence, from which a
 calibration error is computed (alongside a 95% Wald confidence interval).
 
-Subset: the **text-only** subset is graded by default (``text_only=True``)
-because the full text+image set requires a vision-capable candidate *and*
-judge, so text-only is the broadly reproducible default. Reports that evaluate
-only text-only mark those numbers with ``*`` (flagging that the multimodal
-questions are excluded); the full text+image set is the unmarked headline.
-Image questions carry a base64 data URI in the ``image`` column; ``text_only``
-drops them, and with ``text_only=False`` the image is attached as an
-``image_url`` content block. Ordering caveat:
-``text_only`` selection runs at task construction, *after* any session-level
-dataset sampling — a sampling budget therefore applies to the full set and
-``text_only`` shrinks it further, so size the budget against the full set.
+Subset: a dataset-level choice — ``HLEDataset`` drops image questions unless
+``datasets.hle.args.text_only: false`` (a sieval addition; upstream always
+grades the full set), and ``report()`` echoes it as ``subset``. This task grades
+whatever it is handed, attaching an ``image_url`` content block for image
+questions exactly as upstream ``format_message`` does.
 
 Deviations from upstream (``hle_eval`` @ 26dca2e; see ``sieval.community.hle``):
 
@@ -28,9 +22,9 @@ Deviations from upstream (``hle_eval`` @ 26dca2e; see ``sieval.community.hle``):
   ``beta.chat.completions.parse`` structured output; its ``correct``/``confidence``
   fields are parsed from the reply (see ``sieval.community.hle.parse_judge``).
 * Calibration error is guarded below the bin size for slices/tests (docs there).
-* Subset selection (``text_only``, default ``True``) is a sieval addition —
-  upstream has no subset flag and always grades the full set; kept task-side so
-  ``HLEDataset`` stays a thin loader.
+
+Subset selection is a sieval addition too, but it lives on ``HLEDataset``, so
+this task stays isomorphic to upstream ``run_model_predictions.py``.
 
 Decoding params are model-layer, set via ``models:`` / ``infer_args`` — never by
 this task. Upstream HLE defaults to ``temperature=0`` and advises
@@ -57,7 +51,6 @@ AI-Generated Code - Claude Opus 4.8 (Anthropic)
 from collections.abc import Mapping
 from typing import TypedDict, override
 
-from datasets import DatasetDict as HFDatasetDict
 from openai.types.chat import ChatCompletionMessageParam
 
 from sieval.community.hle import (
@@ -66,7 +59,6 @@ from sieval.community.hle import (
     aggregate_metrics,
     parse_judge,
 )
-from sieval.core.datasets import Dataset
 from sieval.core.models import ChatModel, Model, ModelOutput
 from sieval.core.tasks import (
     EvalMode,
@@ -74,7 +66,7 @@ from sieval.core.tasks import (
     Task,
     sieval_task,
 )
-from sieval.datasets import HLEDatasetSample
+from sieval.datasets import HLEDataset, HLEDatasetSample
 
 
 class JudgeFeedback(TypedDict):
@@ -106,10 +98,12 @@ class JudgeFeedback(TypedDict):
             "beta.chat.completions.parse structured output, and its correct/"
             "confidence fields are parsed from the reply. Metrics mirror upstream "
             "dump_metrics: accuracy, a 95% Wald confidence interval, and "
-            "calibration error (calib_err, p=2, beta=100). Text-only subset by "
-            "default (text_only=True; the full text+image set needs a vision-"
-            "capable candidate + judge); text-only numbers are the asterisked "
-            "variant in reports, the full set being the unmarked headline. "
+            "calibration error (calib_err, p=2, beta=100). Subset selection is a "
+            "sieval addition living on HLEDataset (datasets.hle.args.text_only, "
+            "default true — the full text+image set needs a vision-capable "
+            "candidate + judge); text-only numbers are the asterisked variant in "
+            "reports, the full set the unmarked headline, and report() echoes "
+            "which subset was graded. "
             "Grader is a REAL LLM (upstream default o3-mini-2025-01-31) "
             "supplied via the `grader` task arg on its own api_base/api_key. "
             "REPRODUCIBILITY: scores depend on the judge endpoint's model version "
@@ -133,49 +127,18 @@ class HLEZeroShotGenTask(
 ):
     def __init__(
         self,
-        dataset,
+        dataset: HLEDataset,
         model,
         name: str | None = None,
         grader: Mapping | Model | None = None,
         n: int = 1,
-        text_only: bool = True,
     ):
-        if text_only:
-            dataset = self._select_text_only(dataset)
         super().__init__(dataset=dataset, model=model, name=name)
         self._n = n
-        self._text_only = text_only  # reported as the `subset` field
+        # Which subset was loaded is the dataset's decision; read it back so
+        # `report()` can record it.
+        self._text_only = dataset.text_only
         self._grader = self._build_grader(grader)
-
-    @staticmethod
-    def _select_text_only(
-        dataset: Dataset[HLEDatasetSample],
-    ) -> Dataset[HLEDatasetSample]:
-        """Return a clone keeping only text-only questions (empty ``image``).
-
-        ``image`` is a string column (``""`` when absent). The filter reads only
-        that column (``input_columns=["image"]``) so HF never materializes the
-        sibling ``image_preview`` / ``rationale_image`` ``Image`` features, which
-        default to ``decode=True`` and would otherwise pull in Pillow. Raises if
-        the filter empties the ``test`` split — a signal that the ``image``
-        column is missing or every question is multi-modal.
-        """
-        source = dataset.dataset_dict
-        filtered = HFDatasetDict(
-            {
-                split: ds.filter(lambda image: not image, input_columns=["image"])
-                for split, ds in source.items()
-            }
-        )
-        if "test" in filtered and len(filtered["test"]) == 0:
-            raise ValueError(
-                "HLE text-only selection produced an empty 'test' split; the "
-                "source may lack the 'image' column or contain only multi-modal "
-                "questions."
-            )
-        # `_clone_with_new_dict` is core's shallow-clone idiom (see repeat/slice/
-        # shuffle); it preserves subclass identity without touching the ctor.
-        return dataset._clone_with_new_dict(filtered)
 
     @staticmethod
     def _build_grader(grader: Mapping | Model | None) -> Model:

@@ -9,13 +9,20 @@ mirrors it as-is.
 Access: ``cais/hle`` is a gated Hub repo — downloading requires accepting the
 gate on the dataset page and an authenticated ``HF_TOKEN`` in the environment.
 
-The model-facing image is the ``image`` column — a plain string (a base64 data
-URI, ``""`` when absent), preserved untouched. The repo also ships two auxiliary
-``Image`` feature columns (``image_preview``, ``rationale_image``) that default
-to ``decode=True``; no task consumes them, but materializing a row would decode
-them and pull in Pillow. Decoding is disabled here (``Image(decode=False)``) so
-the rows stay Pillow-free while keeping the raw bytes available; text-only vs.
-full-set selection remains the task's concern.
+Subset selection (``text_only``, default ``True``) is a sieval addition —
+upstream ``hle_eval`` @ 26dca2e always grades the full set. It applies at load
+time, before any ``operations:`` sampling, so a sampling budget covers exactly
+the set that gets graded. Image questions are dropped by default because the
+full set needs a vision-capable candidate *and* judge; reports mark text-only
+numbers with ``*``, the full set being the unmarked headline.
+
+The model-facing image is the ``image`` column — a base64 data URI string
+(``""`` when absent), preserved untouched. The auxiliary ``image_preview`` /
+``rationale_image`` columns are ``Image`` features nothing consumes, but they
+would pull in Pillow once a row is materialized, so their decoding is disabled
+(raw bytes kept). Upstream needs neither the guard nor Pillow: it reads the
+split with ``.to_dict()``, a bulk export that skips the per-example decoder,
+whereas sieval materializes rows one at a time.
 
 AI-Generated Code - Claude Opus 4.8 (Anthropic)
 """
@@ -63,10 +70,45 @@ class HLEDataset(Dataset[HLEDatasetSample]):
     # access would require Pillow, so disable it (raw bytes are kept).
     _IMAGE_FEATURE_COLUMNS = ("image_preview", "rationale_image")
 
+    # Fallback for instances built from a pre-materialized dict, which bypass
+    # `load`; the real value is recorded there.
+    _text_only: bool = True
+
+    @property
+    def text_only(self) -> bool:
+        """Whether image questions were dropped at load time."""
+        return self._text_only
+
     @override
-    def load(self, name_or_path: str, **kwargs) -> HFDatasetDict:
+    def load(
+        self, name_or_path: str, *, text_only: bool = True, **kwargs
+    ) -> HFDatasetDict:
+        """Load HLE, dropping image questions when *text_only*.
+
+        *text_only* is captured explicitly so it cannot leak into
+        ``load_dataset``. The filter reads only the ``image`` column so HF never
+        materializes the ``Image`` features. Raises if it empties the ``test``
+        split — the ``image`` column is missing, or every question is
+        multi-modal.
+        """
+        self._text_only = text_only
         dataset = ensure_dataset_dict(load_dataset(name_or_path, **kwargs))
         for split in dataset:
             for column in self._IMAGE_FEATURE_COLUMNS:
                 dataset[split] = dataset[split].cast_column(column, Image(decode=False))
-        return dataset
+        if not text_only:
+            return dataset
+
+        filtered = HFDatasetDict(
+            {
+                split: ds.filter(lambda image: not image, input_columns=["image"])
+                for split, ds in dataset.items()
+            }
+        )
+        if "test" in filtered and len(filtered["test"]) == 0:
+            raise ValueError(
+                "HLE text-only selection produced an empty 'test' split; the "
+                "source may lack the 'image' column or contain only multi-modal "
+                "questions."
+            )
+        return filtered

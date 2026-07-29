@@ -3,11 +3,14 @@
 AI-Generated Code - Claude Opus 4.8 (Anthropic)
 """
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
+import sieval.datasets.hle as hle_module
 from sieval.community.hle import (
     JUDGE_PROMPT,
     SYSTEM_PROMPT,
@@ -56,8 +59,11 @@ def _row(image: str = "") -> dict:
     }
 
 
-def _dataset(rows: list[dict]) -> HLEDataset:
-    return HLEDataset(_hf_dict=HFDatasetDict({"test": HFDataset.from_list(rows)}))
+def _dataset(rows: list[dict], *, text_only: bool = True) -> HLEDataset:
+    """Build through the real ``load`` path so ``text_only`` is recorded on it."""
+    hf = HFDatasetDict({"test": HFDataset.from_list(rows)})
+    with patch.object(hle_module, "load_dataset", return_value=hf):
+        return HLEDataset("cais/hle", text_only=text_only)
 
 
 def _task(
@@ -67,10 +73,10 @@ def _task(
     text_only: bool = True,
     n: int = 1,
 ):
-    dataset = _dataset(rows if rows is not None else [_row()])
+    dataset = _dataset(rows if rows is not None else [_row()], text_only=text_only)
     model = _ScriptedChatModel(reply="Answer: 4", model="candidate")
     grader = _ScriptedChatModel(reply=grader_reply, model="judge-5.2")
-    task = HLEZeroShotGenTask(dataset, model, grader=grader, n=n, text_only=text_only)
+    task = HLEZeroShotGenTask(dataset, model, grader=grader, n=n)
     return task, model, grader
 
 
@@ -89,27 +95,24 @@ def test_build_grader_accepts_mapping_and_model():
     assert HLEZeroShotGenTask._build_grader(existing) is existing
 
 
-# --- text-only selection drops image questions ---
+# --- subset is the dataset's decision; the task only grades what it is handed ---
 
 
-def test_text_only_keeps_only_text_questions():
+def test_task_does_not_refilter_a_text_only_dataset():
+    # The task has no `text_only` arg: the image question was already dropped at
+    # load time, and the task must neither re-filter nor restore it.
     task, _, _ = _task(rows=[_row(), _row(image="data:image/png;base64,AAAA")])
     assert task.dataset.test_set is not None
     assert len(task.dataset.test_set) == 1
     assert task.dataset.test_set[0]["image"] == ""
 
 
-def test_full_set_keeps_image_questions():
+def test_task_keeps_image_questions_from_a_full_set_dataset():
     task, _, _ = _task(
         rows=[_row(), _row(image="data:image/png;base64,AAAA")], text_only=False
     )
     assert task.dataset.test_set is not None
     assert len(task.dataset.test_set) == 2
-
-
-def test_text_only_all_multimodal_raises():
-    with pytest.raises(ValueError, match="empty 'test' split"):
-        _task(rows=[_row(image="data:image/png;base64,AAAA")])
 
 
 # --- preprocess: HLE system prompt + user content blocks (mirrors format_message) ---
@@ -217,7 +220,7 @@ async def test_report_accuracy_and_counts_fails_in_denominator():
     # No infer_result on these contexts -> no truncation surfaced.
     assert report["truncated"] == 0
     assert report["judge_unparsed"] == 0
-    assert report["subset"] == "text_only"  # _task() defaults text_only=True
+    assert report["subset"] == "text_only"  # dataset loaded the text-only subset
     assert report["accuracy"] == pytest.approx(33.33, abs=1e-2)
     assert report["score"] == report["accuracy"]
 

@@ -5,6 +5,7 @@ AI-Generated Code - Claude Opus 4.8 (Anthropic)
 
 from unittest.mock import patch
 
+import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 from datasets import Features, Image, Value
@@ -82,3 +83,43 @@ def test_load_disables_auxiliary_image_decoding():
 
     assert loaded["test"].features["image_preview"].decode is False
     assert loaded["test"].features["rationale_image"].decode is False
+
+
+# --- subset selection: sieval addition, applied at load time (before operations:) ---
+
+
+def _build(rows: list[dict], *, text_only: bool = True) -> HLEDataset:
+    hf = HFDatasetDict({"test": HFDataset.from_list(rows)})
+    with patch.object(hle_module, "load_dataset", return_value=hf):
+        return HLEDataset("cais/hle", text_only=text_only)
+
+
+def test_text_only_default_drops_image_questions():
+    dataset = _build([_row(), _row(image="data:image/png;base64,AAAA")])
+    assert dataset.test_set is not None
+    assert len(dataset.test_set) == 1
+    assert dataset.test_set[0]["image"] == ""
+    assert dataset.text_only is True
+
+
+def test_full_set_keeps_image_questions():
+    dataset = _build(
+        [_row(), _row(image="data:image/png;base64,AAAA")], text_only=False
+    )
+    assert dataset.test_set is not None
+    assert len(dataset.test_set) == 2
+    assert dataset.text_only is False
+
+
+def test_text_only_all_multimodal_raises():
+    with pytest.raises(ValueError, match="empty 'test' split"):
+        _build([_row(image="data:image/png;base64,AAAA")])
+
+
+def test_text_only_never_leaks_into_load_dataset():
+    # `text_only` is captured by the signature, so it must not reach the Hub call.
+    hf = HFDatasetDict({"test": HFDataset.from_list([_row()])})
+    with patch.object(hle_module, "load_dataset", return_value=hf) as mock_load:
+        HLEDataset("cais/hle", text_only=True, revision=HLE_REVISION)
+    assert "text_only" not in mock_load.call_args.kwargs
+    assert mock_load.call_args.kwargs["revision"] == HLE_REVISION
