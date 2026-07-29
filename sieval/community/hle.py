@@ -16,28 +16,21 @@ Wald confidence interval, and calibration error).
 
 Deviations from upstream (``hle_eval/run_judge_results.py`` @ 26dca2e):
 
-* Judge invocation. Upstream calls ``client.beta.chat.completions.parse`` with
-  the ``ExtractedAnswer`` Pydantic ``response_format`` (server-enforced
-  structured output). sieval reaches the judge through the generic ``ChatModel``
-  (``chat.completions`` returning text), so ``parse_judge`` reads the judge's
-  reply textually for the ``correct`` (yes/no) and ``confidence`` fields the
-  prompt already specifies. Why: the judge runs on an arbitrary ``api_base`` and
-  not every endpoint enforces a JSON schema — parsing the prompted field format
-  keeps the judge endpoint-agnostic. Correctness follows upstream semantics
-  (``"yes" in judge_response["correct"]``). An unparseable reply (no ``correct``
-  field) returns ``parsed=False`` and is dropped from the grading arrays by the
-  caller — mirroring upstream's ``None`` on judge failure: it stays in ``n``
-  (counted incorrect) but out of the confidence/calibration arrays, rather than
-  being scored as a spurious max-confidence verdict.
+* Judge invocation. Upstream uses ``beta.chat.completions.parse`` with the
+  ``ExtractedAnswer`` schema; sieval goes through the generic ``ChatModel``, so
+  ``parse_judge`` reads ``correct``/``confidence`` textually — the judge runs on
+  an arbitrary ``api_base`` and not every endpoint enforces a JSON schema.
+  Correctness follows upstream semantics (``"yes" in ...["correct"]``). An
+  unparseable reply returns ``parsed=False`` and the caller drops it from the
+  grading arrays, mirroring upstream's ``None`` on judge failure: still in
+  ``n`` (counted incorrect), out of the calibration arrays.
 * ``aggregate_metrics`` returns a dict instead of printing, and guards
-  ``len(confidence) < beta``: the vendored ``calib_err`` indexes ``bins[-1]`` and
-  raises ``IndexError`` below ``beta`` judged records — unreachable for the full
-  HLE test set (~2.5k) but reachable via slices/tests, where ``calibration_error``
-  is ``None`` (not computed, distinct from a real 0.0). Numerator (correct count)
-  and calibration arrays are
-  built only from judged attempts while the denominator ``n`` is supplied by the
-  caller (finals + failures), mirroring upstream where unjudged/failed
-  predictions stay in ``n`` but out of the ``correct`` array.
+  ``len(confidence) < beta`` (the vendored ``calib_err`` indexes ``bins[-1]``
+  and raises below that), reporting ``calibration_error`` as ``None`` —
+  distinct from a real 0.0. Numerator and calibration arrays come from judged
+  attempts only; the caller supplies ``n`` (finals + failures) as the
+  denominator, matching upstream where failed predictions stay in ``n`` but out
+  of ``correct``.
 
 AI-Generated Code - Claude Opus 4.8 (Anthropic)
 """
@@ -81,16 +74,13 @@ _CONFIDENCE_RE = re.compile(r"\bconfidence[\s\"'*]*:[\s\"'*]*(\d+)", re.IGNORECA
 def parse_judge(reply: str) -> tuple[bool, int, bool]:
     """Extract ``(correct, confidence, parsed)`` from a judge reply.
 
-    The judge is prompted (see ``JUDGE_PROMPT``) to emit ``correct: yes|no`` and
-    ``confidence: <int>`` fields. Both appear after the free-form ``reasoning``
-    field, so the last match of each pattern wins. ``parsed`` is ``True`` only
-    when the ``correct`` field was found (upstream semantics:
-    ``"yes" in judge_response["correct"]``); on an unparseable reply it is
-    ``False`` so the caller can drop the record from the grading arrays —
-    mirroring upstream's ``None`` on judge failure — rather than materializing a
-    spurious verdict. ``confidence`` falls back to 100 only when ``correct``
-    parsed but no ``confidence`` field is present (the prompt's own "Put 100 if
-    there is no confidence score" case, which is about the candidate's score).
+    ``JUDGE_PROMPT`` puts ``correct: yes|no`` and ``confidence: <int>`` after
+    the free-form ``reasoning``, so the last match of each wins. ``parsed`` is
+    ``True`` only when ``correct`` was found; otherwise the caller drops the
+    record rather than materializing a spurious verdict. ``confidence`` falls
+    back to 100 only when ``correct`` parsed without one — the prompt's own
+    "Put 100 if there is no confidence score" case, which is about the
+    candidate's score, not judge failure.
     """
     correct_matches = _CORRECT_RE.findall(reply)
     parsed = bool(correct_matches)
@@ -148,6 +138,11 @@ def aggregate_metrics(
     percentage points), and ``calibration_error`` (0..100), which is ``None``
     when it cannot be computed — ``n == 0`` or fewer than ``BETA`` graded
     attempts — so "not computed" is not conflated with a real 0.0.
+
+    One band escapes that sentinel: at ``BETA``..``2 * BETA`` graded attempts
+    ``calib_err``'s ``range(len(bins) - 1)`` loop never runs and it returns a
+    structural ``0.0``. That is upstream's dropped-last-bin behaviour, kept
+    as-is and unreachable on the full ~2.5k set; read it as uninformative.
     """
     if n == 0:
         return {
