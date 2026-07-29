@@ -50,6 +50,20 @@ def test_build_prompt_single_document_no_join_separator():
         # A word starting with "CORRECT" must not match the CORRECT token.
         ("CORRECTNESS: INCORRECT", "INCORRECT"),
         ("correctness: incorrect", "INCORRECT"),
+        # Hedged verdicts are INCORRECT: the checker is binary and requires the
+        # candidate be *consistent with* the official answer, so a partial match
+        # is not CORRECT. Reading these as CORRECT would inflate accuracy.
+        ("Partially correct.", "INCORRECT"),
+        ("PARTLY CORRECT", "INCORRECT"),
+        ("SEMI-CORRECT", "INCORRECT"),
+        ("Mostly correct", "INCORRECT"),
+        ("somewhat correct", "INCORRECT"),
+        ("almost correct", "INCORRECT"),
+        ("partially incorrect", "INCORRECT"),
+        # A hedge that does not qualify the verdict must not suppress it.
+        ("The candidate is almost identical to the official. CORRECT", "CORRECT"),
+        # Ordinary lead-ins still read as a bare verdict.
+        ("Verdict: CORRECT", "CORRECT"),
         ("", "INCORRECT"),
         ("gibberish", "INCORRECT"),
     ],

@@ -17,9 +17,11 @@ card's own snippets reproduced verbatim. Implementation notes:
 * ``build_prompt`` mirrors the card's two-step assembly (join documents, then
   fill the outer template); documents are joined in the given order — the card
   requires ``data_source_filenames`` order, which the loader preserves.
-* Grading is **binary** ``CORRECT``/``INCORRECT`` (no ``NOT_ATTEMPTED`` tier),
-  so ``parse_grade`` maps an unrecognized reply to ``INCORRECT`` (conservative),
-  and ``aggregate_metrics`` reports plain accuracy — unlike the SimpleQA-style
+* Grading is **binary** ``CORRECT``/``INCORRECT`` (no ``NOT_ATTEMPTED`` tier)
+  and the card requires the candidate be *consistent with* the official answer.
+  So ``parse_grade`` maps both an unrecognized reply and a qualified verdict
+  (``not correct``, ``partially correct``) to ``INCORRECT``, and
+  ``aggregate_metrics`` reports plain accuracy — unlike the SimpleQA-style
   A/B/C + F1 aggregation in ``sieval.community.simpleqa_verified``.
 * The port's one score-affecting deviation from the card lives in the task
   module (``sieval.tasks.aa_lcr_0shot_gen``): empty/whitespace candidates are
@@ -78,9 +80,17 @@ def build_prompt(documents: list[str], question: str) -> str:
     return PROMPT_TEMPLATE.format(documents_text=documents_text, question=question)
 
 
-# Verdict phrase, negation-aware: matches CORRECT / INCORRECT / NOT CORRECT
-# (input is uppercased before matching).
-_VERDICT_RE = re.compile(r"\b(?:NOT\s+)?(?:IN)?CORRECT\b")
+# Qualifiers that, placed directly on the verdict, mean the candidate is not
+# consistent with the official answer: negation plus the hedges a checker reaches
+# for when the answer is only a partial match. Enumerated rather than "any
+# preceding word" so ordinary lead-ins ("VERDICT: CORRECT", "IS CORRECT") still
+# read as a bare verdict.
+_QUALIFIER = r"NOT|PARTIALLY|PARTLY|SEMI|MOSTLY|LARGELY|SOMEWHAT|NEARLY|ALMOST"
+# Verdict phrase, qualifier-aware: matches CORRECT / INCORRECT as well as
+# qualified forms (NOT CORRECT, PARTIALLY CORRECT, SEMI-CORRECT). Input is
+# uppercased before matching; a qualified match is not the bare "CORRECT"
+# string, so it falls through to INCORRECT.
+_VERDICT_RE = re.compile(rf"\b(?:(?:{_QUALIFIER})[\s-]+)?(?:IN)?CORRECT\b")
 
 
 def parse_grade(grading_response: str) -> str:
@@ -88,9 +98,15 @@ def parse_grade(grading_response: str) -> str:
 
     The grader is instructed to reply with only ``CORRECT`` or ``INCORRECT``.
     The **last** verdict phrase wins — a model that reasons before answering
-    puts the verdict at the end. Matching is word-bounded and negation-aware:
-    ``CORRECTNESS`` never matches the ``CORRECT`` token, and ``not correct``
-    counts as INCORRECT rather than falling through to a bare ``CORRECT``.
+    puts the verdict at the end. Matching is word-bounded and qualifier-aware:
+
+    * ``CORRECTNESS`` never matches the ``CORRECT`` token;
+    * ``not correct`` counts as INCORRECT rather than falling through to a bare
+      ``CORRECT``;
+    * so does a hedged verdict (``partially correct``, ``semi-correct``) —
+      AA-LCR's checker is binary and requires the candidate be *consistent
+      with* the official answer, so a partial match is not CORRECT.
+
     Replies with no recognizable verdict — empty or malformed — are INCORRECT;
     AA-LCR has no not-attempted tier.
     """
