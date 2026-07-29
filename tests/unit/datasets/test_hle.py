@@ -16,14 +16,18 @@ from sieval.datasets.hle import HLE_REVISION, HLEDataset
 
 
 def _row(image: str = "") -> dict:
+    # Mirrors the pinned revision's schema, including the auxiliary Image
+    # columns — `load` asserts they exist before disabling their decoding.
     return {
         "id": "q1",
         "question": "What is 2 + 2?",
         "image": image,
+        "image_preview": None,
         "answer": "4",
         "answer_type": "exactMatch",
         "author_name": "author",
         "rationale": "",
+        "rationale_image": None,
         "raw_subject": "Math",
         "category": "Math",
     }
@@ -83,6 +87,19 @@ def test_load_disables_auxiliary_image_decoding():
 
     assert loaded["test"].features["image_preview"].decode is False
     assert loaded["test"].features["rationale_image"].decode is False
+
+
+def test_missing_auxiliary_image_column_raises():
+    # `cast_column` fails open — on an absent column it silently adds an empty
+    # one instead of raising, which would drop the Pillow guard with no signal.
+    # Schema drift must therefore be caught before the cast.
+    drifted = {k: v for k, v in _row().items() if k != "rationale_image"}
+    hf = HFDatasetDict({"test": HFDataset.from_list([drifted])})
+    with (
+        patch.object(hle_module, "load_dataset", return_value=hf),
+        pytest.raises(ValueError, match="rationale_image"),
+    ):
+        HLEDataset("cais/hle")
 
 
 # --- subset selection: sieval addition, applied at load time (before operations:) ---

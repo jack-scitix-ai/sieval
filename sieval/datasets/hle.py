@@ -22,7 +22,9 @@ The model-facing image is the ``image`` column — a base64 data URI string
 would pull in Pillow once a row is materialized, so their decoding is disabled
 (raw bytes kept). Upstream needs neither the guard nor Pillow: it reads the
 split with ``.to_dict()``, a bulk export that skips the per-example decoder,
-whereas sieval materializes rows one at a time.
+whereas sieval materializes rows one at a time. Their presence is asserted
+first — ``cast_column`` fails open, silently adding an empty column instead of
+raising.
 
 AI-Generated Code - Claude Opus 4.8 (Anthropic)
 """
@@ -94,6 +96,18 @@ class HLEDataset(Dataset[HLEDatasetSample]):
         self._text_only = text_only
         dataset = ensure_dataset_dict(load_dataset(name_or_path, **kwargs))
         for split in dataset:
+            missing = [
+                column
+                for column in self._IMAGE_FEATURE_COLUMNS
+                if column not in dataset[split].column_names
+            ]
+            if missing:
+                raise ValueError(
+                    f"HLE split {split!r} is missing auxiliary image column(s): "
+                    f"{', '.join(missing)}. The pinned revision carries both, so "
+                    "this is upstream schema drift; `cast_column` would silently "
+                    "add them as empty and lose the Pillow guard."
+                )
             for column in self._IMAGE_FEATURE_COLUMNS:
                 dataset[split] = dataset[split].cast_column(column, Image(decode=False))
         if not text_only:

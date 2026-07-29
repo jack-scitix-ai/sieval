@@ -46,14 +46,18 @@ class _ScriptedChatModel(ChatModel):
 
 
 def _row(image: str = "") -> dict:
+    # Mirrors the pinned revision's schema; `HLEDataset.load` asserts the
+    # auxiliary Image columns are present before disabling their decoding.
     return {
         "id": "q1",
         "question": "What is 2 + 2?",
         "image": image,
+        "image_preview": None,
         "answer": "4",
         "answer_type": "exactMatch",
         "author_name": "author",
         "rationale": "",
+        "rationale_image": None,
         "raw_subject": "Math",
         "category": "Math",
     }
