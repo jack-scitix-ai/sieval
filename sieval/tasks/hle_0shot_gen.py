@@ -226,21 +226,14 @@ class HLEZeroShotGenTask(
         # produced no gradeable answer) count as incorrect — matching upstream
         # (n = total questions) and the *_gen family, not just graded attempts.
         n = (len(finals) + len(fails)) * self._n
-        # Length-capped attempts: a reasoning model can burn the whole token
-        # budget and emit no answer, then get graded incorrect. Surface the
-        # count so the headline is self-documenting on this collapse-prone
-        # benchmark (upstream reports only accuracy).
-        truncated = 0
-        for f in finals:
-            out = f.infer_result
-            if out is None or out.finish_reasons is None:
-                continue
-            truncated += sum(reason == "length" for reason in out.finish_reasons)
         m = aggregate_metrics(correct, confidence, n)
-        # `truncated` / `judge_unparsed` are counts over the graded attempts in
-        # `finals`, not rates over `n` (which also spans `fails`). `subset`
-        # records which set was evaluated so a text-only run is distinguishable
-        # from a full-set one in the report alone.
+        # `judge_unparsed` is a count over the graded attempts in `finals`, not a
+        # rate over `n` (which also spans `fails`). `subset` records which set
+        # was evaluated so a text-only run is distinguishable from a full-set one
+        # in the report alone. Length-capped attempts are NOT counted here — the
+        # `gen`-scoped truncation detection rule already reports them per sample
+        # (it also covers max_tokens / content_filter, which a finish_reasons
+        # tally in this method would miss).
         return {
             "score": m["accuracy"],
             "accuracy": m["accuracy"],
@@ -250,6 +243,5 @@ class HLEZeroShotGenTask(
             "n_graded": len(correct),
             "fails": len(fails),
             "judge_unparsed": judge_unparsed,
-            "truncated": truncated,
             "subset": "text_only" if self._text_only else "full",
         }

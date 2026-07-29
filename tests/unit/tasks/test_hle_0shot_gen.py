@@ -221,8 +221,6 @@ async def test_report_accuracy_and_counts_fails_in_denominator():
     assert report["n"] == 3
     assert report["n_graded"] == 2
     assert report["fails"] == 1
-    # No infer_result on these contexts -> no truncation surfaced.
-    assert report["truncated"] == 0
     assert report["judge_unparsed"] == 0
     assert report["subset"] == "text_only"  # dataset loaded the text-only subset
     assert report["accuracy"] == pytest.approx(33.33, abs=1e-2)
@@ -249,40 +247,6 @@ async def test_report_fails_weighted_by_n():
     assert report["n"] == 4
     assert report["n_graded"] == 2
     assert report["accuracy"] == pytest.approx(50.0)
-
-
-@pytest.mark.anyio
-async def test_report_counts_truncated_outputs():
-    # A length-capped attempt (finish_reason "length") is surfaced as
-    # `truncated` so the accuracy headline is self-documenting on this
-    # collapse-prone benchmark. Counted per-attempt from infer_result.
-    task, model, _ = _task()  # n=1
-    meta = model.meta()
-    fb = {
-        "correct": False,
-        "confidence": 100,
-        "judge_parsed": True,
-        "gold": "",
-        "predicted": "",
-        "grader_model": "m",
-    }
-    finals = [
-        TaskContext(
-            sample_id=0,
-            infer_result=ModelOutput(model=meta, texts=[""], finish_reasons=["length"]),
-            feedback_result=[dict(fb)],
-        ),
-        TaskContext(
-            sample_id=1,
-            infer_result=ModelOutput(
-                model=meta, texts=["Answer: 4"], finish_reasons=["stop"]
-            ),
-            feedback_result=[{**fb, "correct": True}],
-        ),
-    ]
-    report = await task.report(finals, [])
-    assert report["truncated"] == 1
-    assert report["n_graded"] == 2
 
 
 @pytest.mark.anyio
@@ -318,7 +282,6 @@ async def test_report_empty_is_zero():
     assert report["n"] == 0
     assert report["accuracy"] == 0.0
     assert report["calibration_error"] is None
-    assert report["truncated"] == 0
     assert report["judge_unparsed"] == 0
 
 
