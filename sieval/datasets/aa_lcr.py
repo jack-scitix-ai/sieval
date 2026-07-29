@@ -25,7 +25,7 @@ import io
 import unicodedata
 import zipfile
 from pathlib import Path
-from typing import Any, TypedDict, override
+from typing import TypedDict, override
 
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
@@ -97,7 +97,7 @@ class AALCRDatasetSample(TypedDict):
 )
 class AALCRDataset(Dataset[AALCRDatasetSample]):
     @override
-    def load(self, name_or_path: str, **kwargs: Any) -> HFDatasetDict:
+    def load(self, name_or_path: str, **kwargs) -> HFDatasetDict:
         _ = kwargs
         # `hf:` stages the repo as a directory; that is the only layout the
         # runtime hands us, so accept only it (fail loudly if the files are

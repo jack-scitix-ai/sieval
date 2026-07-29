@@ -24,6 +24,15 @@ Deviations / by-design behavior worth knowing:
   inflate accuracy. Pipeline failures are likewise counted INCORRECT (full-set
   metric).
 
+Serving requirement — inputs run 71k–114k tokens, so ``max_tokens`` must leave
+input + output inside the context window (e.g. 16384 against gpt-oss's 131072).
+Do **not** enable sglang's ``allow_auto_truncate``: on inputs this large it
+silently drops document tokens with no error, invalidating a benchmark whose
+premise is the full document set — a hard error on overflow is the safe
+behavior. At high reasoning effort the longest inputs have little output room
+left; attempts that spend it all on reasoning land as empty answers (graded
+INCORRECT per above), and the ``gen`` truncation detection rule flags the rest.
+
 Reproduction decoding: ``n`` (repeats) is a **task arg** — set it in
 ``tasks.<name>.args.n`` (AA-LCR uses ``n=3``). ``infer`` forwards it as a
 call-time kwarg to ``agenerate``, and call-time wins over model config
