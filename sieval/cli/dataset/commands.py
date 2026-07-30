@@ -18,6 +18,7 @@ from sieval.core.datasets.meta import DatasetMeta, Level1Category
 from sieval.core.utils.logging import configure_logging
 from sieval.core.utils.paths import resolve_data_dir
 from sieval.datasets.downloaders import resolve as resolve_handler
+from sieval.datasets.downloaders.local import LocalSourceUnavailable
 from sieval.datasets.downloaders.resolver import extras_unsatisfied
 from sieval.datasets.downloaders.verify import verify_checksums
 from sieval.meta import load_index
@@ -180,13 +181,19 @@ def download_cmd(
 
 
 def _download_one(m: DatasetMeta, dest_root: Path, force: bool) -> None:
+    missing_local_sources: list[str] = []
     for src in m.source:
         h = resolve_handler(src)
         if h.is_downloaded(src, dest_root, m.name) and not force:
             typer.echo(f"[{m.name}] already present: {src}")
             continue
         typer.echo(f"[{m.name}] fetching {src}")
-        h.download(src, dest_root, m.name, force=force)
+        try:
+            h.download(src, dest_root, m.name, force=force)
+        except LocalSourceUnavailable as e:
+            # BYO corpus: surface the instructions and track for a summary.
+            typer.secho(f"[{m.name}] {e}", fg=typer.colors.YELLOW)
+            missing_local_sources.append(src)
 
     mismatches = verify_checksums(m, dest_root)
     if mismatches:
@@ -200,6 +207,18 @@ def _download_one(m: DatasetMeta, dest_root: Path, force: bool) -> None:
             f"checksum verification failed for {m.name!r} ({details}); "
             f"deleted the mismatched file(s) — re-run "
             f"`sieval dataset download {m.name}` to refetch"
+        )
+
+    # BYO corpus: exit non-zero if any local: sources were unavailable. The
+    # per-source instructions (including each file's exact target path) were
+    # printed above by the handler, so keep this summary dataset-agnostic — it
+    # runs for every `local:` source, not just one benchmark's.
+    if missing_local_sources:
+        raise RuntimeError(
+            f"{m.name!r} requires {len(missing_local_sources)} bring-your-own "
+            f"corpus file(s) that cannot be fetched automatically: "
+            f"{', '.join(missing_local_sources)}. Produce them as instructed "
+            f"above, then re-run `sieval dataset download {m.name}`."
         )
 
     # Post-download hint; print-only, never installs.

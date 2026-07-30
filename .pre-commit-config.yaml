@@ -11,6 +11,7 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-added-large-files
+        # No longer bundling RULER corpus (moved to local: bring-your-own model).
       - id: check-toml
       - id: check-yaml
         args:

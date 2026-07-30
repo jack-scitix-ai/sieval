@@ -117,6 +117,10 @@ from .openbookqa import (
     OpenBookQADataset,
     OpenBookQADatasetSample,
 )
+from .ruler import (
+    RulerDataset,
+    RulerDatasetSample,
+)
 from .simpleqa_verified import (
     SimpleQAVerifiedDataset,
     SimpleQAVerifiedDatasetSample,
@@ -189,6 +193,8 @@ __all__ = [
     "MMMLUDatasetSample",
     "OpenBookQADataset",
     "OpenBookQADatasetSample",
+    "RulerDataset",
+    "RulerDatasetSample",
     "SimpleQAVerifiedDataset",
     "SimpleQAVerifiedDatasetSample",
     "TEvalBeforeCallingDataset",

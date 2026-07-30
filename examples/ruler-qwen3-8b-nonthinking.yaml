@@ -1,0 +1,192 @@
+# ==============================================================================
+# RULER Long-Context Evaluation — Qwen3-8B, Non-Thinking Baseline
+# ==============================================================================
+# Scenario: RULER across a 4K–128K context sweep with thinking disabled. Six
+#   tasks (one per length) served by two configs (native / YaRN).
+# Task: RULER (0-shot, generative).
+#
+# Configuration highlights:
+#   - enable_thinking: false (no reasoning chain)
+#   - Assistant-prefill mode: continue_final_message=true + add_generation_prompt=false
+#   - Datasets: ruler_4k / 8k / 16k / 32k / 64k / 128k (subtask: all, 500 samples each)
+#   - Models:
+#       qwen3-8b       — native 32768 context, serves 4K / 8K / 16K / 32K
+#       qwen3-8b-yarn  — YaRN-scaled to 131072, serves 64K / 128K
+#     (YaRN is enabled only for 64K/128K, which exceed the native 32768 window)
+#   - Temperature / top_p / top_k: 0.7 / 0.8 / 20 ; presence_penalty: 1.5
+#   - concurrency_limit: 64 (native) / 32 (YaRN)
+#   - GPU: H200-141G (native) / L40 (YaRN)
+#
+# Setup steps:
+#   1. Prepare data: sieval dataset download ruler
+#      (or point $SIEVAL_DATA_DIR at an existing RULER staging dir)
+#   2. Point checkpoints / tokenizers at your local model (fields marked # EDIT ME)
+#   3. Run evaluation:
+#      sieval run  ruler-qwen3-8b-nonthinking.yaml   (launch + eval)
+#      sieval eval ruler-qwen3-8b-nonthinking.yaml   (model already served)
+#
+# Editable fields (marked # EDIT ME inline):
+#   models.*.infer.checkpoint            — local model path
+#   datasets.ruler_*.args.tokenizer_path — tokenizer path (same as model)
+#
+# Output:
+#   result_dir: ./outputs/ruler_qwen3_8b_nonthinking
+#   Per-cell scores plus per-length and overall RULER means (see report()).
+#
+# Context fit: thinking is disabled, so there is no think budget — each prompt
+#   packs to max_seq_length reserving only the answer, and every length fits its
+#   serving context_length (≤32K on native 32768, 64K/128K on YaRN 131072). If you
+#   change a dataset's max_seq_length or a model's context_length, keep
+#   max_seq_length + answer ≤ context_length.
+# ==============================================================================
+
+result_dir: ./outputs/ruler_qwen3_8b_nonthinking
+models:
+  qwen3-8b:
+    args:
+      concurrency_limit: 64
+      temperature: 0.7
+      top_p: 0.8
+      presence_penalty: 1.5
+      extra_body:
+        enable_thinking: false
+        top_k: 20
+        continue_final_message: true
+        add_generation_prompt: false
+    infer:
+      backend: sglang
+      recipe: qwen3-8b
+      checkpoint: /path/to/qwen3-8b   # EDIT ME
+      overrides:
+        context_length: 32768
+    infer_meta:
+      gpu: H200-141G
+      image: lmsysorg/sglang:latest
+
+  qwen3-8b-yarn:
+    args:
+      concurrency_limit: 32
+      temperature: 0.7
+      top_p: 0.8
+      presence_penalty: 1.5
+      extra_body:
+        enable_thinking: false
+        top_k: 20
+        continue_final_message: true
+        add_generation_prompt: false
+    infer:
+      backend: sglang
+      recipe: qwen3-8b
+      checkpoint: /path/to/qwen3-8b   # EDIT ME
+      overrides:
+        context_length: 131072
+        disable_cuda_graph: true
+        json_model_override_args: '{"rope_scaling": {"rope_type": "yarn", "factor":
+          4, "original_max_position_embeddings": 32768}}'
+    infer_meta:
+      gpu: L40
+      image: lmsysorg/sglang:latest
+
+datasets:
+  ruler_4k:
+    class: RulerDataset
+    path: ${SIEVAL_DATA_DIR}
+    args:
+      subtask: all
+      max_seq_length: 4096
+      num_samples: 500
+      tokenizer_type: hf
+      tokenizer_path: /path/to/qwen3-8b   # EDIT ME
+      enable_thinking: false
+      model_name: qwen3
+
+  ruler_8k:
+    class: RulerDataset
+    path: ${SIEVAL_DATA_DIR}
+    args:
+      subtask: all
+      max_seq_length: 8192
+      num_samples: 500
+      tokenizer_type: hf
+      tokenizer_path: /path/to/qwen3-8b   # EDIT ME
+      enable_thinking: false
+      model_name: qwen3
+
+  ruler_16k:
+    class: RulerDataset
+    path: ${SIEVAL_DATA_DIR}
+    args:
+      subtask: all
+      max_seq_length: 16384
+      num_samples: 500
+      tokenizer_type: hf
+      tokenizer_path: /path/to/qwen3-8b   # EDIT ME
+      enable_thinking: false
+      model_name: qwen3
+
+  ruler_32k:
+    class: RulerDataset
+    path: ${SIEVAL_DATA_DIR}
+    args:
+      subtask: all
+      max_seq_length: 32768
+      num_samples: 500
+      tokenizer_type: hf
+      tokenizer_path: /path/to/qwen3-8b   # EDIT ME
+      enable_thinking: false
+      model_name: qwen3
+
+  ruler_64k:
+    class: RulerDataset
+    path: ${SIEVAL_DATA_DIR}
+    args:
+      subtask: all
+      max_seq_length: 65536
+      num_samples: 500
+      tokenizer_type: hf
+      tokenizer_path: /path/to/qwen3-8b   # EDIT ME
+      enable_thinking: false
+      model_name: qwen3
+
+  ruler_128k:
+    class: RulerDataset
+    path: ${SIEVAL_DATA_DIR}
+    args:
+      subtask: all
+      max_seq_length: 131072
+      num_samples: 500
+      tokenizer_type: hf
+      tokenizer_path: /path/to/qwen3-8b   # EDIT ME
+      enable_thinking: false
+      model_name: qwen3
+
+tasks:
+  ruler_4k:
+    class: RulerZeroShotGenTask
+    dataset: ruler_4k
+    model: qwen3-8b
+
+  ruler_8k:
+    class: RulerZeroShotGenTask
+    dataset: ruler_8k
+    model: qwen3-8b
+
+  ruler_16k:
+    class: RulerZeroShotGenTask
+    dataset: ruler_16k
+    model: qwen3-8b
+
+  ruler_32k:
+    class: RulerZeroShotGenTask
+    dataset: ruler_32k
+    model: qwen3-8b
+
+  ruler_64k:
+    class: RulerZeroShotGenTask
+    dataset: ruler_64k
+    model: qwen3-8b-yarn
+
+  ruler_128k:
+    class: RulerZeroShotGenTask
+    dataset: ruler_128k
+    model: qwen3-8b-yarn

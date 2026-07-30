@@ -54,6 +54,26 @@ math = [
   "math-verify[antlr4-11-0]==0.8.0",
   "regex>=2024.0.0",
 ]
+# ruler: benchmark eval + loader deps (what `sieval` needs to run RULER).
+ruler = [
+  "tiktoken>=0.8.0",
+  "wonderwords>=2.2.0,<3",
+  "numpy<=2.2",
+  "scipy>=1.16.3",
+  "nltk>=3.9.2",
+  # tokenizer_type: hf (both example configs) → transformers.AutoTokenizer in community/ruler/scripts/tokenizer.py
+  "transformers>=4.44.0",
+]
+# ruler-gen: deps for the BYO corpus regeneration script only
+# (scripts/gen_paul_graham_essays.py). Not needed to run the benchmark, so kept
+# out of `ruler`; install with `pdm install -G ruler-gen` before regenerating.
+ruler-gen = [
+  # Upper-bounded: html2text renamed/removed converter attrs across majors
+  # (e.g. escape_all → escape_snob), so cap to avoid silent API drift.
+  "html2text>=2020.1.16,<2026",
+  "beautifulsoup4>=4.12.0",
+  "certifi>=2024.7.4",
+]
 t-eval = ["numpy<=2.2", "sentence-transformers>=5.1.2"]
 
 [project.scripts]
@@ -127,7 +147,7 @@ select = [
 ] # community/ follows upstream implementations — do not enforce line-length or print restrictions
 "scripts/**/*.py" = [
   "T201",
-] # scripts/ are CLI tools — print() for progress output
+] # scripts/ are CLI tools — print() is their output mechanism
 "tests/**/*.py" = ["T201"] # tests/ may use print() for debugging
 
 [tool.ty.environment]
@@ -150,6 +170,28 @@ unused-type-ignore-comment = "ignore"
 # so ty can't resolve that import. Intentional — keeps CI torch-free.
 [[tool.ty.overrides]]
 include = ["sieval/tasks/t_eval_before_calling_0shot_gen.py"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
+# ruler: wonderwords, tiktoken; not in CI light env. Tests import tiktoken behind try/except.
+[[tool.ty.overrides]]
+include = [
+  "sieval/datasets/ruler/_niah.py",
+  "sieval/datasets/ruler/_cwe.py",
+  "tests/unit/datasets/test_ruler.py",
+  "tests/unit/datasets/test_ruler_cwe.py",
+  "tests/unit/datasets/test_ruler_shared.py",
+]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
+# gen_paul_graham_essays.py: html2text, beautifulsoup4, certifi live in the
+# optional `ruler-gen` group (not installed by default / in CI), so ty can't
+# resolve them here. Install with `pdm install -G ruler-gen` to run the script.
+[[tool.ty.overrides]]
+include = ["scripts/gen_paul_graham_essays.py"]
 
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
