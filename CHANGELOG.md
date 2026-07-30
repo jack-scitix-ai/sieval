@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-07-30
+
+### Added
+
+- New benchmark tasks & datasets:
+    - RULER — NVIDIA long-context benchmark: datasets + 0-shot generative tasks, with upstream-aligned `string_match_all` / `string_match_part` scoring (#11).
+    - Humanity's Last Exam (HLE) — dataset + 0-shot LLM-judge task (#43).
+    - BrowseComp — dataset + 0-shot LLM-autorater-graded task (#40).
+    - SimpleQA Verified — dataset + 0-shot LLM-autorater-graded task; sieval's first autorater-graded benchmark, headline metric F1 (#38).
+    - AA-LCR — dataset + 0-shot LLM-equality-checker-graded task (#44).
+    - HMMT Nov 2025 — MathArena-aligned, validated against MathArena's published outputs (#50).
+    - MATH (Hendrycks) — full dataset + DeepSeek-Math-aligned base-model task (#31).
+    - C-Eval — dataset + few-shot base-model task (#15).
+    - ARC-Easy / ARC-Challenge — datasets + PPL and CLP tasks (#36).
+    - HellaSwag — dataset + few-shot PPL task (#34).
+    - MMMLU — dataset + k-shot CLP base-model task (#30).
+    - MMLU — few-shot base-model CLP task, alongside the existing 0-shot generative one (#33).
+- Per-record sieval version provenance — every stage record is stamped with the producing version, and `report.json` gains a distinct, semver-sorted `sieval_versions[]` so single-version vs blended runs are visible at a glance; an unstamped scored record surfaces as the `"unknown"` sentinel (#37).
+
+### Changed
+
+- **`--resume` version-compatibility gate** — `--resume` now refuses to resume across an incompatible sieval version series (major post-1.0, minor under 1.0) or a dev/local-build mismatch, and is fail-closed on a missing or unreadable `meta.json`. Exact-match is checked first, so resuming your own build (including dev builds) is never blocked; within a compatible series resume stays allowed and is made auditable via the per-record provenance above — **functional** compatibility is guaranteed, not bit-identical numbers. `meta.json` is now written at run start (create-if-absent), recording the run's originating version. **Breaking (one-time transition):** a run interrupted under a pre-gate version never wrote `meta.json` and so cannot be resumed under the gate — start it fresh (#37).
+- CMMLU reclassified from PPL to CLP eval mode, with the task, class, and file renamed to match; the scoring pipeline is byte-identical and scores are unchanged (#32).
+- The code-evaluator is now vendored in-tree under `vendor/code-evaluator` instead of a git submodule, so a plain clone of sieval is self-contained. Adds clearer checker mismatch messages, opt-in float tolerance, and SciCode support (#41).
+
+### Fixed
+
+- `sieval[hle]` was uninstallable — `pyproject.toml` declared the `hle` extra but `pdm.lock` never locked the group, so installing it failed with `Requested groups not in lockfile: hle` (#55).
+- Dataset subpackage exports are now attributed per module in the generated stub, matching `tasks/`; a stub that attributed an export to the wrong module previously shipped unnoticed, since the existing guards compared only export names (#54).
+- SimpleQA Verified now counts pipeline failures as `NOT_ATTEMPTED` in the F1 aggregation rather than silently skewing the score (#39).
+- `check_layer_imports` now enforces the cross-package half of the import policy: a relative import that escapes its own package (level ≥ 2) is flagged with the resolved absolute module offered as the fix, and the private-access carve-out is narrowed from `level > 0` to `level == 1` (#46).
+- Test isolation fixtures now move a registry and its module cache as a unit behind one shared helper — clearing only one half made registration silently no-op or tripped the duplicate-name guard (#53).
+- The T-Eval before-calling task now declares `deps_group="t-eval"`, so `sieval task list` reports it and the pre-run readiness check warns when the extra is missing, instead of failing later with a raw `ImportError` (#35).
+- Resume test fixtures now stamp `meta.json` as a real run does, and a dataset perf test that still called the pre-#7 `Dataset.select()` was updated to `slice()` (#55).
+
+### Docs
+
+- README and CLAUDE.md synced with the current task/dataset registry (#35).
+
 ## [0.6.0] - 2026-07-06
 
 ### Added
@@ -105,5 +144,6 @@ Mainstream benchmarks registered in `sieval/meta/index.json`:
 - Project-wide preflight (`scripts/check_preflight.py`): links, deps, tasks, datasets, imports, examples, meta-index sync, version.
 - Tooling: `ruff`, `ty`, `mypy strict`, `pytest`.
 
+[0.7.0]: https://github.com/scitix/sieval/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/scitix/sieval/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/scitix/sieval/releases/tag/v0.5.0
