@@ -60,14 +60,17 @@ def _register_export(
 
 def _discover_task_classes(
     module_paths: list[Path],
+    prefix: str = "",
 ) -> dict[str, str]:
     """Scan *module_paths* for public ``*Task`` class definitions.
 
-    Returns ``{ClassName: module_stem}`` mapping.
+    Returns ``{ClassName: module_stem}``, or ``{ClassName: "prefix.module_stem"}`` when
+    *prefix* is given, so the duplicate-export error names the module the caller
+    registers rather than a bare stem.
     """
     export_to_module: dict[str, str] = {}
     for module_path in module_paths:
-        module_name = module_path.stem
+        module_name = f"{prefix}.{module_path.stem}" if prefix else module_path.stem
         module_ast = ast.parse(
             module_path.read_text(encoding="utf-8"),
             filename=str(module_path),
@@ -90,36 +93,31 @@ def discover_tasks(package_dir: Path) -> dict[str, str]:
     for name, mod in _discover_task_classes(_iter_module_paths(package_dir)).items():
         _register_export(export_to_module, name, mod, "task")
 
-    # 2) Subpackage task modules — scan .py files inside each subpackage
+    # 2) Subpackage task modules — "subpkg.module_stem", matching the runtime
+    # registry in sieval/tasks/__init__.py. Must stay in sync with it.
     for subpkg_dir in _iter_subpackage_dirs(package_dir):
-        subpkg_name = subpkg_dir.name
-        for name, _mod in _discover_task_classes(
-            _iter_module_paths(subpkg_dir)
+        for name, mod in _discover_task_classes(
+            _iter_module_paths(subpkg_dir), prefix=subpkg_dir.name
         ).items():
-            _register_export(export_to_module, name, subpkg_name, "task")
+            _register_export(export_to_module, name, mod, "task")
 
     return export_to_module
 
 
-def discover_subpackage_tasks(subpkg_dir: Path) -> dict[str, str]:
-    """Discover task exports within a single subpackage directory.
-
-    Returns ``{ClassName: module_stem}`` mapping (module-level, not
-    prefixed with the subpackage name).
-    """
-    return _discover_task_classes(_iter_module_paths(subpkg_dir))
-
-
-def _discover_dataset_classes(module_paths: list[Path]) -> dict[str, str]:
+def _discover_dataset_classes(
+    module_paths: list[Path],
+    prefix: str = "",
+) -> dict[str, str]:
     """Scan *module_paths* for public Dataset/DatasetSample/CSVSample class definitions.
 
-    Returns ``{ClassName: module_stem}`` mapping.
+    Returns ``{ClassName: module_stem}``, or ``{ClassName: "prefix.module_stem"}`` when
+    *prefix* is given, as for ``_discover_task_classes``.
     """
     export_to_module: dict[str, str] = {}
     suffixes = ("Dataset", "DatasetSample", "CSVSample")
 
     for module_path in module_paths:
-        module_name = module_path.stem
+        module_name = f"{prefix}.{module_path.stem}" if prefix else module_path.stem
         module_ast = ast.parse(
             module_path.read_text(encoding="utf-8"),
             filename=str(module_path),
@@ -160,13 +158,12 @@ def discover_datasets(package_dir: Path) -> dict[str, str]:
     for name, mod in _discover_dataset_classes(_iter_module_paths(package_dir)).items():
         _register_export(export_to_module, name, mod, "dataset")
 
-    # 2) Subpackage dataset modules — scan .py files inside each subpackage
+    # 2) Subpackage dataset modules — "subpkg.module_stem", as for tasks above.
     for subpkg_dir in _iter_subpackage_dirs(package_dir):
-        subpkg_name = subpkg_dir.name
-        for name, _mod in _discover_dataset_classes(
-            _iter_module_paths(subpkg_dir)
+        for name, mod in _discover_dataset_classes(
+            _iter_module_paths(subpkg_dir), prefix=subpkg_dir.name
         ).items():
-            _register_export(export_to_module, name, subpkg_name, "dataset")
+            _register_export(export_to_module, name, mod, "dataset")
 
     return export_to_module
 
@@ -244,14 +241,13 @@ def main() -> int:
         check=args.check,
     )
 
-    # Task subpackages
-    for subpkg_dir in _iter_subpackage_dirs(TASKS_DIR):
-        ok &= sync_stub(
-            subpkg_dir / "__init__.pyi",
-            render_stub(discover_subpackage_tasks(subpkg_dir)),
-            check=args.check,
-        )
-
+    # Only the two lazy packages get a stub, because only they have a runtime export
+    # map for one to mirror. Subpackages are ordinary packages: their own __init__.py
+    # is their type surface, and a generated .pyi would *shadow* it rather than
+    # supplement it — hiding whatever suffix-based discovery cannot see (ruler/'s
+    # helpers re-exported from _shared.py) or emptying it outright (downloaders/,
+    # which is infrastructure and carries no dataset suffix at all). Don't add a
+    # per-subpackage loop for either package.
     if ok:
         return 0
 

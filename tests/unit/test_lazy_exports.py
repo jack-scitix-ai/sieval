@@ -146,6 +146,22 @@ def test_access_export_triggers_lazy_import(
     assert package.__dict__[sample_export] is dummy_value
 
 
+def _read_stub_import_map(stub_path: Path) -> dict[str, str]:
+    """Map each name the stub imports to the relative module it comes from."""
+    module_ast = ast.parse(
+        stub_path.read_text(encoding="utf-8"),
+        filename=str(stub_path),
+    )
+    import_map: dict[str, str] = {}
+    for node in module_ast.body:
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+            for alias in node.names:
+                import_map[alias.asname or alias.name] = node.module
+    if not import_map:
+        raise AssertionError(f"{stub_path} declares no relative imports")
+    return import_map
+
+
 @pytest.mark.parametrize("package_name", ["sieval.tasks", "sieval.datasets"])
 def test_stub_exports_match_runtime_exports(package_name: str) -> None:
     package = importlib.import_module(package_name)
@@ -153,3 +169,23 @@ def test_stub_exports_match_runtime_exports(package_name: str) -> None:
     assert package_file is not None
     stub_exports = _read_stub_all(Path(package_file).with_suffix(".pyi"))
     assert stub_exports == package.__all__
+
+
+@pytest.mark.parametrize("package_name", ["sieval.tasks", "sieval.datasets"])
+def test_stub_import_targets_match_runtime_module_map(package_name: str) -> None:
+    """The stub's per-name import target must match the runtime map's values.
+
+    Nothing else compares them: the test above checks only export *names*, and
+    preflight builds its fqn from the runtime map alone. So a stub pointing an
+    export at the wrong module ships silently, and ty resolves
+    ``from sieval.datasets import X`` through a module that never defines it.
+    """
+    package = importlib.import_module(package_name)
+    package_file = package.__file__
+    assert package_file is not None
+
+    stub_map = _read_stub_import_map(Path(package_file).with_suffix(".pyi"))
+    # Via __dict__ because the .pyi deliberately does not declare this global.
+    runtime_map = dict(package.__dict__["_EXPORT_TO_MODULE"])
+
+    assert stub_map == runtime_map

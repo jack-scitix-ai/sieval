@@ -56,11 +56,8 @@ def _is_typeddict_call(node: ast.AST) -> bool:
 
 
 def _scan_dataset_exports(module_path: Path) -> list[str]:
-    """Return public dataset export names defined in *module_path* (AST only).
-
-    Classes whose name ends in one of ``_DATASET_EXPORT_SUFFIXES``, plus
-    module-level ``X = TypedDict(...)`` assignments with such a name.
-    """
+    """Return public ``_DATASET_EXPORT_SUFFIXES``-suffixed classes and ``TypedDict``
+    assignments defined in *module_path* (AST only)."""
     tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
 
     names: list[str] = []
@@ -81,11 +78,9 @@ def _scan_dataset_exports(module_path: Path) -> list[str]:
 def _discover_dataset_exports() -> dict[str, str]:
     """Map each export name to the module ``__getattr__`` should import it from.
 
-    Both passes share one scanner, so they cannot drift apart on what counts as an
-    export. ``scripts/sync_package_stubs.py`` reimplements this scan deliberately —
-    the stub generator must not import the package it generates stubs for — so the
-    two implementations have to agree for the generated ``.pyi`` to match runtime
-    resolution.
+    ``scripts/sync_package_stubs.py`` reimplements this scan deliberately — the stub
+    generator must not import the package it generates stubs for — so the two have to
+    agree for the generated ``.pyi`` to match runtime resolution.
     """
     export_to_module: dict[str, str] = {}
 
@@ -103,13 +98,15 @@ def _discover_dataset_exports() -> dict[str, str]:
         for name in _scan_dataset_exports(module_path):
             _register(name, module_path.stem)
 
-    # 2) Subpackage .py modules — mapped to the subpackage, which re-exports them
-    # from its __init__. (The task registry instead maps to "subpkg.module_stem";
-    # the two conventions differ, see sieval/tasks/__init__.py.)
+    # 2) Subpackage .py modules — "subpkg.module_stem", matching sieval/tasks/
+    # __init__.py. Resolving to the defining module keeps the registry independent of
+    # what the subpackage's __init__ re-exports, and keeps _register's guard effective
+    # within a subpackage (the bare subpackage name made same-named exports collide
+    # silently).
     for subpkg_dir in _iter_subpackage_dirs():
         for module_path in _iter_module_paths_in(subpkg_dir):
             for name in _scan_dataset_exports(module_path):
-                _register(name, subpkg_dir.name)
+                _register(name, f"{subpkg_dir.name}.{module_path.stem}")
 
     return export_to_module
 
