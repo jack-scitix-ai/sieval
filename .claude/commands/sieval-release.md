@@ -32,12 +32,26 @@ git fetch origin main
 # local main must match remote
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]
 
-python -m pytest tests/unit tests/integration tests/acceptance --tb=short -q
+python -m pytest tests/unit tests/integration tests/acceptance -m "not benchmark" --tb=short -q
 ruff check .
 ty check
 
 gh pr list --state open --limit 20     # list for user review
 ```
+
+Then the wall-clock gates, alone — CI deselects `benchmark`, so this is the only
+place they run. Serially and without `--cov`: both other load and the coverage
+tracer distort what they measure.
+
+```bash
+SIEVAL_BENCHMARK_ARTIFACT_DIR=./outputs/benchmarks \
+python -m pytest -m benchmark -q -s
+```
+
+Report the `SiEval Benchmark Summary` table (printed last, after the engine's log
+lines) as the release's performance baseline; the same numbers land in
+gitignored `outputs/benchmarks/benchmark_summary.json`. A breach can just mean a
+busy box — re-run idle before calling it a regression.
 
 Also collect changes since last tag:
 
@@ -47,7 +61,7 @@ git log $PREV_TAG..HEAD --format="%h %s" --no-merges
 git diff $PREV_TAG..HEAD --stat
 ```
 
-If working tree is dirty, not on main, tests/lint fail — stop and report.
+If working tree is dirty, not on main, tests/lint/benchmark fail — stop and report.
 If there are open PRs — list them and ask the user whether to include or defer.
 
 ### 2. ReferenceImpl Sanity Check

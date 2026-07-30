@@ -126,6 +126,10 @@ python -m pytest tests/acceptance/ -v -s
 SIEVAL_BENCHMARK_ARTIFACT_DIR=./outputs/benchmarks \
 python -m pytest tests/acceptance/ -v -s
 
+# What CI runs: everything deterministic, benchmarks deselected
+python -m pytest tests/unit tests/integration tests/acceptance \
+  -m "not stress and not benchmark" --cov -q
+
 # Performance diagnostic benchmarks (default excludes stress)
 python -m pytest tests/performance/ -v
 
@@ -135,6 +139,20 @@ python -m pytest tests/performance/ -m "not stress" -v
 # Run only stress tests (intentional profiling)
 python -m pytest tests/performance/ -m stress -v
 
+# Run only the wall-clock throughput gates
+python -m pytest -m benchmark -v -s
+```
+
+### Markers
+
+| Marker | Meaning |
+| --- | --- |
+| `stress` | Resource-intensive profiling runs. Excluded by default via `addopts`; opt in with `-m stress`. |
+| `benchmark` | Wall-clock throughput gates, calibrated on a dedicated box. A plain local `pytest` runs them; **CI deselects them** (a shared runner cannot hold the thresholds, and `--cov` skews the latency they measure), so `/sieval-release` is where they are enforced. |
+
+Because these assert on *time*, treat a failure as "re-run idle" before calling it a regression. `tests/acceptance/` holds one (`test_benchmark_scenarios`); its other nine are deterministic and do run in CI.
+
+```bash
 # Single file
 python -m pytest tests/integration/resume/test_advanced.py -v
 

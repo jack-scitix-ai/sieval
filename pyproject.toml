@@ -226,7 +226,10 @@ also_copy = [
 ]
 
 [tool.pytest]
-markers = ["stress: resource-intensive tests (run with: pytest -m stress)"]
+markers = [
+  "stress: resource-intensive tests (run with: pytest -m stress)",
+  "benchmark: wall-clock throughput gates, excluded from CI (see tests/README.md)",
+]
 testpaths = [
   "tests/unit",
   "tests/integration",
