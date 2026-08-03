@@ -1,6 +1,8 @@
-# SciCode execution dependencies — the scientific stack the problems import
-# (numpy / scipy / sympy / matplotlib; verified across all 80 problems).
+# SciCode execution dependencies — the scientific stack the problems import.
 # Pinned to the environment used to validate SciCode on Kimi-K2.6.
+# SciPy >=1.14 removed integrate.simps, which four SciCode programs still import
+# (upstream issue #2); the sieval SciCode harness conditionally restores its
+# legacy API for those programs before their required_dependencies execute.
 # NOTE: scipy 1.16.x requires Python >= 3.11 and numpy 1.26.x requires < 3.13,
 # so this set targets Python 3.11 / 3.12 (not the 3.10 base of the other images).
 matplotlib==3.10.8

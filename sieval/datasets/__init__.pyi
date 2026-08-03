@@ -121,6 +121,10 @@ from .ruler.ruler import (
     RulerDataset,
     RulerDatasetSample,
 )
+from .scicode import (
+    SciCodeDataset,
+    SciCodeDatasetSample,
+)
 from .simpleqa_verified import (
     SimpleQAVerifiedDataset,
     SimpleQAVerifiedDatasetSample,
@@ -195,6 +199,8 @@ __all__ = [
     "OpenBookQADatasetSample",
     "RulerDataset",
     "RulerDatasetSample",
+    "SciCodeDataset",
+    "SciCodeDatasetSample",
     "SimpleQAVerifiedDataset",
     "SimpleQAVerifiedDatasetSample",
     "TEvalBeforeCallingDataset",

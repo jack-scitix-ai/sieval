@@ -109,6 +109,9 @@ from .openbookqa_kshot_gen import (
 from .ruler_0shot_gen import (
     RulerZeroShotGenTask,
 )
+from .scicode_0shot_gen import (
+    SciCodeZeroShotGenTask,
+)
 from .simpleqa_verified_0shot_gen import (
     SimpleQAVerifiedZeroShotGenTask,
 )
@@ -156,6 +159,7 @@ __all__ = [
     "MMMLUKShotClpTask",
     "OpenBookQAFewShotGenTask",
     "RulerZeroShotGenTask",
+    "SciCodeZeroShotGenTask",
     "SimpleQAVerifiedZeroShotGenTask",
     "TEvalBeforeCallingZeroShotGenTask",
     "TheoremQAKShotBaseGenTask",

@@ -669,6 +669,34 @@
       }
     },
     {
+      "name": "scicode",
+      "display_name": "SciCode",
+      "description": "Research coding benchmark; test split 65 problems / 288 tested sub-steps (dev adds 15/50).",
+      "source": [
+        "url:https://raw.githubusercontent.com/scicode-bench/SciCode/69a8cfc829fe8788a426ce8b5de6292366dce7ef/eval/data/problems_all.jsonl",
+        "url:https://raw.githubusercontent.com/scicode-bench/SciCode/69a8cfc829fe8788a426ce8b5de6292366dce7ef/eval/data/problems_dev.jsonl",
+        "url:https://huggingface.co/datasets/akshathmangudi/SciCode/resolve/526f6cbf273fc2b134444104fd1979a013e95d39/raw/raw_ground.h5"
+      ],
+      "categories": [
+        {
+          "level1": "Code",
+          "level2": "CodeGeneration"
+        }
+      ],
+      "tags": [
+        "english",
+        "python",
+        "code-exec"
+      ],
+      "deps_group": null,
+      "license": "apache-2.0",
+      "checksums": {
+        "problems_all.jsonl": "sha256:38797fef78f434720be6d053b4f3a86839d6f8ea5fb9115450677cd3a6edf81d",
+        "problems_dev.jsonl": "sha256:193968aff23b7ed931c8f6d196b611e2f6694adb49e6cc085444a60ad2fc4f7b",
+        "raw_ground.h5": "sha256:48b0272a88b17dbd29777c217e1b4fb2b019b92e11cc2add847409db9541b890"
+      }
+    },
+    {
       "name": "simpleqa_verified",
       "display_name": "SimpleQA Verified",
       "description": "SimpleQA Verified — 1,000-prompt short-form factuality benchmark.",
@@ -1490,6 +1518,27 @@
         "notes": "Scoring mirrors RULER's string_match_all (recall) and string_match_part (QA), vendored in community/ruler/eval. Verified byte-exact against NVIDIA/RULER at ab17b78 and reproduces published recall on a Qwen3-8B run (repro table in the PR). Generation is capped per subtask to upstream's tokens_to_generate (via the sample's gen_budget, see infer()), and HotpotQA document ordering matches upstream's sorted(set()). Remaining divergences, each score-neutral:\n1. Paul Graham essay corpus: the BYO generator concatenates essays in the pinned URL-list order, while upstream groups them repo-then-html (glob order within each group), so the full-corpus bytes differ. NIAH/VT needles and QA answers don't depend on filler-text content or order, so recall is unchanged.\n2. HotpotQA (_read_hotpotqa in datasets/ruler/_qa.py) is sourced from the HF mirror (hotpotqa/hotpot_qa), not upstream's derived json, and questions are taken in the HF dataset's native row order and sliced to the first N. Per-index question selection can therefore differ from upstream even though document ordering (sorted(set()), used for distractor indexing) matches. Scoring is unaffected: each sample's answer is looked up from its own question, not from upstream's index.\nSeparately, a real divergence with material score impact — not the harmless cap-reproduction it might look like. CWE's 124-token answer budget (120 upstream base + 4 Qwen3 <think> tag overhead) is upstream's own tokens_to_generate=120, inherited byte-exact; sieval did not shrink it. But upstream calibrated 120 against its own terse, non-thinking answers — it has no thinking mode, so it never tested this budget against thinking-mode's more verbose output. A 10-item markdown list needs roughly 150 tokens, so the answer gets cut off mid-list (finish_reason=length) before naming the top-10. Measured truncation rate and recall split by completed vs truncated, across six thinking runs (n=500 each):\n  length:            4k     8k    16k    32k    64k   128k\n  truncated/500:    469    482    484    468    437    363\n  recall completed: 100.0  88.9   95.6   82.8   55.9   13.0\n  recall truncated:  83.1  68.3   53.8   56.9   42.9   14.4\nniah_single_1 and vt truncate 0/500 on these same runs, so this is CWE-specific verbosity, not a general thinking-mode issue. At 4k-64k, completed recall stays far above truncated recall — real budget starvation. At 128k the gap closes (13.0 vs 14.4) — that length is genuinely capability-limited, not truncation-limited.\nScore impact: replacing 4k-64k CWE scores with their completed-only recall (i.e. as if untruncated) moves the thinking-mode mean from 86.86 to ~88.3 — the gap from the 84.4 reference widens from +2.91% to ~+4.6%, outside the <3% band this PR otherwise holds to. Stated plainly, not as expected behavior. Whether to give the answer a larger budget (breaking byte-exact alignment with upstream's 120) is a separate decision; this note exists so the tradeoff is visible."
       },
       "status": "stable"
+    },
+    {
+      "name": "scicode_0shot_gen",
+      "display_name": "SciCode (0-shot, generative)",
+      "description": "SciCode — research coding benchmark with dependent sub-steps; sub-problem and main-problem accuracy.",
+      "dataset": "scicode",
+      "eval_mode": "gen",
+      "n_shot": 0,
+      "tags": [
+        "english",
+        "python",
+        "code-exec"
+      ],
+      "deps_group": "scicode",
+      "model_type": "chat",
+      "reference_impl": {
+        "source": "scicode",
+        "url": "https://github.com/scicode-bench/SciCode/tree/69a8cfc829fe8788a426ce8b5de6292366dce7ef/eval/scripts",
+        "notes": "Vendored from upstream eval/scripts into community/scicode: prompt templates, code/h5 parsers, comparison helpers, and the 3 non-generated gold steps (13.6/62.1/76.3, inlined in _gold_steps.py). special_step_mode selects gold injection and is SCORE-RELEVANT: 'verbatim' (default) injects the whole gold block; 'extract' byte-matches upstream gencode_json.py, whose get_function_from_code matches the header's def before class and so silently drops the class wrapper for 13.6/62.1 (open upstream bugs #59/#49), leaving every dependent step to fail with NameError and making problems 13/62 structurally unsolvable. Use 'extract' when comparing against public leaderboard numbers (produced with that behavior). Calibration (Qwen2-72B, committed code, T=0 greedy, full test split, self-dependency): official expected values apply only to 'extract'. Observed extract main accuracy matches the official figures (1.5 without background, paper Table 2; 4.6 with background, Table 3). Observed main/sub pairs are extract no-background 1.5/13.9, verbatim no-background 1.5/13.9, extract with-background 4.6/24.0, and verbatim with-background 3.1/24.7; verbatim has no official expected value. Without background, the two modes have identical pass/fail outcomes because Qwen's affected downstream code is wrong even after the missing classes are restored. With background, verbatim rescues 13.14/62.2/62.4 (+3), as it does on a stronger model (gpt-5.6). An unrelated byte-identical program for stochastic step 14.2 flipped verdict between the two background runs: its unseeded Monte Carlo test creates an observed ±1-problem (about 1.5 point) main-accuracy jitter, while sglang generation differences in other non-special problems changed no verdicts in this calibration. Compatibility/parity adaptations and other deviations from upstream: (1) problems 2/28 import scipy.integrate.simps, removed in SciPy 1.14 (open upstream issue #2); a conditional legacy-compatible wrapper restores that API for only their 4 tested programs. Replaying the stored Qwen programs after this fix changes their failure causes but not their pass/fail outcomes, so the reported calibration is unchanged; (2) numeric h5 targets are read eval-side and inlined into the sandbox program (upstream reads test_data.h5 in-subprocess); (3) execution runs on a remote code-eval service over HTTP, not an in-process subprocess — the service caps sandbox memory (1 GB default) while upstream subprocesses are uncapped, so memory-heavy numeric steps could OOM here yet pass upstream; (4) pipeline failures count as unsolved problems in main-problem accuracy. Reproducing official numbers requires greedy decoding (temperature=0) in the model config; with_background defaults to False (the official headline mode). The code-eval service image must provide the sandbox scientific stack including sympy, which the vendored comparison shim injects — see the evaluator's requirements/scicode.txt."
+      },
+      "status": "experimental"
     },
     {
       "name": "simpleqa_verified_0shot_gen",
