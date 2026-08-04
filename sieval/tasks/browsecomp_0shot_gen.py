@@ -17,7 +17,9 @@ pre-built Model); the official autorater is gpt-4.1-2025-04-14. As with the
 other autorater-graded tasks, correctness depends on a real grader model whose
 version sieval cannot pin the way it pins a Hub revision, so for reproducibility
 pin the grader model and set ``temperature: 0``; each sample's grade, echoed
-confidence, and grader model id are persisted in the feedback record.
+confidence, grader model id, and the autorater's verbatim reply
+(``grader_reply``) are persisted in the feedback record — see
+``GradeFeedback.grader_reply`` for why the reply is kept.
 
 NOTE: BrowseComp is designed to require web browsing; a plain (closed-book)
 model scores near-zero — this task grades whatever answer the model returns, so
@@ -54,6 +56,11 @@ class GradeFeedback(TypedDict):
     gold: str
     predicted: str
     grader_model: str
+    # The autorater's reply verbatim, on every attempt — the text `grade` and
+    # `confidence` come from. `parse_grade` defaults a non-matching reply to
+    # INCORRECT, so the grade alone cannot separate format drift from a real
+    # negative verdict.
+    grader_reply: str
 
 
 @sieval_task(
@@ -81,7 +88,11 @@ class GradeFeedback(TypedDict):
             "`grader` task arg on its own api_base/api_key. REPRODUCIBILITY: scores "
             "depend on the grader endpoint's model version (not pinnable like a Hub "
             "revision) — pin the grader model + temperature=0; the per-sample grade/"
-            "confidence and grader model id are persisted. BrowseComp requires "
+            "confidence, grader model id, and the autorater's verbatim reply "
+            "(grader_reply) are persisted — the reply being the only evidence of a "
+            "verdict a re-grade need not reproduce, and (parse_grade defaults to "
+            "INCORRECT) the only way to tell format drift from a real negative. "
+            "BrowseComp requires "
             "browsing: closed-book models score near-zero — validated at 0.316% "
             "(4/1266) for gemma-3-27b-it with the gpt-4.1 autorater — so a "
             "meaningful score needs a browsing-capable model/scaffold."
@@ -164,6 +175,7 @@ class BrowseCompZeroShotGenTask(
                     "gold": gold,
                     "predicted": predicted,
                     "grader_model": grader_model,
+                    "grader_reply": reply,
                 }
             )
         return True, feedbacks

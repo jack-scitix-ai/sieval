@@ -162,7 +162,8 @@ async def test_infer_forwards_only_n():
 
 @pytest.mark.anyio
 async def test_feedback_parses_correct_and_confidence():
-    task, _, _ = _task(grader_reply="correct: yes\nconfidence: 90")
+    reply = "reasoning: matches\ncorrect: yes\nconfidence: 90"
+    task, _, _ = _task(grader_reply=reply)
     ctx = TaskContext(sample_id=0, raw_sample=_row())
     finalize, feedbacks = await task.feedback(["Answer: 4"], ctx)
 
@@ -174,17 +175,24 @@ async def test_feedback_parses_correct_and_confidence():
     assert fb["gold"] == "4"
     assert fb["predicted"] == "Answer: 4"
     assert fb["grader_model"] == "judge-5.2"
+    # Multi-line on purpose, with reasoning the parse discards: storing only the
+    # matched fields, or only on parse failure, fails this assertion.
+    assert fb["grader_reply"] == reply
 
 
 @pytest.mark.anyio
 async def test_feedback_unparseable_reply_flagged_not_graded():
-    task, _, _ = _task(grader_reply="the judge rambled without the fields")
+    reply = "the judge rambled without the fields"
+    task, _, _ = _task(grader_reply=reply)
     ctx = TaskContext(sample_id=0, raw_sample=_row())
     _, feedbacks = await task.feedback(["whatever"], ctx)
     # Unparseable -> flagged so report() drops it from grading (not a verdict).
     assert feedbacks[0]["judge_parsed"] is False
     assert feedbacks[0]["correct"] is False
     assert feedbacks[0]["confidence"] == 100
+    # The motivating case: `judge_unparsed` alone cannot separate format drift
+    # from an error body from a matcher gap. The reply is the evidence.
+    assert feedbacks[0]["grader_reply"] == reply
 
 
 # --- report: accuracy over the full requested set (fails in denominator) ---

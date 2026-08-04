@@ -11,8 +11,9 @@ pre-built Model, on its own ``api_base``/``api_key``); the official autorater is
 gpt-4.1-2025-04-14. Unlike sieval's deterministic-grader tasks, correctness
 depends on a real grader model whose version sieval cannot pin the way it pins a
 Hub revision, so for reproducibility pin the grader model and set
-``temperature: 0``; each sample's grade and the grader model id are persisted in
-the feedback record.
+``temperature: 0``; each sample's grade, the grader model id, and the autorater's
+verbatim reply (``grader_reply``) are persisted in the feedback record — see
+``GradeFeedback.grader_reply`` for why the reply is kept.
 
 AI-Generated Code - Claude Opus 4.8 (Anthropic)
 """
@@ -42,6 +43,11 @@ class GradeFeedback(TypedDict):
     gold: str
     predicted: str
     grader_model: str
+    # The autorater's reply verbatim, on every attempt — the text `grade` comes
+    # from. `parse_grade` defaults a non-matching reply to NOT_ATTEMPTED, so the
+    # grade alone cannot separate format drift from a real abstention — which the
+    # F1 weights very differently from an incorrect answer.
+    grader_reply: str
 
 
 @sieval_task(
@@ -69,7 +75,11 @@ class GradeFeedback(TypedDict):
             "REPRODUCIBILITY: unlike deterministic-grader tasks, scores depend "
             "on the grader endpoint's model version (not pinnable like a Hub "
             "revision) — pin the grader model + temperature=0; the per-sample "
-            "grade and grader model id are persisted in the feedback record. "
+            "grade, grader model id, and the autorater's verbatim reply "
+            "(grader_reply) are persisted — the reply being the only evidence of "
+            "a verdict a re-grade need not reproduce, and (parse_grade defaults "
+            "to NOT_ATTEMPTED) the only way to tell format drift from a real "
+            "abstention. "
             "VALIDATION: google/gemma-4-31B-it scored F1 9.95 (n=1000, grader "
             "openai/gpt-4.1 via OpenRouter), within the official 10.7±2.1 band. "
             "Official numbers (Gemini 2.5 Pro 55.6; the band above) are from the "
@@ -153,6 +163,7 @@ class SimpleQAVerifiedZeroShotGenTask(
                     "gold": gold,
                     "predicted": predicted,
                     "grader_model": grader_model,
+                    "grader_reply": reply,
                 }
             )
         return True, feedbacks

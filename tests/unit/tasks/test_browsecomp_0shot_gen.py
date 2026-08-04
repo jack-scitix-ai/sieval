@@ -115,7 +115,8 @@ async def test_infer_forwards_n():
 
 @pytest.mark.anyio
 async def test_feedback_grades_yes_and_records_provenance():
-    task, _ = _task(grader_reply="reasoning: matches\ncorrect: yes\nconfidence: 90")
+    reply = "reasoning: matches\ncorrect: yes\nconfidence: 90"
+    task, _ = _task(grader_reply=reply)
     ctx = TaskContext(sample_id=0, raw_sample=_sample())
     finalize, feedbacks = await task.feedback(
         ["Exact Answer: William Shakespeare"], ctx
@@ -129,15 +130,22 @@ async def test_feedback_grades_yes_and_records_provenance():
     assert fb["gold"] == "William Shakespeare"
     assert fb["predicted"] == "Exact Answer: William Shakespeare"
     assert fb["grader_model"] == "grader-4.1"
+    # Multi-line on purpose, with reasoning the parse discards: storing only the
+    # matched fields, or only on parse failure, fails this assertion.
+    assert fb["grader_reply"] == reply
 
 
 @pytest.mark.anyio
 async def test_feedback_defaults_to_incorrect_without_verdict():
     # No recognizable "correct: yes|no" -> default INCORRECT (matches upstream).
-    task, _ = _task(grader_reply="the grader rambled without a verdict")
+    reply = "the grader rambled without a verdict"
+    task, _ = _task(grader_reply=reply)
     ctx = TaskContext(sample_id=0, raw_sample=_sample())
     _, feedbacks = await task.feedback(["some answer"], ctx)
     assert feedbacks[0]["grade"] == "INCORRECT"
+    # The INCORRECT default is indistinguishable from a real negative in the
+    # grade alone; the reply separates format drift from a wrong answer.
+    assert feedbacks[0]["grader_reply"] == reply
 
 
 # --- report: accuracy over the full requested set ---
