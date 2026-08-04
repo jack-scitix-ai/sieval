@@ -16,6 +16,7 @@ from loguru import logger
 
 from sieval.core.models import ModelOutput
 from sieval.core.tasks.context import TaskContext, TaskStage, TaskStageOutput
+from sieval.core.tasks.records import is_prediction_record
 
 
 # Schema
@@ -476,6 +477,11 @@ def detect_empty_postprocess(ctx: TaskContext) -> set[int]:
     if ctx.postprocess_result is None:
         return {0}
     post_result = _unwrap_result(ctx.postprocess_result)
+    if is_prediction_record(post_result):
+        # A PredictionRecord is a non-empty dict whatever its contents, so the
+        # emptiness heuristics below cannot see into it. detect_extraction_failure
+        # reads it properly; staying silent here keeps the two from double-reporting.
+        return set()
     is_empty_collection = (
         isinstance(post_result, (list, dict, set, tuple)) and len(post_result) == 0
     )
@@ -483,3 +489,36 @@ def detect_empty_postprocess(ctx: TaskContext) -> set[int]:
     if post_result is None or is_empty_collection or is_empty_string:
         return {0}
     return set()
+
+
+@sieval_detection_rule(
+    description=(
+        "A rollout yielded no usable answer -- extraction found none, or, for an "
+        "open-ended task, the generation itself was blank"
+    ),
+    category="correctness",
+    rationale=(
+        "Either way the rollout scores as wrong without the model necessarily "
+        "being wrong: for a task that extracts, this points at the prompt or the "
+        "extraction rule rather than at capability; for an open-ended task, at an "
+        "empty generation. Reported per rollout, so an occasional miss under n>1 "
+        "is distinguishable from a total failure."
+    ),
+    tags=["parsing", "extraction", "empty_output", "correctness"],
+)
+def detect_extraction_failure(ctx: TaskContext) -> set[int]:
+    if ctx.postprocess_result is None:
+        return set()  # detect_empty_postprocess owns the missing-result case
+    post_result = _unwrap_result(ctx.postprocess_result)
+    if not is_prediction_record(post_result):
+        return set()
+    rollouts = post_result.get("rollouts") or []
+    if not rollouts:
+        # A prediction record covering no rollouts is itself the anomaly; index 0
+        # is a sentinel here, since there is no rollout to point at.
+        return {0}
+    return {
+        rollout.get("index", position)
+        for position, rollout in enumerate(rollouts)
+        if not rollout.get("extracted")
+    }

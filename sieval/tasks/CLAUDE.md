@@ -27,6 +27,33 @@ Class: `<Benchmark><ShotType><Mode>Task` — words for shot count (`ZeroShot`, `
 - Subpackage shared base module: file named `_base.py` (private module), classes inside without underscore prefix (package-internal public API, e.g. `from ._base import XxxTask`).
 - General code-quality + layer rules live in `.claude/rules/tasks.md`.
 
+## Stage-Output Protocol (opt-in)
+
+Per-stage record types so a sample's answer / ground truth / verdict is readable without knowing which task produced it. **Schema, serialization rules and builder contracts live in [`sieval/core/tasks/records.py`](../core/tasks/records.py)** — authoritative, and deliberately not repeated here. This section is the vocabulary. Opt-in per task; legacy shapes keep working, so migrate deliberately.
+
+Records are named by **content**, not by the stage that emits them — a shard line reads `prediction` / `judgement`, not `postprocess` / `feedback`:
+
+| stage | record |
+| --- | --- |
+| `preprocess` | `PromptRecord` |
+| `infer` | `ModelOutput` — already uniform, deliberately **not** wrapped |
+| `postprocess` | `PredictionRecord` |
+| `feedback` | `JudgementRecord` |
+
+Vocabulary — these denote **different layers**, keep them distinct:
+
+- **judgement** — the verdict record, mechanism-agnostic: string-compare, math-verify, test-suite *or* LLM verdicts all produce one.
+- **prediction** — the model's extracted answer. `None` means "could not extract" — never `""` or `-1`.
+- **reference** — ground truth; `None` when it is a *procedure* (test suite, rubric).
+- **correct** / **score** — the headline verdict. `correct` is the only axis comparable across tasks.
+- **metrics** — every metric measured, by name. A task with *co-equal* metrics (IFEval strict + loose, HellaSwag `acc` + `acc_norm`) records them all here and derives the headline from them; a metric parked in `extra` is hidden from any reader that doesn't already know the task.
+- **grade** — an LLM autorater's categorical output (CORRECT / INCORRECT / NOT_ATTEMPTED). A judgement *contains* a grade — grade sits **below** judgement, not beside it.
+- **grader** — the LLM actor (the `grader` task arg / model). Not every judgement has one; persist its whole `ModelOutput` in `extra` rather than hand-picked fields.
+- **judge** — HLE only, upstream's synonym with its own `parse_judge` contract; do not introduce it in new tasks.
+- **extra** — mechanism detail, *not* metrics: a grader's `ModelOutput`, a code runner's failure message, per-constraint results.
+
+Constructors are `build_*` (matching `build_model_call_meta` / `build_stage_meta`); structural sniffs are `is_*`. Records are returned **bare**, never wrapped in `TaskStageOutput`.
+
 ## `infer_args` — Per-Task Inference Override
 
 YAML-level `infer_args` overrides model inference parameters via `EvalSession` calling `model.with_args(**infer_args)`.
