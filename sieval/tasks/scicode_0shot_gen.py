@@ -128,7 +128,12 @@ class StepFeedback(TypedDict):
             "restores that API for only their 4 tested programs. A fresh four-way "
             "post-fix rerun reports import_errors=0; those steps remain incorrect "
             "because of downstream Qwen errors, so the wrapper itself adds no Qwen "
-            "passes; "
+            "passes. simps is the only removed API any problem declares (checked "
+            "across both splits), but the sandbox otherwise runs its own pinned "
+            "SciPy rather than the pre-1.14 one behind the official numbers, so "
+            "model-generated code reaching for another retired API fails here "
+            "though it would pass upstream; the prompt constraining models to the "
+            "declared dependencies bounds that exposure; "
             "(2) numeric h5 "
             "targets are read eval-side and inlined into the "
             "sandbox program (upstream reads test_data.h5 in-subprocess); "
@@ -404,7 +409,13 @@ class SciCodeZeroShotGenTask(
             messages = [str(fb.get("msg", "")).lower() for fb in feedbacks]
             timeouts += sum("timeout" in msg for msg in messages)
             memory_errors += sum("memoryerror" in msg for msg in messages)
-            import_errors += sum("importerror" in msg for msg in messages)
+            # ModuleNotFoundError is an ImportError subclass, but the evaluator
+            # reports the concrete class name, which does not contain
+            # "importerror". It is the signature of a package missing from the
+            # code-eval image, so it must not read as import_errors=0.
+            import_errors += sum(
+                "importerror" in msg or "modulenotfounderror" in msg for msg in messages
+            )
             if feedbacks and n_correct == len(feedbacks):
                 correct_problems += 1
 

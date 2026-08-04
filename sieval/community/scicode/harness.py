@@ -23,6 +23,7 @@ AI-Generated Code - Claude Opus 4.8 (1M context) (Anthropic)
 import base64
 import functools
 import pickle
+import re
 import zlib
 from importlib import resources
 
@@ -41,7 +42,13 @@ def _cmp_source() -> str:
 # wrapper before those four programs execute, without downgrading SciPy for the
 # other 284 tested steps. Defining it inside the installer keeps its numpy/scipy
 # dependencies in a closure rather than leaking them into solution globals.
-_SCIPY_SIMPS_IMPORT = "from scipy.integrate import simps"
+#
+# Match the bare name rather than the exact import line: `simps` also reaches a
+# program as `from scipy.integrate import quad, simps` or as an attribute call
+# on an imported module. The trailing \b keeps `simpson` — a live SciPy name
+# needing no wrapper — from matching. Over-matching is harmless: the installer
+# no-ops when `simps` already exists and only ever adds an unused name.
+_SCIPY_SIMPS_PATTERN = re.compile(r"\bsimps\b")
 _SCIPY_SIMPS_COMPAT = r'''
 def _install_scicode_simps_compat():
     import numpy as _np
@@ -56,7 +63,13 @@ def _install_scicode_simps_compat():
         return array[tuple(slices)]
 
     def simps(y, x=None, dx=1.0, axis=-1, even="avg"):
-        """Compatibility implementation of the pre-SciPy-1.14 simps API."""
+        """Restore pre-SciPy-1.14 simps for even="avg"/"first"/"last".
+
+        That is the surface SciCode's problems declare. SciPy 1.11-1.13 also
+        accepted even="simpson", which is not reproduced here and raises;
+        invalid even= values raise for odd sample counts too, where the
+        original silently ignored them.
+        """
         y = _np.asarray(y)
         if y.ndim == 0:
             return _integrate.simpson(y, x=x, dx=dx, axis=axis)
@@ -153,7 +166,7 @@ def build_test_program(code_content: str, targets_b64: str, test_cases: list) ->
     upstream test-body strings; each references ``target`` (the i-th target).
     """
     parts = []
-    if _SCIPY_SIMPS_IMPORT in code_content:
+    if _SCIPY_SIMPS_PATTERN.search(code_content):
         parts.extend([_SCIPY_SIMPS_COMPAT, ""])
     parts.extend(
         [

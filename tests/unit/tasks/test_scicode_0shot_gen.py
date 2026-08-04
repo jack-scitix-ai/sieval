@@ -291,6 +291,28 @@ def legacy_even_values():
     assert "_install_scicode_simps_compat" not in unaffected
 
 
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("from scipy.integrate import simps\n", True),
+        # simps can arrive in a multi-name import or as an attribute call; an
+        # exact-import-line probe would miss both and leave the step ImportError-ing.
+        ("from scipy.integrate import quad, simps\n", True),
+        ("from scipy.integrate import simps, quad\n", True),
+        ("import scipy.integrate\nscipy.integrate.simps(y, x)\n", True),
+        ("from scipy import integrate\nintegrate.simps(y, x)\n", True),
+        # simpson is a live SciPy name and needs no wrapper — a substring probe
+        # for "...import simps" matches it, a word-boundary one must not.
+        ("from scipy.integrate import simpson\n", False),
+        ("from scipy.integrate import simpson as s\n", False),
+        ("import numpy as np\n", False),
+    ],
+)
+def test_build_test_program_injects_simps_compat_by_bare_name(code, expected):
+    program = build_test_program(code, encode_targets([None]), ["pass"])
+    assert ("_install_scicode_simps_compat" in program) is expected
+
+
 def test_build_test_program_does_not_leak_comparison_dependencies():
     pytest.importorskip("sympy")
     program = build_test_program(
@@ -455,11 +477,14 @@ async def test_report_surfaces_step_execution_failures():
     finals = [
         _final(
             0,
-            [False, False, False, False],
+            [False, False, False, False, False],
             messages=[
                 "failed: subprocess timeout: 1800.0s",
                 "failed: [MemoryError] unable to allocate",
                 "failed: [ImportError] cannot import name 'simps'",
+                # The evaluator reports the concrete class name, so a package
+                # missing from the sandbox image never says "ImportError".
+                "failed: [ModuleNotFoundError] No module named 'numba'",
                 "failed: [AssertionError]",
             ],
         )
@@ -469,7 +494,7 @@ async def test_report_surfaces_step_execution_failures():
 
     assert report["timeouts"] == 1
     assert report["memory_errors"] == 1
-    assert report["import_errors"] == 1
+    assert report["import_errors"] == 2
     assert report["fails"] == 0
 
 
