@@ -13,8 +13,8 @@ from sieval.core.models.gen_model import GenModel
 from sieval.core.tasks import EvalMode, TaskContext
 from sieval.core.tasks.meta import get_task_meta
 from sieval.datasets.arc_easy import ARCEasyDataset, ARCEasyDatasetSample
-from sieval.tasks._arc import ARC_UNCOND_CONTEXT
-from sieval.tasks.arc_easy_kshot_ppl import ARCEasyFewShotPplTask
+from sieval.tasks.arc._base import ARC_UNCOND_CONTEXT
+from sieval.tasks.arc.arc_easy_kshot_ppl import ARCEasyFewShotPplTask
 
 
 class _ScriptedGenModel(GenModel):
@@ -61,7 +61,7 @@ def _task(scores: dict[str, tuple[float, float]]) -> ARCEasyFewShotPplTask:
     dataset = ARCEasyDataset(
         _hf_dict=HFDatasetDict({"test": HFDataset.from_list([dict(_sample())])})
     )
-    return ARCEasyFewShotPplTask(dataset, _ScriptedGenModel(scores), k=0)
+    return ARCEasyFewShotPplTask(dataset, _ScriptedGenModel(scores), n_shot=0)
 
 
 @pytest.mark.anyio

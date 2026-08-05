@@ -14,11 +14,29 @@ import orjson
 import pytest
 
 from sieval import __version__
-from sieval.core.runners.resume_gate import ResumeVersionError
-from sieval.core.runners.runner import ResultDirExistsError, TaskRunner
+from sieval.core.datasets.meta import (
+    DATASET_REGISTRY,
+    SAMPLE_TO_DATASET,
+    Category,
+    DatasetMeta,
+    Level1Category,
+)
+from sieval.core.models import ModelOutput
+from sieval.core.runners.resume_gate import ResumeIdentityError, ResumeVersionError
+from sieval.core.runners.runner import (
+    ResultDirExistsError,
+    TaskRunner,
+    gate_resume_identity,
+)
 from sieval.core.tasks.concurrency import compute_stream_buffer_capacity
 from sieval.core.tasks.consts import TaskAction, TaskStage
-from sieval.core.tasks.context import TaskContext, TaskStageOutput
+from sieval.core.tasks.context import TaskContext, TaskRunIdentity, TaskStageOutput
+from sieval.core.tasks.meta import (
+    _TASK_CLASSES,
+    TASK_REGISTRY,
+    EvalMode,
+    sieval_task,
+)
 from sieval.core.tasks.task import Task
 from tests.conftest import MockAlwaysFailModel, MockChatModel, MockDataset, make_config
 
@@ -109,6 +127,69 @@ class ProgressUpdateCall(TypedDict):
 
 
 # ===================================================================
+# A @sieval_task-decorated task, for the meta.json identity block
+# ===================================================================
+class _IdentitySample(TypedDict):
+    question: str
+    answer: str
+
+
+class _IdentityStubDataset:
+    """Registry stand-in for `MockDataset`.
+
+    `@sieval_task` resolves the dataset FK from the task's *sample type*, not
+    from the `Dataset` instance passed at construction, so the run can keep
+    using the plain `MockDataset` while the FK resolves against this.
+    """
+
+    _sieval_dataset_meta = DatasetMeta(
+        name="stub_identity_dataset",
+        display_name="Stub Identity",
+        description="stub",
+        source=("hf:stub/stub",),
+        categories=(Category(Level1Category.MATHEMATICS),),
+    )
+
+
+@pytest.fixture
+def decorated_mock_task_cls():
+    """A `MockTask` carrying real `@sieval_task` metadata.
+
+    `MockTask` itself is declared as bare `class MockTask(Task)`, so
+    `extract_sample_type` cannot resolve its dataset FK — the decoration
+    target has to restate the generic. The class is built inside the fixture
+    so the attached meta cannot leak into other tests.
+    """
+    SAMPLE_TO_DATASET[_IdentitySample] = _IdentityStubDataset
+    DATASET_REGISTRY["stub_identity_dataset"] = (
+        _IdentityStubDataset._sieval_dataset_meta
+    )
+    try:
+
+        @sieval_task(
+            name="e2e_identity_task",
+            display_name="E2E Identity",
+            description="decorated mock task",
+            eval_mode=EvalMode.CLP,
+            n_shot=2,
+            tags=("english", "multiple-choice"),
+            status="experimental",
+        )
+        class DecoratedMockTask(
+            MockTask,
+            Task[_IdentitySample, str, ModelOutput, str, tuple, dict],
+        ):
+            pass
+
+        yield DecoratedMockTask
+    finally:
+        TASK_REGISTRY.pop("e2e_identity_task", None)
+        _TASK_CLASSES.pop("e2e_identity_task", None)
+        SAMPLE_TO_DATASET.pop(_IdentitySample, None)
+        DATASET_REGISTRY.pop("stub_identity_dataset", None)
+
+
+# ===================================================================
 # Tests
 # ===================================================================
 class TestE2EHappyPath:
@@ -143,6 +224,194 @@ class TestE2EHappyPath:
         idx_files = list(root.rglob("*.idx"))
         assert len(jsonl_files) > 0
         assert len(idx_files) > 0
+
+
+class TestE2ERunMetaTaskIdentity:
+    """`meta.json` records which registered task produced the run (#49)."""
+
+    @pytest.mark.anyio
+    async def test_decorated_task_persists_its_registry_identity(
+        self, tmp_path, decorated_mock_task_cls
+    ):
+        task = decorated_mock_task_cls(
+            dataset=MockDataset(),
+            model=MockChatModel(answers=DEFAULT_ANSWERS),
+            # Deliberately unlike the registered name. `Task.name` is a
+            # user-chosen YAML key — under MultiTaskRunner it names the
+            # result directory, and it is exactly what the persisted
+            # identity must not be recovered from.
+            name="whatever_the_yaml_called_it",
+        )
+        runner = TaskRunner(task, make_config(tmp_path))
+        await runner.arun()
+
+        meta = orjson.loads((runner.root_dir / "meta.json").read_bytes())
+        assert meta["task"] == {
+            "name": "e2e_identity_task",
+            "display_name": "E2E Identity",
+            "dataset": "stub_identity_dataset",
+            "eval_mode": "clp",
+            "n_shot": 2,
+            "tags": ["english", "multiple-choice"],
+            "status": "experimental",
+        }
+        assert task.name != meta["task"]["name"]
+        assert meta["version"] == __version__
+
+    @pytest.mark.anyio
+    async def test_persisted_n_shot_is_the_run_not_the_declaration(
+        self, tmp_path, decorated_mock_task_cls
+    ):
+        """The class declares `n_shot=2`; this run renders 7. A result
+        directory is read to find out what the run did, so 7 is what lands —
+        otherwise a `k` override is invisible after the fact."""
+        task = decorated_mock_task_cls(
+            dataset=MockDataset(),
+            model=MockChatModel(answers=DEFAULT_ANSWERS),
+            name="shot_override",
+        )
+        task.n_shot = 7  # a real task sets this in __init__ from its knob
+        runner = TaskRunner(task, make_config(tmp_path))
+        await runner.arun()
+
+        meta = orjson.loads((runner.root_dir / "meta.json").read_bytes())
+        assert meta["task"]["n_shot"] == 7
+        # The declaration itself is untouched — only the run's view moved.
+        assert TASK_REGISTRY["e2e_identity_task"].n_shot == 2
+
+    @pytest.mark.anyio
+    async def test_undecorated_task_omits_the_block(self, tmp_path):
+        task = MockTask(
+            dataset=MockDataset(),
+            model=MockChatModel(answers=DEFAULT_ANSWERS),
+            name="e2e_no_identity",
+        )
+        runner = TaskRunner(task, make_config(tmp_path))
+        await runner.arun()
+
+        meta = orjson.loads((runner.root_dir / "meta.json").read_bytes())
+        assert "task" not in meta
+
+
+_IDENT: TaskRunIdentity = {
+    "name": "task_a",
+    "display_name": "A",
+    "dataset": "d",
+    "eval_mode": "gen",
+    "n_shot": 0,
+    "tags": [],
+    "status": "stable",
+}
+# Same block, different registered name — the only field the gate compares.
+_OTHER: TaskRunIdentity = {
+    "name": "task_b",
+    "display_name": "A",
+    "dataset": "d",
+    "eval_mode": "gen",
+    "n_shot": 0,
+    "tags": [],
+    "status": "stable",
+}
+
+
+def _write_meta(root: Path, task_block: object) -> Path:
+    """Persist a `meta.json` whose `task` block is *whatever was passed* —
+    malformed shapes included, since the gate has to survive them."""
+    root.mkdir(parents=True, exist_ok=True)
+    meta: dict[str, object] = {"version": __version__, "deterministic": False}
+    if task_block is not None:
+        meta["task"] = task_block
+    (root / "meta.json").write_bytes(orjson.dumps(meta))
+    return root
+
+
+class TestResumeIdentityGate:
+    """`gate_resume_identity` — a result dir is matched by path alone, so the
+    task that produced it has to be part of the key."""
+
+    def test_refuses_a_directory_another_task_produced(self, tmp_path):
+        root = _write_meta(tmp_path / "d", _IDENT)
+        with pytest.raises(ResumeIdentityError, match="different task"):
+            gate_resume_identity(root, _OTHER)
+
+    def test_allows_the_same_task(self, tmp_path):
+        root = _write_meta(tmp_path / "d", _IDENT)
+        gate_resume_identity(root, _IDENT)  # must not raise
+
+    @pytest.mark.parametrize(
+        ("task_block", "identity"),
+        [
+            # Pre-feature run, or one produced by an undecorated class: absent
+            # is indistinguishable from a match, so it cannot justify refusing.
+            (None, _IDENT),
+            # Undecorated task resuming: no name on this side to compare.
+            (_IDENT, None),
+            # Block present but malformed — shape alone decides.
+            ("not-a-dict", _IDENT),
+            ({"display_name": "A"}, _IDENT),
+        ],
+        ids=["pre-feature", "undecorated-current", "block-not-a-dict", "block-unnamed"],
+    )
+    def test_passes_when_there_is_nothing_to_compare(
+        self, tmp_path, task_block, identity
+    ):
+        root = _write_meta(tmp_path / "d", task_block)
+        gate_resume_identity(root, identity)  # must not raise
+
+    def test_non_object_meta_is_ignored(self, tmp_path):
+        """Valid JSON that is not an object. The drifting name *is* in the
+        bytes, just not at a path this reads, so shape alone decides — a
+        looser parse would refuse a resume it has no grounds to refuse."""
+        root = tmp_path / "d"
+        root.mkdir()
+        (root / "meta.json").write_bytes(orjson.dumps([{"task": {"name": "task_a"}}]))
+        gate_resume_identity(root, _OTHER)  # must not raise
+
+    def test_unreadable_meta_is_the_version_gate_s_problem(self, tmp_path):
+        """This gate stays silent on a corrupt file rather than raising its own
+        error: `gate_resume_version` runs first and already fail-closes on it."""
+        root = tmp_path / "d"
+        root.mkdir()
+        (root / "meta.json").write_bytes(b"{ truncated")
+        gate_resume_identity(root, _IDENT)  # must not raise
+
+    @pytest.mark.anyio
+    async def test_finished_dir_is_not_handed_to_another_task(
+        self, tmp_path, decorated_mock_task_cls
+    ):
+        """The failure this gate exists for.
+
+        `auto_resume` short-circuits `arun()` on a valid `report.json` before
+        any stage runs, so without the gate a second task pointed at a
+        finished directory got the first task's report back as its own result,
+        having evaluated nothing — and `meta.json` still named the first task.
+        """
+        first = decorated_mock_task_cls(
+            dataset=MockDataset(),
+            model=MockChatModel(answers=DEFAULT_ANSWERS),
+            name="shared",
+        )
+        runner = TaskRunner(first, make_config(tmp_path))
+        assert await runner.arun() is not None
+        assert (runner.root_dir / "report.json").exists()
+
+        # Same directory, a different registered task.
+        meta_path = runner.root_dir / "meta.json"
+        meta = orjson.loads(meta_path.read_bytes())
+        meta["task"]["name"] = "a_completely_different_task"
+        meta_path.write_bytes(orjson.dumps(meta))
+
+        with pytest.raises(ResumeIdentityError, match="different task"):
+            TaskRunner(
+                decorated_mock_task_cls(
+                    dataset=MockDataset(),
+                    model=MockChatModel(answers=DEFAULT_ANSWERS),
+                    name="shared",
+                ),
+                make_config(
+                    tmp_path, result_dir=str(runner.root_dir), auto_resume=True
+                ),
+            )
 
 
 class TestE2EFailureRecovery:

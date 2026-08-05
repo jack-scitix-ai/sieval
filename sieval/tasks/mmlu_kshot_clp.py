@@ -11,7 +11,7 @@ and its normalizer is constant across the four letters. This is OpenCompass
 ``clp`` (conditional log-prob, single inference), not ``ppl`` (full-sequence
 perplexity of multi-token continuations).
 
-Few-shot: the first ``k`` ``dev`` examples of the *same subject*, in dataset
+Few-shot: the first ``n_shot`` ``dev`` examples of the *same subject*, in dataset
 order (matching evaluate_flan ``dev_df[:k]`` per subject). Prompt text
 (``_format_subject`` / ``_format_example``) is copied verbatim from the
 reference and pinned by tests.
@@ -101,7 +101,7 @@ def _format_example(sample: MMLUDatasetSample, *, include_answer: bool) -> str:
             "Next-token A/B/C/D scoring via one alogprobs(echo=False) call, "
             "argmax over the option tokens in top_logprobs; equivalent to the "
             "reference softmax over the restricted letter logits (OpenCompass "
-            "clp). Few-shot = first k dev examples per subject in dataset "
+            "clp). Few-shot = first n_shot dev examples per subject in dataset "
             "order. Requires all of A/B/C/D in the top-k and fails the sample "
             "otherwise (default logprobs=100; vLLM needs --max-logprobs 100, "
             "default 20; SGLang serves 100). Micro-average score over the "
@@ -130,16 +130,16 @@ class MMLUFewShotCLPTask(
         model: Model[Any],
         name: str | None = None,
         *,
-        k: int = DEFAULT_N_SHOT,
+        n_shot: int = DEFAULT_N_SHOT,
         logprobs: int = DEFAULT_LOGPROBS,
         fewshot_split: str = "dev",
     ):
-        if k < 0:
-            raise ValueError(f"k must be >= 0, got {k}")
+        if n_shot < 0:
+            raise ValueError(f"n_shot must be >= 0, got {n_shot}")
         if logprobs < 1:
             raise ValueError(f"logprobs must be >= 1, got {logprobs}")
         super().__init__(dataset=dataset, model=model, name=name)
-        self._k = k
+        self.n_shot = n_shot
         self._logprobs = max(logprobs, len(CHOICES))
         self._fewshot_split = fewshot_split
         self._few_shot_by_subject: dict[str, list[MMLUDatasetSample]] = {}
@@ -147,10 +147,18 @@ class MMLUFewShotCLPTask(
 
     @override
     async def setup(self) -> None:
+        # Build every per-subject prefix up front, so a subject whose dev pool
+        # is too short for n_shot aborts before any inference spend rather than
+        # failing samples one at a time (matches C-Eval). No-op at n_shot == 0.
+        # Reaches only subjects the few-shot split contains: one present in
+        # `test` but absent from it has no prefix to build here, so that case
+        # still surfaces per sample, from _select_examples.
         self._ensure_few_shot_pool()
+        for subject in self._few_shot_by_subject:
+            self._build_few_shot_prompt(subject)
 
     def _ensure_few_shot_pool(self) -> None:
-        if self._few_shot_by_subject or self._k == 0:
+        if self._few_shot_by_subject or self.n_shot == 0:
             return
         split = self.dataset.dataset_dict.get(self._fewshot_split)
         if split is None:
@@ -163,10 +171,19 @@ class MMLUFewShotCLPTask(
             self._few_shot_by_subject.setdefault(subject, []).append(sample)
 
     def _select_examples(self, subject: str) -> list[MMLUDatasetSample]:
-        if self._k == 0:
+        if self.n_shot == 0:
             return []
         self._ensure_few_shot_pool()
-        return list(self._few_shot_by_subject.get(subject, []))[: self._k]
+        examples = self._few_shot_by_subject.get(subject, [])
+        # Slicing a short pool would render fewer shots than meta.json reports,
+        # with nothing on disk saying so. Fail instead, as C-Eval and MMMLU
+        # already do for the same per-subject pool.
+        if len(examples) < self.n_shot:
+            raise ValueError(
+                f"MMLU subject {subject!r} has {len(examples)} "
+                f"{self._fewshot_split!r} exemplars; need n_shot={self.n_shot}."
+            )
+        return list(examples)[: self.n_shot]
 
     def _build_few_shot_prompt(self, subject: str) -> str:
         cached = self._few_shot_prompt_by_subject.get(subject)

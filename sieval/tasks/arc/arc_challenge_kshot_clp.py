@@ -1,5 +1,5 @@
 """
-ARC-Easy few-shot base-model conditional-log-prob task (options format).
+ARC-Challenge few-shot base-model conditional-log-prob task (options format).
 
 The "options" MCQ format (Borchmann, ARC "Challenge" Is Not That Challenging,
 Findings of ACL 2025; arXiv:2412.17758): the candidate options are listed
@@ -12,13 +12,13 @@ loud rather than a best-of-present guess (default ``logprobs=100``; SGLang
 serves 100 by default, on vLLM start with ``--max-logprobs 100``).
 
 This is the base-model options-format counterpart to the ``ppl`` separation task
-(``arc_easy_kshot_ppl``, which scores full option text). DeepSeek switched from
-separation to options after V1, so the options-regime number is the target
+(``arc_challenge_kshot_ppl``, which scores full option text). DeepSeek switched
+from separation to options after V1, so the options-regime number is the target
 here; the Qwen2.5 report uses separation (see the ppl sibling).
 
-Comparison target: Qwen2.5-72B-Base ARC-Easy 25-shot EM = 98.4, taken from the
-DeepSeek-V3 report's Table 3 (the Qwen2.5-72B-Base column — DeepSeek-V3-Base's
-own entry is 98.9). Not yet validated against a run, so ``status="experimental"``.
+Comparison target: Qwen2.5-72B-Base ARC-Challenge 25-shot EM = 94.5, taken from
+the DeepSeek-V3 report's Table 3 (the Qwen2.5-72B-Base column — DeepSeek-V3-Base's
+own entry is 95.3). Not yet validated against a run, so ``status="experimental"``.
 
 AI-Generated Code - Claude Opus 4.8 (1M context) (Anthropic)
 """
@@ -36,9 +36,9 @@ from sieval.core.tasks import (
     sieval_task,
 )
 from sieval.core.utils.ppl import choice_scores_from_top_logprobs
-from sieval.datasets import ARCEasyDatasetSample
+from sieval.datasets import ARCChallengeDatasetSample
 
-from ._arc import (
+from ._base import (
     DEFAULT_CLP_LOGPROBS,
     DEFAULT_FEWSHOT_SEED,
     arc_judgement_record,
@@ -55,9 +55,9 @@ N_SHOT = 25
 
 
 @sieval_task(
-    name="arc_easy_kshot_clp",
-    display_name="ARC-Easy (few-shot, conditional log-prob)",
-    description="ARC-Easy few-shot options-format next-token letter accuracy.",
+    name="arc_challenge_kshot_clp",
+    display_name="ARC-Challenge (few-shot, conditional log-prob)",
+    description="ARC-Challenge few-shot options-format next-token letter accuracy.",
     eval_mode=EvalMode.CLP,
     n_shot=N_SHOT,
     tags=("english", "science", "multiple-choice", "base-model"),
@@ -66,26 +66,27 @@ N_SHOT = 25
     reference_impl=ReferenceImpl(
         source="lm-evaluation-harness",
         url=(
-            "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/arc/arc_easy.yaml"
+            "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/arc/arc_challenge.yaml"
         ),
         notes=(
-            "Shares the ARC-Easy split/dataset/revision with "
+            "Shares the ARC-Challenge split/dataset/revision with "
             "lm-evaluation-harness. Uses the 'options' MCQ format (arXiv "
             "2412.17758): options listed A/B/C/... in the prompt, answer is the "
             "option letter, scored by one-call next-token top_logprobs argmax "
             "(the clp protocol; mirrors cmmlu_kshot_base_gen). Requires all "
             "option letters in the top-k and fails the sample otherwise "
             "(default logprobs=100; SGLang serves 100, on vLLM use "
-            "--max-logprobs 100). Comparison target: Qwen2.5-72B-Base ARC-Easy "
-            "25-shot EM = 98.4, from the DeepSeek-V3 report's Table 3 "
-            "(Qwen2.5-72B-Base column; DeepSeek switched separation->options "
-            "after V1, and the ppl sibling reproduces the separation number)."
+            "--max-logprobs 100). Comparison target: Qwen2.5-72B-Base "
+            "ARC-Challenge 25-shot EM = 94.5, from the DeepSeek-V3 report's "
+            "Table 3 (Qwen2.5-72B-Base column; DeepSeek switched separation->"
+            "options after V1, and the ppl sibling reproduces the separation "
+            "number, e.g. the Qwen2.5 report's ~72.4)."
         ),
     ),
 )
-class ARCEasyFewShotClpTask(
+class ARCChallengeFewShotClpTask(
     Task[
-        ARCEasyDatasetSample,
+        ARCChallengeDatasetSample,
         PromptRecord,
         ModelOutput,
         PredictionRecord,
@@ -99,17 +100,17 @@ class ARCEasyFewShotClpTask(
         model,
         name: str | None = None,
         *,
-        k: int = N_SHOT,
+        n_shot: int = N_SHOT,
         logprobs: int = DEFAULT_CLP_LOGPROBS,
         fewshot_split: str = "train",
         fewshot_seed: int = DEFAULT_FEWSHOT_SEED,
     ):
-        if k < 0:
-            raise ValueError(f"k must be >= 0, got {k}")
+        if n_shot < 0:
+            raise ValueError(f"n_shot must be >= 0, got {n_shot}")
         if logprobs < 1:
             raise ValueError(f"logprobs must be >= 1, got {logprobs}")
         super().__init__(dataset=dataset, model=model, name=name)
-        self._k = k
+        self.n_shot = n_shot
         self._logprobs = logprobs
         self._fewshot_split = fewshot_split
         self._fewshot_seed = fewshot_seed
@@ -117,7 +118,7 @@ class ARCEasyFewShotClpTask(
 
     @override
     async def setup(self) -> None:
-        # Built once here (setup runs before any preprocess) so the k-exemplar
+        # Built once here (setup runs before any preprocess) so the few-shot
         # prefix is not rejoined per sample.
         self._fewshot_prefix = self._build_fewshot_prefix()
 
@@ -148,7 +149,7 @@ class ARCEasyFewShotClpTask(
         if not all_present:
             missing = [label for label in labels if scores[label] == float("-inf")]
             raise RuntimeError(
-                f"ARC-Easy top_logprobs missing option token(s) {missing}; "
+                f"ARC-Challenge top_logprobs missing option token(s) {missing}; "
                 f"increase logprobs (got top-k of {self._logprobs}) or raise the "
                 "server's max-logprobs so all option letters are returned."
             )
@@ -167,6 +168,6 @@ class ARCEasyFewShotClpTask(
 
     def _build_fewshot_prefix(self) -> str:
         examples = sample_arc_fewshot(
-            self.dataset, self._k, self._fewshot_split, self._fewshot_seed
+            self.dataset, self.n_shot, self._fewshot_split, self._fewshot_seed
         )
         return build_arc_clp_fewshot_prefix(examples)

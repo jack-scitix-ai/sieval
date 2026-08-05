@@ -13,6 +13,34 @@ File: `<task>_<N>shot_<mode>.py` — suffix determines `model_type`:
 
 Class: `<Benchmark><ShotType><Mode>Task` — words for shot count (`ZeroShot`, `FewShot`).
 
+### Constructor knobs: `n_shot` vs `k`
+
+Two counts that read alike and are not interchangeable. Enforced by
+`scripts/check_preflight.py --check check_task_shot_knobs`:
+
+- **`n_shot`** — the few-shot exemplar count. The only accepted spelling (not
+  `k`, `shots`, `num_shots`, `fewshot`, …). Store it as **`self.n_shot`**, the
+  public field `Task` declares and `@sieval_task(n_shot=...)` seeds on the
+  class: assigning it shadows the class value for that instance, and that is
+  what `meta.json` records as the count the run used. Store it anywhere else
+  (`self._n_shot`, …) and the class value stands, so the run directory reports
+  the declared default. A task with **no** knob needs no code at all — the
+  seeded class value is already right.
+- **`k`** — the `k` in `pass@k`, nothing else: the metric's parameter, **not**
+  the sampling budget. That is `n`, forwarded to `agenerate(n=...)`, and
+  `k <= n` — `pass@k` is estimated from `n` samples per problem. A task taking
+  `k` must compute a `pass@k` metric, and `self.n_shot` may never be fed from it.
+
+The `n_shot` rules bind **every constructor under `sieval/tasks/`**, including an
+undecorated shared base in a subpackage (`arc/_base.py`) — a decorated task can
+inherit its `__init__`, and checking only decorated classes would leave that
+knob unchecked. The `k` rule is decorated-classes-only: an undecorated base's
+`pass@k` is usually computed by the subclass.
+
+`fewshot_split` / `fewshot_seed` / `fewshot_as_multiturn` name a different noun
+each and are unaffected. In prose, `k-shot` (the file-naming genre) and `top-k`
+(logprobs breadth) are unrelated to either knob.
+
 ### `ppl` vs `clp`
 
 - `ppl` — pick the answer whose full `context + candidate` has the highest
@@ -23,7 +51,10 @@ Class: `<Benchmark><ShotType><Mode>Task` — words for shot count (`ZeroShot`, `
 
 ## Key Rules
 
-- ≥ 5 task files per benchmark → subdirectory with an empty `__init__.py` (lazy loading is handled by the top-level `tasks/__init__.py`). Empty on purpose: nothing imports a task class by name — the registry resolves it through the top-level package — so the subpackage needs no type surface of its own, and leaving it empty keeps exactly one import path per task. Contrast `sieval/datasets/`, whose subpackages do re-export, because tasks import them directly.
+- ≥ 5 files per benchmark → subdirectory with an empty `__init__.py`. Two mechanisms make nesting work and both are load-bearing: lazy export by the top-level `tasks/__init__.py`, and name → class resolution by `get_task_class()` (`sieval/core/tasks/meta.py`), which scans subpackages once the flat path misses. With only the export half, a nested task imports fine but is unresolvable by name — a bare `KeyError` from `sieval task show`, no other symptom.
+- The `__init__.py` is empty on purpose: both mechanisms key on the *module* (importing it runs `@sieval_task`, which registers the class), never on a subpackage attribute, so it needs no type surface and there stays exactly one import path per task. Contrast `sieval/datasets/`, whose subpackages do re-export, because tasks import them directly.
+- **The count includes the extracted shared module**: 4 task modules plus a `_base.py` trips it. Deliberate — a benchmark only grows a shared module once its variants have logic worth reusing, so that module *is* the signal the group has become a unit, and it is what a flat layout has nowhere good to put. `arc/` (4 tasks + `_base.py`) is the reference layout.
+- Keep the full task name as the filename inside the subpackage (`arc/arc_easy_kshot_ppl.py`, not `arc/easy_kshot_ppl.py`), so a grep for a registered task name still finds its file.
 - Subpackage shared base module: file named `_base.py` (private module), classes inside without underscore prefix (package-internal public API, e.g. `from ._base import XxxTask`).
 - General code-quality + layer rules live in `.claude/rules/tasks.md`.
 

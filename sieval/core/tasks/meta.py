@@ -5,6 +5,11 @@ v0.1 schema contract — partial freeze. Fields and values listed as frozen are
 a consumer contract: renames, removals, or type changes require a
 `meta/index.json` schema_version bump.
 
+Run `meta.json` is a second consumer of that freeze: `get_task_run_identity`
+projects a subset of these fields into run directories, which are written once
+and never rewritten. A schema_version bump does nothing for runs already on
+disk — their only compatibility marker is the sieval `version` alongside.
+
 Frozen fields on TaskMeta:
     name, display_name, description, dataset (FK str), eval_mode, n_shot,
     deps_group, status.
@@ -31,6 +36,7 @@ from urllib.parse import urlparse
 
 from sieval.core.datasets.meta import extract_sample_type
 
+from .context import TaskRunIdentity
 from .task import Task
 
 
@@ -214,6 +220,10 @@ def sieval_task[T: type[Task]](
         )
         setattr(cls, _TASK_META_ATTR, meta)
         cls.tags = protocol_tags
+        # Seeds the declared count on the class. A task with a shot-count knob
+        # shadows it per instance in __init__; a knobless one is already right,
+        # which is why no task needs code to make `meta.json` correct.
+        cls.n_shot = n_shot
         if model_type is not None:
             cls.model_type = model_type
         TASK_REGISTRY[name] = meta
@@ -228,6 +238,58 @@ def get_task_meta(cls: type) -> TaskMeta:
     return getattr(cls, _TASK_META_ATTR)
 
 
+def get_task_run_identity(task: Task) -> TaskRunIdentity | None:
+    """Project the run-identity subset of *task*'s TaskMeta, for ``meta.json``.
+
+    Returns ``None`` when ``type(task)`` itself is undecorated — the fail-soft
+    path `write_run_meta` needs, since `Task` subclasses need no decorator.
+
+    Read off ``cls.__dict__``, not the MRO like :func:`get_task_meta`: an
+    undecorated subclass of a decorated task is a *different* task, and
+    inheriting `name` / `dataset` / `eval_mode` would label its results with
+    its parent's name. (`cls.tags` / `cls.model_type` do stay inherited —
+    behavioral defaults, not identity.)
+
+    A chosen subset, not `task_meta_to_dict`. Left out on purpose, so the gap
+    does not read as an oversight: `model_type` (scheduled for replacement by
+    a task-side capability requirement), `reference_impl` (`notes` is not
+    frozen within `schema_version=1` and changes often), `description` and
+    `deps_group` (properties of the task, not the run).
+
+    `tags` is the descriptive `TaskMeta.tags`, *not* the `cls.tags` protocol
+    set the decorator synthesizes for anomaly routing — and it is the one
+    persisted field whose *values* are not frozen within `schema_version=1`
+    (see the module docstring), so consumers should read it as advisory.
+
+    `n_shot` alone comes off the *object* rather than `meta`, via
+    :attr:`Task.n_shot`: it is the one field a run can change, and a run
+    directory is read to find out what the run did. Attribute lookup resolves
+    it — an instance whose `__init__` took a knob shadows the class value, a
+    knobless one falls through to what the decorator seeded, which equals
+    `meta.n_shot`. So this needs no fallback of its own.
+    """
+    if isinstance(task, type):
+        raise TypeError(
+            "get_task_run_identity takes a Task instance, not a class "
+            f"({task.__qualname__}): `n_shot` is read off the instance, and a "
+            "class would report the declared default as though a run had used "
+            "it."
+        )
+    cls = type(task)
+    meta: TaskMeta | None = cls.__dict__.get(_TASK_META_ATTR)
+    if meta is None:
+        return None
+    return {
+        "name": meta.name,
+        "display_name": meta.display_name,
+        "dataset": meta.dataset,
+        "eval_mode": meta.eval_mode.value,
+        "n_shot": task.n_shot,
+        "tags": list(meta.tags),
+        "status": meta.status,
+    }
+
+
 def iter_task_metas() -> Iterator[TaskMeta]:
     """Iterate over all registered TaskMeta in insertion order."""
     return iter(TASK_REGISTRY.values())
@@ -239,12 +301,36 @@ def iter_task_entries() -> Iterator[tuple[type[Task], TaskMeta]]:
         yield _TASK_CLASSES[name], meta
 
 
+def _try_import_task_module(module: str) -> bool:
+    """Import *module*; return False if that module simply does not exist.
+
+    Suppresses only the "no such task module" case. A nested
+    ``ModuleNotFoundError`` (the task module's own ``import`` statement failing)
+    means the user has a real missing dependency — surface it verbatim, or
+    they'll debug a ``KeyError``.
+    """
+    try:
+        importlib.import_module(module)
+    except ModuleNotFoundError as e:
+        if e.name != module:
+            raise
+        return False
+    return True
+
+
 def get_task_class(name: str) -> type[Task]:
     """Return the Task subclass registered under *name*.
 
-    Lazy-imports ``sieval.tasks.{name}`` on miss (decorator convention:
-    one task per eponymous module) to avoid the full ``import_all_tasks()``
-    cost. Raises ``KeyError`` if still unregistered after the import.
+    Lazy-imports the module defining *name* on miss, to avoid the full
+    ``import_all_tasks()`` cost. Raises ``KeyError`` if still unregistered after
+    the import.
+
+    Follows the decorator convention first — one task per eponymous module,
+    ``sieval.tasks.{name}`` — then scans subpackages for ``{subpkg}.{name}``,
+    because a benchmark that outgrew a flat layout keeps the eponymous filename
+    inside its subpackage (``sieval.tasks.arc.arc_easy_kshot_ppl``; see
+    ``sieval/tasks/CLAUDE.md``). The scan is one directory listing, paid only on
+    a miss; flat tasks still resolve in a single import.
 
     After ``load_index()`` the ``_TASK_CLASSES`` cache is empty (the index is
     rebuilt from JSON and doesn't execute decorators), so the first call per
@@ -252,17 +338,15 @@ def get_task_class(name: str) -> type[Task]:
     point lookups (``task show``); if a future caller does this per-row
     across the full registry, call ``import_all_tasks()`` once upfront.
     """
-    if name not in _TASK_CLASSES:
-        expected = f"{_TASKS_PACKAGE}.{name}"
-        try:
-            importlib.import_module(expected)
-        except ModuleNotFoundError as e:
-            # Suppress only the "no such task module" case. A nested
-            # ModuleNotFoundError (task module's own `import` statement
-            # failing) means the user has a real missing dependency —
-            # surface it verbatim, or they'll debug a KeyError.
-            if e.name != expected:
-                raise
+    if name not in _TASK_CLASSES and not _try_import_task_module(
+        f"{_TASKS_PACKAGE}.{name}"
+    ):
+        pkg = importlib.import_module(_TASKS_PACKAGE)
+        for info in pkgutil.iter_modules(pkg.__path__):
+            if info.ispkg and _try_import_task_module(
+                f"{_TASKS_PACKAGE}.{info.name}.{name}"
+            ):
+                break
     return _TASK_CLASSES[name]
 
 

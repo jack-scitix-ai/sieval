@@ -35,7 +35,7 @@ method this task reproduces. The reproduced method is the official CMMLU
 ``qwen2.py`` ``eval`` path above. Note the official CMMLU leaderboard's
 "Qwen2.5-72B" (85.67) is the *Instruct* model, not this base-model target.
 
-Few-shot selection takes the first ``k`` same-subject dev examples in order and,
+Few-shot selection takes the first ``n_shot`` same-subject dev examples in order and,
 unlike the official ``gen_prompt``, does not drop the longest shots to fit a
 token budget. For CMMLU this is a no-op divergence: the official cap is
 ``max_length=2048``, the dev pool is 5 examples/subject, and the longest full
@@ -261,7 +261,7 @@ CMMLU_CATEGORY_SUBJECTS = {
         notes=(
             "Mirrors the official qwen2.py base path (eval, not eval_instruct): "
             "non-CoT CMMLU prompt, same-subject dev shots, one-call next-token "
-            "A/B/C/D scoring, and subject-level macro report. Runtime k is "
+            "A/B/C/D scoring, and subject-level macro report. Runtime n_shot is "
             "configurable. Uses API top_logprobs as an OpenAI-compatible "
             "substitute for the official raw-logits choice argmax (equivalent "
             "while all four option tokens are in top-k). Scoring requires all "
@@ -296,16 +296,16 @@ class CMMLUFewShotClpTask(
         model: Model[Any],
         name: str | None = None,
         *,
-        k: int = DEFAULT_N_SHOT,
+        n_shot: int = DEFAULT_N_SHOT,
         logprobs: int = DEFAULT_LOGPROBS,
         fewshot_split: str = "dev",
     ):
-        if k < 0:
-            raise ValueError(f"k must be >= 0, got {k}")
+        if n_shot < 0:
+            raise ValueError(f"n_shot must be >= 0, got {n_shot}")
         if logprobs < 1:
             raise ValueError(f"logprobs must be >= 1, got {logprobs}")
         super().__init__(dataset=dataset, model=model, name=name)
-        self._k = k
+        self.n_shot = n_shot
         self._logprobs = max(logprobs, len(CHOICES))
         self._fewshot_split = fewshot_split
         self._few_shot_by_subject: dict[str, list[CMMLUDatasetSample]] = {}
@@ -313,10 +313,18 @@ class CMMLUFewShotClpTask(
 
     @override
     async def setup(self) -> None:
+        # Build every per-subject prefix up front, so a subject whose dev pool
+        # is too short for n_shot aborts before any inference spend rather than
+        # failing samples one at a time (matches C-Eval). No-op at n_shot == 0.
+        # Reaches only subjects the few-shot split contains: one present in
+        # `test` but absent from it has no prefix to build here, so that case
+        # still surfaces per sample, from _select_examples.
         self._ensure_few_shot_pool()
+        for subject in self._few_shot_by_subject:
+            self._build_few_shot_prompt(subject)
 
     def _ensure_few_shot_pool(self) -> None:
-        if self._few_shot_by_subject or self._k == 0:
+        if self._few_shot_by_subject or self.n_shot == 0:
             return
         split = self.dataset.dataset_dict.get(self._fewshot_split)
         if split is None:
@@ -329,10 +337,19 @@ class CMMLUFewShotClpTask(
             self._few_shot_by_subject.setdefault(subject, []).append(sample)
 
     def _select_examples(self, subject: str) -> list[CMMLUDatasetSample]:
-        if self._k == 0:
+        if self.n_shot == 0:
             return []
         self._ensure_few_shot_pool()
-        return list(self._few_shot_by_subject.get(subject, []))[: self._k]
+        examples = self._few_shot_by_subject.get(subject, [])
+        # Slicing a short pool would render fewer shots than meta.json reports,
+        # with nothing on disk saying so. Fail instead, as C-Eval and MMMLU
+        # already do for the same per-subject pool.
+        if len(examples) < self.n_shot:
+            raise ValueError(
+                f"CMMLU subject {subject!r} has {len(examples)} "
+                f"{self._fewshot_split!r} exemplars; need n_shot={self.n_shot}."
+            )
+        return list(examples)[: self.n_shot]
 
     def _format_example(
         self, sample: CMMLUDatasetSample, *, include_answer: bool = True

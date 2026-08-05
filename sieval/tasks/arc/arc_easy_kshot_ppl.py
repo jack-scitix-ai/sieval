@@ -1,12 +1,12 @@
 """
-ARC-Challenge few-shot base-model perplexity task (full text, unconditional norm).
+ARC-Easy few-shot base-model perplexity task (full text, unconditional norm).
 
-Scores ARC-Challenge in the SEPARATION regime (Qwen2.5-report style; the setup
+Scores ARC-Easy in the SEPARATION regime (Qwen2.5-report style; the setup
 DeepSeek used before switching to the options format after V1). Each answer
-OPTION is
-scored as a text continuation of ``"Question: {q}\nAnswer:"`` — no letters, no
-options listed in the prompt — and the prediction is the option with the
-highest UNCONDITIONALLY-NORMALIZED sequence log-likelihood (Brown et al. 2020):
+OPTION is scored as
+a text continuation of ``"Question: {q}\nAnswer:"`` — no letters, no options
+listed in the prompt — and the prediction is the option with the highest
+UNCONDITIONALLY-NORMALIZED sequence log-likelihood (Brown et al. 2020):
 
     score_i = logP(option_i | few_shot + question + "Answer:")
               - logP(option_i | "Answer:")
@@ -24,10 +24,12 @@ hit sglang drops logprobs for cached positions, and the model fails loud rather
 than score a truncated echoed sequence.
 
 Comparison target — the SEPARATION regime (arXiv 2412.17758), NOT the
-options/letter regime: Qwen2.5-72B-Base ARC-Challenge 25-shot ≈ 72.4 (Qwen2.5
-report). The 94.5 options/letter figure belongs to the ``clp`` sibling
-(``arc_challenge_kshot_clp``), not this task. Not yet validated against a run,
-so ``status="experimental"``.
+options/letter regime. No concrete ARC-Easy separation figure is cited as an
+anchor here: the Qwen2.5 report's headline ARC number is ARC-Challenge (≈ 72.4,
+see the ppl sibling), and neither it nor the DeepSeek reports give an ARC-Easy
+*separation* score to compare against. The 98.4 options/letter figure belongs to
+the ``clp`` sibling (``arc_easy_kshot_clp``), not this task. Not calibrated, so
+``status="experimental"``.
 
 AI-Generated Code - Claude Opus 4.8 (1M context) (Anthropic)
 """
@@ -44,9 +46,9 @@ from sieval.core.tasks import (
     Task,
     sieval_task,
 )
-from sieval.datasets import ARCChallengeDatasetSample
+from sieval.datasets import ARCEasyDatasetSample
 
-from ._arc import (
+from ._base import (
     ARC_UNCOND_CONTEXT,
     DEFAULT_FEWSHOT_SEED,
     arc_judgement_record,
@@ -63,9 +65,9 @@ N_SHOT = 25
 
 
 @sieval_task(
-    name="arc_challenge_kshot_ppl",
-    display_name="ARC-Challenge (few-shot, perplexity)",
-    description="ARC-Challenge few-shot full-text unconditional-normalized accuracy.",
+    name="arc_easy_kshot_ppl",
+    display_name="ARC-Easy (few-shot, perplexity)",
+    description="ARC-Easy few-shot full-text unconditional-normalized accuracy.",
     eval_mode=EvalMode.PPL,
     n_shot=N_SHOT,
     tags=("english", "science", "multiple-choice", "base-model"),
@@ -74,10 +76,10 @@ N_SHOT = 25
     reference_impl=ReferenceImpl(
         source="lm-evaluation-harness",
         url=(
-            "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/arc/arc_challenge.yaml"
+            "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/arc/arc_easy.yaml"
         ),
         notes=(
-            "Shares the ARC-Challenge split/dataset/revision with "
+            "Shares the ARC-Easy split/dataset/revision with "
             "lm-evaluation-harness, but scores in the SEPARATION regime "
             "(Qwen2.5-report style), not upstream acc/acc_norm: each option's "
             "full TEXT is scored as the "
@@ -88,15 +90,14 @@ N_SHOT = 25
             "single-letter clp method. Requires the sglang server launched "
             "with --disable-radix-cache (SglangGenModel fails loud on a cache "
             "hit that truncates echoed logprobs). Comparison target — the "
-            "SEPARATION regime (arXiv 2412.17758): Qwen2.5-72B-Base "
-            "ARC-Challenge 25-shot ≈ 72.4 (Qwen2.5 report). The 94.5 "
-            "options/letter figure is the clp sibling, not this task."
+            "SEPARATION regime (arXiv 2412.17758), Qwen2.5-report style. The "
+            "98.4 options/letter figure is the clp sibling, not this task."
         ),
     ),
 )
-class ARCChallengeFewShotPplTask(
+class ARCEasyFewShotPplTask(
     Task[
-        ARCChallengeDatasetSample,
+        ARCEasyDatasetSample,
         PromptRecord,
         list[ModelOutput],
         PredictionRecord,
@@ -110,21 +111,21 @@ class ARCChallengeFewShotPplTask(
         model,
         name: str | None = None,
         *,
-        k: int = N_SHOT,
+        n_shot: int = N_SHOT,
         fewshot_split: str = "train",
         fewshot_seed: int = DEFAULT_FEWSHOT_SEED,
     ):
-        if k < 0:
-            raise ValueError(f"k must be >= 0, got {k}")
+        if n_shot < 0:
+            raise ValueError(f"n_shot must be >= 0, got {n_shot}")
         super().__init__(dataset=dataset, model=model, name=name)
-        self._k = k
+        self.n_shot = n_shot
         self._fewshot_split = fewshot_split
         self._fewshot_seed = fewshot_seed
         self._fewshot_prefix: str | None = None
 
     @override
     async def setup(self) -> None:
-        # Built once here (setup runs before any preprocess) so the k-exemplar
+        # Built once here (setup runs before any preprocess) so the few-shot
         # prefix is not rejoined per sample.
         self._fewshot_prefix = self._build_fewshot_prefix()
 
@@ -184,6 +185,6 @@ class ARCChallengeFewShotPplTask(
 
     def _build_fewshot_prefix(self) -> str:
         examples = sample_arc_fewshot(
-            self.dataset, self._k, self._fewshot_split, self._fewshot_seed
+            self.dataset, self.n_shot, self._fewshot_split, self._fewshot_seed
         )
         return build_arc_ppl_fewshot_prefix(examples)

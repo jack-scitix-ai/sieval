@@ -28,11 +28,13 @@ from sieval.core.tasks.context import (
     TaskAction,
     TaskContext,
     TaskManifest,
+    TaskRunIdentity,
     TaskStage,
     TaskStageMeta,
     TaskStageOutput,
 )
 from sieval.core.tasks.loader import TaskLoader
+from sieval.core.tasks.meta import get_task_run_identity
 from sieval.core.tasks.profiler import TaskProfiler
 from sieval.core.tasks.progress import TaskProgress
 from sieval.core.tasks.records import iter_grader_outputs
@@ -48,7 +50,9 @@ from sieval.core.utils.meta import (
 
 from .resume_gate import (
     ResumeAction,
+    ResumeIdentityError,
     ResumeVersionError,
+    format_identity_reject_message,
     format_reject_message,
     resume_version_verdict,
 )
@@ -171,6 +175,52 @@ def gate_resume_version(root_dir: Path, current_version: str) -> None:
         )
 
 
+def gate_resume_identity(root_dir: Path, identity: TaskRunIdentity | None) -> None:
+    """Refuse to resume into a directory a *different* task produced.
+
+    A finished run directory is matched by path alone, and under
+    ``auto_resume`` a valid ``report.json`` short-circuits :meth:`arun` before
+    any stage runs — so a task pointed at another task's directory would hand
+    back that task's report as its own result, having evaluated nothing. The
+    version gate cannot catch it: the two runs are typically the same version.
+
+    Compares the registered ``name`` only — the key the rest of the block is
+    derived from. A wider comparison would refuse a task merely redefined
+    between runs, which is the version gate's business.
+
+    ``n_shot`` is excluded too, though it is the run's value rather than a
+    declaration and so escapes that argument: a same-task resume under a
+    different ``n_shot`` is a changed *invocation*, and the CLI's strict
+    ``--resume`` config match already refuses it by comparing the persisted
+    YAML body — ``tasks.*.args`` included — before a runner is built. What is
+    left for this gate is the one mismatch that match cannot see, because it
+    is not a config change at all: two different tasks aimed at one directory.
+
+    Passes when either side has no name to compare: an absent block means a
+    pre-feature run or an undecorated task, neither distinguishable from a
+    match, so this only bites once both sides carry one. Runs after
+    :func:`gate_resume_version`, which has already fail-closed on a missing or
+    unreadable ``meta.json``.
+    """
+    if identity is None:
+        return
+    try:
+        meta = orjson.loads((root_dir / "meta.json").read_bytes())
+    except (OSError, orjson.JSONDecodeError):
+        return
+    if not isinstance(meta, dict):
+        return
+    persisted = meta.get("task")
+    if not isinstance(persisted, dict):
+        return
+    persisted_name = persisted.get("name")
+    if not isinstance(persisted_name, str) or persisted_name == identity["name"]:
+        return
+    raise ResumeIdentityError(
+        format_identity_reject_message(persisted_name, identity["name"])
+    )
+
+
 class TaskRunner:
     """Core execution engine for a single evaluation task.
 
@@ -224,8 +274,12 @@ class TaskRunner:
         self._resumed_from_existing, self._root_dir = self._resolve_result_dir(
             self._config.result_dir, task, self._auto_resume
         )
+        # Read off the task, not looked up by name: `task.name` is a
+        # user-chosen YAML key, not the registered `@sieval_task(name=...)`.
+        self._task_identity = get_task_run_identity(task)
         if self._resumed_from_existing:
             gate_resume_version(self._root_dir, __version__)
+            gate_resume_identity(self._root_dir, self._task_identity)
             logger.info("Auto resumed from: {}", self._root_dir)
 
         # Profiling
@@ -271,6 +325,7 @@ class TaskRunner:
             record_meta=self._config.record_meta,
             profiler=self._profiler,
             deterministic=self._config.deterministic,
+            task_identity=self._task_identity,
         )
 
         # Progress Tracking (Initialized in arun)

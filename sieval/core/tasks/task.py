@@ -98,6 +98,22 @@ class Task[
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", task_name).strip("._-") or "task"
         return safe_name
 
+    n_shot: int = 0
+    """Few-shot exemplars this task renders — what ``meta.json`` records.
+
+    Seeded on the class by ``@sieval_task(n_shot=...)``, so a task with no
+    shot-count knob is already correct and needs no code of its own. A task
+    whose constructor takes one assigns ``self.n_shot`` in ``__init__``, which
+    shadows the class value for that instance: the catalog says what the task
+    advertises, a run directory says what the run did. ``"n_shot" in
+    task.__dict__`` distinguishes the two after the fact.
+
+    Deliberately a plain class attribute rather than a ``ClassVar`` like
+    :attr:`model_type` / :attr:`tags`: those are never set per instance, while
+    this is the one field a run can change — annotating it ``ClassVar`` would
+    make the shadowing assignment a type error.
+    """
+
     def make_context(
         self, sample_id: str | int, raw: TRawSample | None = None
     ) -> TaskContext[TRawSample, TPreprocessed, TInferred, TPostprocessed, TFeedback]:

@@ -23,6 +23,7 @@ from sieval.core.tasks.meta import (
     ReferenceImpl,
     TaskMeta,
     get_task_meta,
+    get_task_run_identity,
     iter_task_metas,
     sieval_task,
     task_meta_to_dict,
@@ -52,13 +53,31 @@ class _StubDataset:
 
 
 class _StubTask(Task[_StubSample, None, None, None, None, dict[str, float]]):
-    """Bare Task subclass used only as a @sieval_task decoration target.
+    """Bare Task subclass used as a @sieval_task decoration target.
 
-    Tests never instantiate these stubs, so the abstract methods are left
-    unimplemented; inheriting from Task satisfies the decorator's `type[Task]`
-    bound and supplies the `tags` / `model_type` ClassVar declarations ty needs
-    to resolve attribute accesses after decoration.
+    Inheriting from Task satisfies the decorator's `type[Task]` bound and
+    supplies the `tags` / `model_type` ClassVar declarations ty needs to
+    resolve attribute accesses after decoration. The stage methods are inert
+    stand-ins rather than left abstract: run identity is projected off an
+    *instance*, so `_identity_of` needs a class `object.__new__` will accept.
     """
+
+    async def preprocess(self, *args, **kwargs): ...
+    async def infer(self, *args, **kwargs): ...
+    async def postprocess(self, *args, **kwargs): ...
+    async def feedback(self, *args, **kwargs): ...
+    async def report(self, *args, **kwargs): ...
+
+
+def _identity_of(cls: type[Task]):
+    """Project run identity for a decoration-target stub.
+
+    `get_task_run_identity` takes an instance, because `n_shot` is read off
+    the task rather than the class. These stubs hold no `__init__` state it
+    touches, so `object.__new__` stands in for a constructed task and keeps a
+    pure projection test free of a dataset/model pair.
+    """
+    return get_task_run_identity(object.__new__(cls))
 
 
 @pytest.fixture(autouse=True)
@@ -192,14 +211,12 @@ def test_clean_registry_fixture_leaves_task_modules_reimportable():
     its keep in a full-suite or multi-file run, where an earlier file has already
     imported a task module.
 
-    Also pins the eponymous-module convention `get_task_class()` depends on
-    (`sieval/core/tasks/meta.py`): every registered name must be reachable as
-    `sieval.tasks.{name}`, or `sieval task list` cannot resolve its class. Note
-    this is deliberately stricter than the lazy export map, which also accepts
-    subpackage-hosted tasks as `"subpkg.module_stem"` (`sieval/tasks/__init__.py`
-    "Subpackage .py modules"). Such a task would import and export fine but be
-    unreachable through `get_task_class()`, so the flat layout is the binding
-    constraint until that lookup learns to walk subpackages.
+    Also pins the eponymous-*filename* convention `get_task_class()` depends on
+    (`sieval/core/tasks/meta.py`): every registered name must be the last segment
+    of some loaded `sieval.tasks.*` module, or that lookup cannot resolve its
+    class. Depth is deliberately unconstrained — flat and subpackage-hosted both
+    satisfy it. What stays banned is a task whose defining file is named
+    something other than the task, which no amount of walking can find.
     """
     import sys
 
@@ -215,11 +232,14 @@ def test_clean_registry_fixture_leaves_task_modules_reimportable():
     assert tasks, "shipped index is non-empty"
     missing = {t.name for t in tasks} - set(TASK_REGISTRY)
     assert not missing, f"indexed tasks left unregistered: {sorted(missing)}"
-    off_convention = [
-        name for name in TASK_REGISTRY if f"sieval.tasks.{name}" not in sys.modules
-    ]
+    loaded_stems = {
+        module.rpartition(".")[2]
+        for module in sys.modules
+        if module.startswith("sieval.tasks.")
+    }
+    off_convention = sorted(set(TASK_REGISTRY) - loaded_stems)
     assert not off_convention, (
-        f"tasks not defined in an eponymous module: {sorted(off_convention)}"
+        f"tasks not defined in an eponymous module: {off_convention}"
     )
 
 
@@ -282,6 +302,230 @@ def test_get_task_meta_raises_for_unregistered():
 
     with pytest.raises(AttributeError):
         get_task_meta(Plain)
+
+
+# ===================================================================
+# get_task_run_identity — the subset persisted into run meta.json
+# ===================================================================
+class TestGetTaskRunIdentity:
+    def test_projects_the_declared_subset(self):
+        @sieval_task(
+            name="ident",
+            display_name="Ident",
+            description="identity task",
+            eval_mode=EvalMode.CLP,
+            n_shot=5,
+            tags=("chinese", "multiple-choice"),
+            deps_group="extra",
+            model_type="gen",
+            reference_impl=ReferenceImpl(source="upstream", url="https://x.invalid"),
+            status="experimental",
+        )
+        class IdentTask(_StubTask):
+            pass
+
+        assert _identity_of(IdentTask) == {
+            "name": "ident",
+            "display_name": "Ident",
+            "dataset": "stub_dataset",
+            "eval_mode": "clp",
+            "n_shot": 5,
+            "tags": ["chinese", "multiple-choice"],
+            "status": "experimental",
+        }
+
+    def test_omits_fields_excluded_on_purpose(self):
+        """`description` / `deps_group` / `model_type` / `reference_impl` are
+        deliberately not persisted — assert their absence so a well-meaning
+        "complete the subset" change has to delete a test to land."""
+
+        @sieval_task(
+            name="excluded",
+            display_name="Excluded",
+            description="has every optional field set",
+            eval_mode=EvalMode.GEN,
+            deps_group="extra",
+            model_type="chat",
+            reference_impl=ReferenceImpl(source="upstream", url="https://x.invalid"),
+        )
+        class ExcludedTask(_StubTask):
+            pass
+
+        identity = _identity_of(ExcludedTask)
+        assert identity is not None
+        assert set(identity) == {
+            "name",
+            "display_name",
+            "dataset",
+            "eval_mode",
+            "n_shot",
+            "tags",
+            "status",
+        }
+
+    def test_is_json_shaped(self):
+        """`eval_mode` serializes as its enum *value* and `tags` as a list, so
+        the projection can go straight through `orjson.dumps`."""
+
+        @sieval_task(
+            name="jsonshape",
+            display_name="JSON",
+            description="x",
+            eval_mode=EvalMode.PPL,
+            tags=("english",),
+        )
+        class JsonTask(_StubTask):
+            pass
+
+        identity = _identity_of(JsonTask)
+        assert identity is not None
+        assert identity["eval_mode"] == "ppl"
+        assert type(identity["eval_mode"]) is str
+        assert identity["tags"] == ["english"]
+        assert json.loads(json.dumps(identity)) == identity
+
+    def test_descriptive_tags_not_the_synthesized_protocol_set(self):
+        """`tags` is the author-declared `TaskMeta.tags`, not the `cls.tags`
+        protocol set the decorator synthesizes from `eval_mode` + `n_shot`."""
+
+        @sieval_task(
+            name="tagsplit",
+            display_name="Tags",
+            description="x",
+            eval_mode=EvalMode.GEN,
+            n_shot=3,
+            tags=("english",),
+        )
+        class TagTask(_StubTask):
+            pass
+
+        identity = _identity_of(TagTask)
+        assert identity is not None
+        assert identity["tags"] == ["english"]
+        assert TagTask.tags == frozenset({"gen", "few_shot"})
+
+    def test_returns_none_for_undecorated_class(self):
+        """Fail-soft: `Task` subclasses are not required to be decorated, and
+        `write_run_meta` is documented as never raising."""
+
+        class Undecorated(_StubTask):
+            pass
+
+        assert _identity_of(Undecorated) is None
+
+    def test_does_not_inherit_identity_from_a_decorated_parent(self):
+        """An undecorated subclass is a *different* task. `get_task_meta` reads
+        through the MRO and so still resolves the parent's meta; run identity
+        deliberately does not, or the subclass's results would be persisted
+        under its parent's name."""
+
+        @sieval_task(
+            name="parent",
+            display_name="Parent",
+            description="x",
+            eval_mode=EvalMode.GEN,
+        )
+        class Parent(_StubTask):
+            pass
+
+        class Child(Parent):
+            pass
+
+        assert _identity_of(Parent) is not None
+        assert _identity_of(Child) is None
+        # The MRO-reading accessor is unchanged — this is a divergence, not a
+        # migration.
+        assert get_task_meta(Child).name == "parent"
+
+    def test_n_shot_is_the_run_not_the_declaration(self):
+        """A run directory answers "what did this run do", so the shot count
+        persisted there is the instance's, not the class's advertisement.
+
+        The override has to be per *instance*: the decorator assigns
+        `cls.n_shot` after the class body executes, so a class-level value
+        would simply be overwritten by the declared one.
+        """
+
+        @sieval_task(
+            name="knob",
+            display_name="Knob",
+            description="x",
+            eval_mode=EvalMode.CLP,
+            n_shot=5,
+        )
+        class KnobTask(_StubTask):
+            pass
+
+        # What a real task's `__init__` does with its shot-count knob.
+        task = object.__new__(KnobTask)
+        task.n_shot = 3
+
+        identity = get_task_run_identity(task)
+        assert identity is not None
+        assert identity["n_shot"] == 3
+        # Only the projection moves: the declaration and the catalog row it
+        # feeds still say 5.
+        assert get_task_meta(KnobTask).n_shot == 5
+        assert KnobTask.n_shot == 5
+
+    def test_class_level_n_shot_cannot_shadow_the_declaration(self):
+        """The decorator is the single declaration, so it wins over the body.
+
+        Guards the reading that a subclass could advertise one count while
+        `@sieval_task` declares another — it cannot, and a run that wants a
+        different count shadows per instance instead.
+        """
+
+        @sieval_task(
+            name="bodyshadow",
+            display_name="BodyShadow",
+            description="x",
+            eval_mode=EvalMode.CLP,
+            n_shot=5,
+        )
+        class BodyShadowTask(_StubTask):
+            n_shot = 3  # overwritten by the decorator
+
+        assert BodyShadowTask.n_shot == 5
+        identity = _identity_of(BodyShadowTask)
+        assert identity is not None
+        assert identity["n_shot"] == 5
+
+    def test_declared_n_shot_stands_without_a_knob(self):
+        """`@sieval_task` seeds `cls.n_shot`, so a task with no shot-count knob
+        keeps projecting what it declared, with no code of its own — the common
+        case."""
+
+        @sieval_task(
+            name="noknob",
+            display_name="NoKnob",
+            description="x",
+            eval_mode=EvalMode.CLP,
+            n_shot=4,
+        )
+        class NoKnobTask(_StubTask):
+            pass
+
+        identity = _identity_of(NoKnobTask)
+        assert identity is not None
+        assert identity["n_shot"] == 4
+
+    def test_rejects_a_class(self):
+        """Passing a class resolves to no metadata, which the fail-soft `None`
+        path would report as "undecorated" and silently drop the block. The
+        previous signature took a class, so this is a reachable mistake."""
+
+        @sieval_task(
+            name="classarg",
+            display_name="ClassArg",
+            description="x",
+            eval_mode=EvalMode.GEN,
+        )
+        class ClassArgTask(_StubTask):
+            pass
+
+        with pytest.raises(TypeError, match="instance, not a class"):
+            get_task_run_identity(ClassArgTask)  # ty: ignore[invalid-argument-type]
 
 
 def _valid_kwargs(**overrides):
@@ -725,8 +969,59 @@ def test_get_task_class_lazy_imports_unregistered_module(tmp_path):
         sieval.tasks.__dict__.pop(name, None)
 
 
+def test_get_task_class_lazy_imports_subpackage_hosted_module(tmp_path):
+    """A benchmark that outgrew a flat layout keeps the eponymous filename inside
+    its subpackage (`sieval/tasks/CLAUDE.md`, `arc/`), so the lookup must fall
+    back to scanning subpackages for `{subpkg}.{name}`. Without that fallback the
+    module exists and imports fine but `get_task_class()` raises KeyError, taking
+    `sieval task show` and by-name task resolution down with it.
+    """
+    import sys
+
+    import sieval.tasks
+    from sieval.core.tasks.meta import TASK_REGISTRY, get_task_class
+
+    subpkg, name = "pkg_for_test", "nested_task_for_test"
+    (tmp_path / subpkg).mkdir()
+    (tmp_path / subpkg / "__init__.py").write_text("")
+    (tmp_path / subpkg / f"{name}.py").write_text(
+        "from sieval.core.tasks.meta import EvalMode, sieval_task\n"
+        f"from {__name__} import _StubTask\n"
+        "\n"
+        "\n"
+        "@sieval_task(\n"
+        f'    name="{name}",\n'
+        '    display_name="Nested",\n'
+        '    description="subpackage-hosted lazy-import target",\n'
+        "    eval_mode=EvalMode.GEN,\n"
+        ")\n"
+        "class NestedForTestTask(_StubTask):\n"
+        "    pass\n"
+    )
+    sieval.tasks.__path__.insert(0, str(tmp_path))
+    try:
+        assert name not in TASK_REGISTRY  # only the import can register it
+        # The flat path must genuinely miss first, or this proves nothing.
+        assert not (tmp_path / f"{name}.py").exists()
+        cls = get_task_class(name)
+        assert cls.__name__ == "NestedForTestTask"
+        assert TASK_REGISTRY[name].display_name == "Nested"
+    finally:
+        sieval.tasks.__path__.remove(str(tmp_path))
+        sys.modules.pop(f"sieval.tasks.{subpkg}.{name}", None)
+        sys.modules.pop(f"sieval.tasks.{subpkg}", None)
+        # The successful import also bound the submodule on the package; drop it
+        # so nothing outside this test can reach a module whose file is gone.
+        sieval.tasks.__dict__.pop(subpkg, None)
+
+
 def test_get_task_class_raises_key_error_on_unknown_name():
-    """Unregistered names raise KeyError — a programmer-error signal."""
+    """Unregistered names raise KeyError — a programmer-error signal.
+
+    Also covers the exhausted-scan path: neither the flat module nor any
+    subpackage hosts the name, and the lookup still ends in KeyError rather than
+    leaking a ModuleNotFoundError from the last candidate it tried.
+    """
     import pytest
 
     from sieval.core.tasks.meta import get_task_class

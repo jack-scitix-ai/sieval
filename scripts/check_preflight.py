@@ -54,6 +54,12 @@ _TASK_FILE_PATTERN = re.compile(
 )
 _DATASET_SUFFIX_PATTERN = re.compile(r"(Dataset|DatasetSample|CSVSample)$")
 
+# A parameter name that is itself a word for "number of few-shot examples":
+# n_shot, n_shots, num_shots, nshot, fewshot, few_shot, shot_count, fewshot_k.
+# Deliberately anchored, so compounds naming a different noun — fewshot_split,
+# fewshot_seed, fewshot_as_multiturn — are not shot counts and do not match.
+_SHOT_COUNT_PARAM = re.compile(r"^(?:n_?|num_?)?(?:few_?)?shots?(?:_count|_k)?$")
+
 
 @dataclasses.dataclass
 class CheckResult:
@@ -111,6 +117,123 @@ def _dataset_integrity_violations(metas: "list[DatasetMeta]") -> list[str]:
     return violations
 
 
+def _is_sieval_task(cls: ast.ClassDef) -> bool:
+    """Whether *cls* carries the ``@sieval_task`` decorator."""
+    for deco in cls.decorator_list:
+        target = deco.func if isinstance(deco, ast.Call) else deco
+        if isinstance(target, ast.Name) and target.id == "sieval_task":
+            return True
+    return False
+
+
+def _classes_with_own_init(
+    tree: ast.Module,
+) -> list[tuple[ast.ClassDef, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """Every class in a task module declaring its own ``__init__``.
+
+    Deliberately *not* narrowed to ``@sieval_task``-decorated classes. A
+    decorated task may inherit its constructor from an undecorated base in the
+    same package (the ``arc/_base.py`` layout), and keying on the decorator
+    misses both ends of that: the subclass declares no ``__init__``, the base
+    carries no decorator. The knob-bearing constructor would then go unchecked
+    with only a silently lower count to show for it.
+    """
+    out: list[tuple[ast.ClassDef, ast.FunctionDef | ast.AsyncFunctionDef]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        init = _init_of(node)
+        if init is not None:
+            out.append((node, init))
+    return out
+
+
+def _init_of(cls: ast.ClassDef) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """Return the class's own ``__init__``, or None if it does not define one."""
+    for item in cls.body:
+        if (
+            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == "__init__"
+        ):
+            return item
+    return None
+
+
+def _param_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    """Every declared parameter name, in any position."""
+    args = fn.args
+    return [a.arg for a in args.posonlyargs + args.args + args.kwonlyargs]
+
+
+def _n_shot_sources(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[set[str]]:
+    """For each ``self.n_shot = <expr>``, the identifiers ``<expr>`` reads.
+
+    A bare ``n_shot`` contributes ``n_shot``, ``_normalize_n_shot(n_shot)``
+    contributes both — enough to tell which knob feeds the persisted count.
+    """
+    sources: list[set[str]] = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Assign):
+            continue
+        assigns_it = any(
+            isinstance(t, ast.Attribute)
+            and t.attr == "n_shot"
+            and isinstance(t.value, ast.Name)
+            and t.value.id == "self"
+            for t in node.targets
+        )
+        if not assigns_it:
+            continue
+        names = {n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)}
+        names |= {a.attr for a in ast.walk(node.value) if isinstance(a, ast.Attribute)}
+        sources.append(names)
+    return sources
+
+
+def _docstring_constant_ids(cls: ast.ClassDef) -> set[int]:
+    """``id()`` of every docstring Constant in *cls* (its own and its methods').
+
+    Prose is not evidence of behaviour. Without this, a class whose docstring
+    merely *mentions* ``pass@1`` satisfies :func:`_computes_pass_at_k`, so a
+    ``k`` parameter that is really a few-shot count passes rule 3 — the precise
+    regression rule 3 exists to catch. Metric *keys* (``f"pass@{k}"`` built in a
+    report dict) are real evidence and stay counted.
+    """
+    ids: set[int] = set()
+    for node in ast.walk(cls):
+        if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            ids.add(id(first.value))
+    return ids
+
+
+def _computes_pass_at_k(cls: ast.ClassDef) -> bool:
+    """Whether the class body computes a pass@k metric.
+
+    Docstrings do not count — see :func:`_docstring_constant_ids`.
+    """
+    docstrings = _docstring_constant_ids(cls)
+    for node in ast.walk(cls):
+        if isinstance(node, ast.Name) and node.id.endswith("pass_at_k"):
+            return True
+        if isinstance(node, ast.Attribute) and node.attr.endswith("pass_at_k"):
+            return True
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and "pass@" in node.value
+            and id(node) not in docstrings
+        ):
+            return True
+    return False
+
+
 class PreflightRunner:
     """Orchestrates preflight checks."""
 
@@ -119,6 +242,7 @@ class PreflightRunner:
         "check_deps",
         "check_dep_coverage",
         "check_tasks",
+        "check_task_shot_knobs",
         "check_datasets",
         "check_imports",
         "check_examples",
@@ -761,6 +885,116 @@ class PreflightRunner:
             )
 
         return results
+
+    def check_task_shot_knobs(self) -> list[CheckResult]:
+        """Verify the few-shot knob is spelled ``n_shot`` and reaches meta.json.
+
+        ``meta.json`` records the shot count a run used by reading
+        ``Task.n_shot``, which ``@sieval_task`` seeds on the class with the
+        declared value. A constructor that takes a shot-count argument and
+        stores it anywhere *but* ``self.n_shot`` therefore leaves the class
+        value standing, and nothing at runtime can tell — the run directory
+        reports a number the run never used. So the wiring is checked here.
+
+        Three rules, AST-only so a task whose optional deps are absent is still
+        covered:
+
+        1. a shot-count parameter is spelled ``n_shot``, nothing else;
+        2. a constructor accepting ``n_shot`` assigns ``self.n_shot``;
+        3. ``k`` is the ``k`` in ``pass@k`` in every task that takes one — the
+           metric's parameter, not the sampling budget (that is ``n``, and
+           ``k <= n``) — so a task accepting ``k`` must compute a pass@k
+           metric, and ``self.n_shot`` may never be fed from it. This is what
+           stops ``k`` from re-acquiring a second meaning.
+
+        Rules 1 and 2 bind *every* constructor under ``sieval/tasks/``, not only
+        the decorated classes — see :func:`_classes_with_own_init`. Rule 3 reads
+        the metric off the class body, so it can only be judged where that body
+        is the task's: an undecorated base's ``pass@k`` may well be computed by
+        the subclass, so applying it there would be a false positive.
+        """
+        # Recursive, matching check_tasks' naming sweep: a benchmark with >= 5
+        # task files lives in a subdirectory (sieval/tasks/CLAUDE.md). Subpackage
+        # __init__.py files are empty by convention, so skipping them by name
+        # costs no coverage.
+        py_files = [
+            f
+            for f in self._git_tracked_files(".py")
+            if str(f.relative_to(self.project_root)).startswith("sieval/tasks/")
+            and f.name != "__init__.py"
+        ]
+        if not py_files:
+            return [CheckResult("SKIP", "check_task_shot_knobs", "no task modules")]
+
+        violations: list[str] = []
+        checked = 0
+        for py_file in py_files:
+            rel = py_file.relative_to(self.project_root)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", SyntaxWarning)
+                    tree = ast.parse(
+                        py_file.read_text(encoding="utf-8"), filename=str(py_file)
+                    )
+            except (OSError, SyntaxError) as e:
+                violations.append(f"{rel}: could not parse ({e})")
+                continue
+
+            for cls, init in _classes_with_own_init(tree):
+                checked += 1
+                where = f"{rel}:{init.lineno} {cls.name}"
+                params = _param_names(init)
+
+                for p in params:
+                    if p != "n_shot" and _SHOT_COUNT_PARAM.match(p):
+                        violations.append(
+                            f"{where}: shot-count parameter is named {p!r}; "
+                            "the repo spells it 'n_shot'"
+                        )
+
+                sources = _n_shot_sources(init)
+                if "n_shot" in params and not sources:
+                    violations.append(
+                        f"{where}: takes 'n_shot' but never assigns "
+                        "self.n_shot, so the class value @sieval_task(n_shot=...) "
+                        "seeded would stand and meta.json would report the "
+                        "declared default rather than the count this run used"
+                    )
+                for names in sources:
+                    if names & {"k", "_k"}:
+                        violations.append(
+                            f"{where}: feeds self.n_shot from 'k', which "
+                            "is the k in pass@k, not a shot count"
+                        )
+
+                if (
+                    _is_sieval_task(cls)
+                    and "k" in params
+                    and not _computes_pass_at_k(cls)
+                ):
+                    violations.append(
+                        f"{where}: takes 'k' but computes no pass@k metric; "
+                        "'k' is reserved for the k in pass@k — spell a "
+                        "few-shot knob 'n_shot'"
+                    )
+
+        if violations:
+            return [
+                CheckResult(
+                    "FAIL",
+                    "check_task_shot_knobs",
+                    f"{len(violations)} shot-knob violation(s)",
+                    violations,
+                )
+            ]
+        return [
+            CheckResult(
+                "PASS",
+                "check_task_shot_knobs",
+                f"all {checked} task constructor(s) spell and wire the "
+                "shot knob correctly",
+            )
+        ]
 
     def check_datasets(self) -> list[CheckResult]:
         results: list[CheckResult] = []
