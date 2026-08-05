@@ -59,6 +59,20 @@ Do not put task-specific logic into `core/`.
 - **Imports:** relative within same package, absolute across packages
 - **AI-generated code:** include `AI-Generated Code - <model> (<provider>)` as the last line of the module-level docstring
 
+## Dependencies
+
+Re-lock with `pdm lock --update-reuse`, never bare `pdm lock` — a bare re-lock re-resolves the whole graph, so a one-package change arrives with dozens of unrelated bumps nobody asked for or reviewed.
+
+Preflight compares your lock against its baseline and fails on version changes no requirement change asked for:
+
+```bash
+python scripts/check_preflight.py --check check_deps
+```
+
+The question it asks of each moved package is whether a `--update-reuse` re-lock could have kept the old pin. If something that did not itself move now forbids the old version — a specifier you raised, or a new dependency's own requirement — the move was forced and passes. If the old pin would still have been valid, nothing asked for the move and it fails.
+
+So if a package genuinely needs a newer version, raise its specifier in `pyproject.toml` in the same commit: that both makes the bump reviewable and is what the check accepts. A changed `requires-python` is the exception — it re-resolves everything, so the check cannot attribute those moves and lists them as needing manual review rather than passing them silently.
+
 ## Testing
 
 ```bash
