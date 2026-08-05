@@ -6,6 +6,12 @@ from unittest.mock import Mock
 
 import pytest
 
+from sieval.core.tasks import (
+    build_judgement_record,
+    build_prediction_record,
+    build_rollout_judgement,
+)
+from sieval.core.utils.serialization import obj_to_dict
 from sieval.datasets.ruler._shared import (
     resolve_reserve_think_budget,
     thinking_prefill,
@@ -16,14 +22,28 @@ from sieval.tasks.ruler_0shot_gen import RulerZeroShotGenTask
 
 
 def _final(context_length, subtask, prediction, references):
-    """Build a minimal `finals` entry carrying only what report() reads."""
+    """Build a minimal `finals` entry carrying only what report() reads.
+
+    Post-migration that is two records: the prediction (which holds the model's
+    text) and the judgement (references + the grouping keys).
+
+    Both go through `obj_to_dict` because report() also runs on the resume path,
+    over records rehydrated from disk -- and serialization DROPS None-valued keys,
+    so the in-memory shape is strictly more forgiving than the on-disk one. Every
+    report test below therefore exercises the shape report() actually has to read.
+    """
     return SimpleNamespace(
-        feedback_result={
-            "prediction": prediction,
-            "references": references,
-            "subtask": subtask,
-            "context_length": context_length,
-        }
+        postprocess_result=obj_to_dict(
+            build_prediction_record([prediction]), add_type=False
+        ),
+        feedback_result=obj_to_dict(
+            build_judgement_record(
+                references,
+                [build_rollout_judgement(0, False)],
+                extra={"subtask": subtask, "context_length": context_length},
+            ),
+            add_type=False,
+        ),
     )
 
 
@@ -134,9 +154,19 @@ class TestMessageModes:
             },
         }
 
-        raw = {"input": "Context here.", "answer_prefix": "Answer: "}
+        raw = {
+            "input": "Context here.",
+            "answer_prefix": "Answer: ",
+            # preprocess now records the gold + grouping keys on the prompt
+            # record, so a minimal sample has to carry them.
+            "outputs": ["cat"],
+            "subtask": "niah_single_1",
+            "context_length": 4096,
+        }
 
-        messages = asyncio.run(RulerZeroShotGenTask.preprocess(task, raw, None))
+        messages = asyncio.run(RulerZeroShotGenTask.preprocess(task, raw, None))[
+            "prompt"
+        ]
 
         assert len(messages) == 1
         assert messages[0]["role"] == "user"
@@ -159,9 +189,19 @@ class TestMessageModes:
             },
         }
 
-        raw = {"input": "Context here.", "answer_prefix": "Answer: "}
+        raw = {
+            "input": "Context here.",
+            "answer_prefix": "Answer: ",
+            # preprocess now records the gold + grouping keys on the prompt
+            # record, so a minimal sample has to carry them.
+            "outputs": ["cat"],
+            "subtask": "niah_single_1",
+            "context_length": 4096,
+        }
 
-        messages = asyncio.run(RulerZeroShotGenTask.preprocess(task, raw, None))
+        messages = asyncio.run(RulerZeroShotGenTask.preprocess(task, raw, None))[
+            "prompt"
+        ]
 
         assert len(messages) == 2
         assert messages[0]["role"] == "user"
@@ -187,9 +227,19 @@ class TestMessageModes:
             },
         }
 
-        raw = {"input": "Context here.", "answer_prefix": "Answer: "}
+        raw = {
+            "input": "Context here.",
+            "answer_prefix": "Answer: ",
+            # preprocess now records the gold + grouping keys on the prompt
+            # record, so a minimal sample has to carry them.
+            "outputs": ["cat"],
+            "subtask": "niah_single_1",
+            "context_length": 4096,
+        }
 
-        messages = asyncio.run(RulerZeroShotGenTask.preprocess(task, raw, None))
+        messages = asyncio.run(RulerZeroShotGenTask.preprocess(task, raw, None))[
+            "prompt"
+        ]
 
         assert len(messages) == 2
         assert messages[1]["role"] == "assistant"
@@ -207,9 +257,17 @@ class TestMessageModes:
             "default_params": {},  # No extra_body
         }
 
-        raw = {"input": "Context.", "answer_prefix": "Q: "}
+        raw = {
+            "input": "Context.",
+            "answer_prefix": "Q: ",
+            "outputs": ["cat"],
+            "subtask": "niah_single_1",
+            "context_length": 4096,
+        }
 
-        messages = asyncio.run(RulerZeroShotGenTask.preprocess(task, raw, None))
+        messages = asyncio.run(RulerZeroShotGenTask.preprocess(task, raw, None))[
+            "prompt"
+        ]
 
         # Should default to user-message mode
         assert len(messages) == 1
@@ -393,6 +451,29 @@ class TestReport:
 
         assert result["score"] == 0.0
         assert result["fails"] == 0
+
+    def test_blank_prediction_survives_the_resume_report_path(self):
+        """A whitespace-only response leaves `prediction` ABSENT on disk.
+
+        postprocess normalizes a blank response to None so `extracted` stays a
+        real signal, and serialization omits None-valued keys — so on the
+        resume-report path the key is missing, not null. Indexing it instead of
+        `.get()`-ing it took the whole report down, after an already-paid-for
+        long-context run had completed.
+
+        One blank + one hit in the same cell → string_match_all mean 50.0, which
+        also pins the blank sample as a scored miss rather than a skipped sample.
+        """
+        finals = [
+            _final(4096, "niah_single_1", None, ["cat"]),
+            _final(4096, "niah_single_1", "cat", ["cat"]),
+        ]
+        assert "prediction" not in finals[0].postprocess_result["rollouts"][0]
+
+        result = asyncio.run(RulerZeroShotGenTask.report(Mock(), finals, []))
+
+        assert result["score"] == 50.0
+        assert result["score_niah_single_1_4k"] == 50.0
 
 
 class TestScenarios:

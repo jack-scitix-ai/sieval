@@ -14,6 +14,11 @@ from datasets import DatasetDict as HFDatasetDict
 
 from sieval.core.models import ModelOutput
 from sieval.core.models.gen_model import GenModel
+from sieval.core.tasks import (
+    build_judgement_record,
+    build_prediction_record,
+    build_rollout_judgement,
+)
 from sieval.core.tasks.context import TaskContext
 from tests.conftest import ModuleIsolation
 
@@ -129,10 +134,15 @@ def test_import_does_not_pull_latex2sympy():
 async def test_report_divides_metrics_by_completed_finals_only():
     raw = {"Question": "What is 2+2?", "Answer": "4", "Answer_type": "integer"}
     task = _task(k=0)
-    final_ctx = TaskContext(
-        sample_id=0,
-        raw_sample=raw,
-        feedback_result={"correct": True, "pred": "4", "answer": "4"},
+    judgement = build_judgement_record("4", [build_rollout_judgement(0, True)])
+    # report() reads `extracted` off the prediction record for its `empty` count,
+    # so the context has to carry both records, not just the judgement.
+    final_ctx = (
+        TaskContext(sample_id=0, raw_sample=raw)
+        .to_preprocessed({"prompt": "p"})
+        .to_inferred("i")
+        .to_postprocessed(build_prediction_record(["4"]))
+        .to_feedback(judgement)
     )
     failed_ctx = TaskContext(sample_id=1, raw_sample=raw)
 
@@ -151,7 +161,7 @@ async def test_infer_only_forwards_prompt_coupled_stop():
     task = task_module.TheoremQAKShotBaseGenTask(_dataset(), model, k=0)
 
     await task.infer(
-        "prompt",
+        {"prompt": "prompt"},
         TaskContext(sample_id=0, raw_sample={"Question": "What is 2+2?"}),
     )
 
@@ -170,7 +180,9 @@ async def test_preprocess_uses_configured_k(k, expected_examples):
     if expected_examples is None:
         expected_examples = len(examples)
 
-    prompt = await task.preprocess(raw, TaskContext(sample_id=0, raw_sample=raw))
+    prompt = (await task.preprocess(raw, TaskContext(sample_id=0, raw_sample=raw)))[
+        "prompt"
+    ]
 
     assert prompt.count("Problem:\n") == expected_examples + 1
     assert prompt.endswith("Problem:\nWhat is 2+2?\nSolution:\n")
@@ -186,7 +198,9 @@ async def test_preprocess_preserves_official_runtime_prompt_artifacts():
     raw = {"Question": "What is 2+2?", "Answer": "4", "Answer_type": "integer"}
     task = _task(k=3)
 
-    prompt = await task.preprocess(raw, TaskContext(sample_id=0, raw_sample=raw))
+    prompt = (await task.preprocess(raw, TaskContext(sample_id=0, raw_sample=raw)))[
+        "prompt"
+    ]
 
     assert "\u2248 833.33 frames" in prompt
     assert "Bytes/frame is approximately 833.33 frames" not in prompt
