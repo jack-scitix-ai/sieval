@@ -197,6 +197,164 @@ def _n_shot_sources(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[set[str]
     return sources
 
 
+#: Rollout keys whose absence is a *runtime* outcome, so `[]` on them is a
+#: latent KeyError no type checker reports. Only `prediction` qualifies today:
+#: extraction failure is not under the task author's control, and the record
+#: builder spells that failure as `None`, which never reaches disk.
+_GATED_ROLLOUT_KEYS = frozenset({"prediction"})
+
+#: Every *other* `NotRequired` key on a record TypedDict, with the reason it is
+#: different in kind from `prediction`. Listed rather than ignored so a key in
+#: neither set fails the check. Covers all five record classes, so a key added to
+#: `PromptRecord` / `JudgementRecord` forces the same decision.
+_UNGATED_RECORD_KEYS = frozenset(
+    {
+        # Absence is an authoring choice, not a runtime outcome: the task that
+        # reads `r["extra"]["grade"]` is the same task that wrote that extra,
+        # unconditionally. And every read is *nested*, so the mechanical `.get()`
+        # fix would turn a KeyError into `NoneType is not subscriptable` —
+        # strictly worse. Needs a per-site pass, not a sweep.
+        "extra",
+        # Same authoring-choice argument. "Absent is not zero" (RolloutJudgement),
+        # so a `.get()` returning None here would silently become a wrong metric
+        # rather than a loud failure.
+        "score",
+        "metrics",
+        # Absence is an authoring *property*: None iff the task's ground truth is
+        # a procedure (a test suite, a rubric), which is fixed per task. Shares
+        # `prediction`'s shape on JudgementRecord, but the one `[]` read (ruler's
+        # report) consumes it as an iterable, so `.get()` would swap KeyError for
+        # `list(None)` TypeError — `extra`'s trap again. What it needs is a
+        # durable signal of *which* absence this is: scitix/sieval#71.
+        "reference",
+    }
+)
+
+
+#: Builtins that pass a rollout list through to the loop, directly or inside a
+#: per-item tuple. Unwrapped so `for i, r in enumerate(post["rollouts"])` -- the
+#: natural way to write feedback needing the rollout index -- is not a blind spot.
+_ROLLOUT_ITER_WRAPPERS = frozenset({"enumerate", "zip", "reversed", "list", "sorted"})
+
+
+def _rollout_container(node: ast.expr) -> bool:
+    """True for an expression that yields a record's rollout list.
+
+    ``<record>["rollouts"]``, ``<maybe-record>.get("rollouts", ...)``, or either
+    of those behind a pass-through builtin (:data:`_ROLLOUT_ITER_WRAPPERS`) or a
+    walrus.
+    """
+    if isinstance(node, ast.NamedExpr):
+        return _rollout_container(node.value)
+    if isinstance(node, ast.Subscript):
+        key = node.slice
+        return isinstance(key, ast.Constant) and key.value == "rollouts"
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id in _ROLLOUT_ITER_WRAPPERS:
+            return any(_rollout_container(arg) for arg in node.args)
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and node.args
+        ):
+            first = node.args[0]
+            return isinstance(first, ast.Constant) and first.value == "rollouts"
+    return False
+
+
+def _iteration_target_names(target: ast.expr) -> set[str]:
+    """Names bound by a ``for``/comprehension target: ``r``, or ``i, r``.
+
+    A tuple target binds every ``Name`` element, not just the rollout one. That
+    over-approximates ``enumerate``/``zip``, but misfires only if something
+    subscripts a non-rollout element with a *gated* key -- and no gated key is
+    plausible on an index or a judgement.
+    """
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return {e.id for e in target.elts if isinstance(e, ast.Name)}
+    return set()
+
+
+def _rollout_bound_names(tree: ast.Module) -> set[str]:
+    """Names bound by iterating a rollout container (`for r in post["rollouts"]`).
+
+    This is what keeps the check structural rather than name-based. A task-local
+    dict that merely happens to carry a ``prediction`` key -- t_eval's
+    ``datum["prediction"]``, whose sibling is ``ground_truth`` -- is not a record
+    and must not be flagged.
+
+    Not followed, because each needs dataflow rather than a syntactic walk:
+    ``rs = post["rollouts"]``, ``r = post["rollouts"][0]``, and a helper taking a
+    ``RolloutPrediction`` parameter. Nor ``.pop(<gated key>)`` -- same KeyError,
+    but mutating a hydrated record is not a pattern here.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        pairs: list[tuple[ast.expr, ast.expr]] = []
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            pairs.append((node.target, node.iter))
+        elif isinstance(
+            node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+        ):
+            pairs.extend((gen.target, gen.iter) for gen in node.generators)
+        for target, iterable in pairs:
+            if _rollout_container(iterable):
+                names |= _iteration_target_names(target)
+    return names
+
+
+def _gated_rollout_subscripts(tree: ast.Module) -> list[tuple[int, str, str]]:
+    """Every ``<rollout>[<gated key>]`` in *tree*, as ``(lineno, key, source)``."""
+    bound = _rollout_bound_names(tree)
+    out: list[tuple[int, str, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Subscript):
+            continue
+        key = node.slice
+        if not (isinstance(key, ast.Constant) and key.value in _GATED_ROLLOUT_KEYS):
+            continue
+        base = node.value
+        is_rollout = (isinstance(base, ast.Name) and base.id in bound) or (
+            isinstance(base, ast.Subscript) and _rollout_container(base.value)
+        )
+        if is_rollout:
+            out.append((node.lineno, str(key.value), ast.unparse(node)))
+    return out
+
+
+#: The record TypedDicts whose ``NotRequired`` keys must all be classified. A key
+#: left out is a key nobody had to think about -- how `prediction` drifted.
+_RECORD_CLASSES = (
+    "PromptRecord",
+    "RolloutPrediction",
+    "PredictionRecord",
+    "RolloutJudgement",
+    "JudgementRecord",
+)
+
+
+def _not_required_record_keys(records_py: Path) -> set[str] | None:
+    """``NotRequired`` field names on the record TypedDicts, or None if unreadable."""
+    try:
+        tree = ast.parse(records_py.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return None
+    keys: set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name in _RECORD_CLASSES):
+            continue
+        for stmt in node.body:
+            if (
+                isinstance(stmt, ast.AnnAssign)
+                and isinstance(stmt.target, ast.Name)
+                and ast.unparse(stmt.annotation).startswith("NotRequired[")
+            ):
+                keys.add(stmt.target.id)
+    return keys
+
+
 def _docstring_constant_ids(cls: ast.ClassDef) -> set[int]:
     """``id()`` of every docstring Constant in *cls* (its own and its methods').
 
@@ -413,6 +571,7 @@ class PreflightRunner:
         "check_dep_coverage",
         "check_tasks",
         "check_task_shot_knobs",
+        "check_record_key_access",
         "check_datasets",
         "check_imports",
         "check_examples",
@@ -1267,6 +1426,123 @@ class PreflightRunner:
                 "check_task_shot_knobs",
                 f"all {checked} task constructor(s) spell and wire the "
                 "shot knob correctly",
+            )
+        ]
+
+    def check_record_key_access(self) -> list[CheckResult]:
+        """Forbid ``[]`` on a rollout key whose absence is a runtime outcome.
+
+        ``build_prediction_record`` spells "could not extract" as
+        ``prediction=None``, and ``obj_to_dict`` drops ``None``-valued keys, so
+        the key is *absent* on disk -- not null, gone. On resume the loader
+        hydrates ``postprocess_result`` from disk and hands it to ``feedback``,
+        where ``rollout["prediction"]`` raises ``KeyError`` for exactly the
+        samples whose extraction failed. The same line is fine on a fresh run,
+        which is why this survives every in-memory test.
+
+        Nothing else catches it. The contract is already stated three times over
+        -- ``RolloutPrediction.prediction`` is declared ``NotRequired``, its
+        docstring says "absent on disk in that case, so read ``extracted``
+        instead", and ``test_records.py::TestSerializationRoundTrip`` pins the
+        behaviour -- yet neither ``ty`` nor ``mypy --strict`` reports a ``[]``
+        subscript of a ``NotRequired`` key (both accept it by design; the typing
+        spec leaves that diagnostic optional). A correctly-declared,
+        correctly-documented, unit-tested contract with no enforcement at the
+        call site is how 39 modules drifted off it while CI stayed green.
+
+        Structural, not name-based: a key is only flagged when its base provably
+        comes from a record's ``rollouts`` -- indexed (``post["rollouts"][0]``) or
+        iterated (``for r in post["rollouts"]``, including through
+        ``enumerate``/``zip``). A task-local dict that merely carries a
+        ``prediction`` key is left alone; :func:`_rollout_bound_names` lists what
+        is deliberately not followed.
+
+        Flagging is rollout-scoped (:data:`_GATED_ROLLOUT_KEYS`); *classification*
+        covers every ``NotRequired`` key on every record TypedDict
+        (:data:`_RECORD_CLASSES`), and a key in neither set fails the check, so
+        adding one to ``records.py`` forces the decision. The scopes differ on
+        purpose: gating a key not read off a rollout (``reference``) would be inert
+        and would read as coverage the check does not have.
+        """
+        records_py = self.project_root / "sieval" / "core" / "tasks" / "records.py"
+        declared = _not_required_record_keys(records_py)
+        if declared is None:
+            # FAIL, not SKIP: records.py is this check's subject, not an optional
+            # input. Renaming it would otherwise narrow the gate to nothing with
+            # preflight still green.
+            return [
+                CheckResult(
+                    "FAIL",
+                    "check_record_key_access",
+                    f"{records_py.relative_to(self.project_root)} not readable",
+                    [
+                        "the record TypedDicts are this check's subject — if they "
+                        "moved, point check_record_key_access at the new path "
+                        "rather than leaving the gate unenforced"
+                    ],
+                )
+            ]
+
+        unclassified = sorted(declared - _GATED_ROLLOUT_KEYS - _UNGATED_RECORD_KEYS)
+        if unclassified:
+            return [
+                CheckResult(
+                    "FAIL",
+                    "check_record_key_access",
+                    f"{len(unclassified)} unclassified NotRequired record key(s)",
+                    [
+                        f"records.py declares {k!r} NotRequired on a record but "
+                        "check_preflight lists it in neither _GATED_ROLLOUT_KEYS "
+                        "nor _UNGATED_RECORD_KEYS — decide whether `[]` on it is "
+                        "a latent KeyError and say so in one of the two"
+                        for k in unclassified
+                    ],
+                )
+            ]
+
+        py_files = [
+            f
+            for f in self._git_tracked_files(".py")
+            if str(f.relative_to(self.project_root)).startswith("sieval/")
+        ]
+        if not py_files:
+            return [CheckResult("SKIP", "check_record_key_access", "no sieval modules")]
+
+        violations: list[str] = []
+        for py_file in py_files:
+            rel = py_file.relative_to(self.project_root)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", SyntaxWarning)
+                    tree = ast.parse(
+                        py_file.read_text(encoding="utf-8"), filename=str(py_file)
+                    )
+            except (OSError, SyntaxError) as e:
+                violations.append(f"{rel}: could not parse ({e})")
+                continue
+            for lineno, key, source in _gated_rollout_subscripts(tree):
+                violations.append(
+                    f"{rel}:{lineno}: {source} — {key!r} is NotRequired and "
+                    f"absent on disk when it was None, so this raises KeyError "
+                    f"on resume; use .get({key!r}) (same value, and the resumed "
+                    "path then matches the fresh one)"
+                )
+
+        if violations:
+            return [
+                CheckResult(
+                    "FAIL",
+                    "check_record_key_access",
+                    f"{len(violations)} unsafe rollout-key access(es)",
+                    violations,
+                )
+            ]
+        return [
+            CheckResult(
+                "PASS",
+                "check_record_key_access",
+                f"no unsafe `[]` access to {sorted(_GATED_ROLLOUT_KEYS)} "
+                f"across {len(py_files)} module(s)",
             )
         ]
 
