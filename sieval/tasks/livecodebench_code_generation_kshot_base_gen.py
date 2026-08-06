@@ -34,10 +34,10 @@ Deviations from the upstream LCB runner (complete list):
      approximate rather than exactly reproduce the reference.
   3. Eval sandbox: code is executed by an external service at
      `$SIEVAL_CODE_EVAL_API` (POST code + test cases), not upstream's in-process
-     `check_correctness`. The execution budget is client-owned — sent in the
-     request body, scaled by case count (`timeout + len(inputs) * 2.0`) since the
-     service runs all cases under one sequential budget — approximating upstream's
-     per-case 6s.
+     `check_correctness`. The execution budget is client-owned, sent in the request
+     body, but enforced per test case as upstream does (`timeout_per_case`, default
+     6s) rather than as one wall for the whole suite. Runs from before that rule
+     landed used the whole-suite wall and are NOT comparable.
 
 AI-Generated Code - Claude Opus 4.8 (Anthropic)
 """
@@ -101,7 +101,10 @@ STOP_SEQUENCES = ("###",)
             "'LiveCodeBench-Base (Pass@1), 3-shot' and upstream's runner default. "
             "Upstream ships only 2 few-shot examples per pool, so the 3rd example "
             "is sieval-authored. Recommended problem window 2024-08-01..2024-11-01 "
-            "is configured via dataset YAML args (version_tag/start_date/end_date)."
+            "is configured via dataset YAML args (version_tag/start_date/end_date). "
+            "Grading budget matches upstream: each test case gets its own 6s, "
+            "tunable via `timeout_per_case`. Runs recorded before that rule landed "
+            "used one whole-suite wall instead and are NOT comparable."
         ),
     ),
 )
@@ -126,8 +129,15 @@ class LiveCodeBenchCodeGenerationFewShotBaseGenTask(
         n: int = 1,
         stop: tuple[str, ...] = STOP_SEQUENCES,
         max_concurrency: int = 4,
-        timeout: float = 6.0,
+        timeout_per_case: float = 6.0,
     ):
+        """*timeout_per_case* is the budget **each test case** gets -- upstream's rule
+        and its ``6.0`` default (``codegen_metrics(..., timeout=6)``, deviation 3
+        above). The whole-suite wall is derived from it and not configurable.
+
+        It replaces an earlier ``timeout``, the base of a whole-suite wall and a
+        different rule; passing that now raises ``TypeError``.
+        """
         if n_shot < 0:
             raise ValueError(f"n_shot must be >= 0, got {n_shot}")
         super().__init__(dataset=dataset, model=model, name=name)
@@ -135,7 +145,7 @@ class LiveCodeBenchCodeGenerationFewShotBaseGenTask(
         self._k = k
         self._n = n
         self._stop = stop
-        self._timeout = timeout
+        self._timeout_per_case = timeout_per_case
         # Fixed few-shot prefixes, keyed by whether the target has starter code
         # (func vs stdin pool). Computed once in setup(); never per sample.
         self._fewshot_prefix: dict[bool, str] = {}
@@ -207,6 +217,13 @@ class LiveCodeBenchCodeGenerationFewShotBaseGenTask(
         outputs = [t["output"] for t in cases]
         fn_name = metadata.get("func_name", None)
 
+        # Cases are budgeted individually, so this wall is only a backstop, for a
+        # worker wedged where a per-case signal cannot reach it. Upstream's own shape:
+        # `check_correctness` joins its worker at `(timeout + 1) * n + 5`. Sent rather
+        # than left to the evaluator's identical derivation, so the HTTP deadline below
+        # is provably outside it. Mirrored in the sibling 0-shot task.
+        suite_timeout = (self._timeout_per_case + 1.0) * len(inputs) + 5.0
+
         for rollout in post["rollouts"]:
             idx = rollout["index"]
             try:
@@ -224,13 +241,11 @@ class LiveCodeBenchCodeGenerationFewShotBaseGenTask(
                             "outputs": outputs,
                             "fn_name": fn_name,
                         },
-                        # All N cases share one sequential budget, so scale by N.
-                        # Approximates official per-case 6s within a single run.
-                        "timeout": self._timeout + len(inputs) * 2.0,
+                        "timeout": suite_timeout,
+                        "timeout_per_case": self._timeout_per_case,
                     },
-                    # allow more time for more test cases
-                    # with extra buffer for network latency
-                    timeout=self._timeout + len(inputs) * 2 + 2,
+                    # allow more time than the suite wall, for network latency
+                    timeout=suite_timeout + 2,
                 )
                 resp.raise_for_status()
                 res = resp.json()

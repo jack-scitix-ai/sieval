@@ -1,8 +1,10 @@
 import ast
 import asyncio
+import contextlib
 import json
 import multiprocessing
 import os
+import signal
 import sys
 from decimal import Decimal
 from io import StringIO
@@ -27,6 +29,41 @@ _FLOAT_TOL = (
     if os.environ.get("CODE_EVAL_FLOAT_TOL")
     else None
 )
+
+
+class CaseTimeout(BaseException):
+    """Raised in the worker when one test case exceeds its own time budget.
+
+    Derived from ``BaseException``, not ``Exception``, so that neither the submitted
+    code nor this module's own ``except Exception`` handlers swallow it and report a
+    timeout as an ordinary wrong answer. (A submission with a bare ``except:`` can
+    still catch it -- upstream LiveCodeBench has the same hole -- but the whole-suite
+    wall in :func:`execute_test` remains as the backstop.)
+    """
+
+
+@contextlib.contextmanager
+def _case_time_limit(seconds: float | None):
+    """Arm a wall-clock alarm for a single test case; no-op when *seconds* is None.
+
+    ``setitimer`` rather than ``alarm`` because a per-case budget is naturally
+    fractional. Main thread of the worker process only, which is where
+    :func:`_unsafe_execute` runs.
+    """
+    if not seconds or seconds <= 0:
+        yield
+        return
+
+    def _fire(signum, frame):
+        raise CaseTimeout
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def _decimals_match(out_decimals: list, exp_decimals: list) -> bool:
@@ -72,19 +109,29 @@ async def execute_test(
     fn_name: str | None = None,
     timeout: float = 3.0,
     memory_limit: int | None = None,
+    timeout_per_case: float | None = None,
 ) -> tuple[bool, str, ResourceStats, int | None]:
     """Run the submitted code against the test cases in a spawned subprocess.
 
-    The fourth element is how many test cases passed, or ``None`` when the count
-    is genuinely unknown -- the subprocess was killed on timeout, or died without
-    putting a result on the queue, so no count was ever produced. ``None`` is
-    "unknown", never "zero".
+    ``timeout`` is a wall for the whole suite. ``timeout_per_case``, when given, also
+    budgets each case individually, which is how official LiveCodeBench grades
+    (``lcb_runner/evaluation/testing_util.py`` re-arms ``signal.alarm(timeout)`` on
+    every iteration of the case loop in ``grade_call_based`` / ``grade_stdio``, with
+    ``timeout=6`` defaulted by ``codegen_metrics``). Matching only the *total* is not
+    the same rule: a suite of 43 cases where one takes 200 s and the rest take 1 s
+    fits inside a 258 s whole-suite wall and fails a 6 s-per-case one.
+
+    The fourth element is how many test cases passed, or ``None`` when the count is
+    genuinely unknown -- the subprocess was killed on the whole-suite wall, or died
+    without putting a result on the queue. ``None`` is "unknown", never "zero". A
+    *per-case* timeout does not lose the count: the worker returns normally with the
+    cases it had already passed.
     """
     ctx = multiprocessing.get_context("spawn")
     q = ctx.SimpleQueue()
     p = ctx.Process(
         target=_subprocess_target,
-        args=(q, code, inputs, expect_outputs, fn_name, memory_limit),
+        args=(q, code, inputs, expect_outputs, fn_name, memory_limit, timeout_per_case),
     )
     p.start()
 
@@ -129,13 +176,19 @@ def _subprocess_target(
     expect_outputs: list[str],
     fn_name: str | None,
     memory_limit: int | None,
+    timeout_per_case: float | None = None,
 ):
     try:
         ok, msg, n_passed = _unsafe_execute(
-            code, inputs, expect_outputs, fn_name, memory_limit
+            code, inputs, expect_outputs, fn_name, memory_limit, timeout_per_case
         )
         q.put((ok, msg, n_passed))
-    except Exception as e:
+    # `CaseTimeout` is named because it is a BaseException, so `Exception` alone
+    # misses it. `_unsafe_execute` catches it per case, but cancelling the timer
+    # cannot un-deliver a signal the kernel already sent: an alarm firing just as a
+    # case ends is raised at the next bytecode check, which can land past that
+    # `except`. Uncaught, the queue stays empty and the parent waits out the wall.
+    except (Exception, CaseTimeout) as e:
         q.put((False, f"failed: [{type(e).__name__}] {e}", 0))
 
 
@@ -145,6 +198,7 @@ def _unsafe_execute(
     expect_outputs: list[str],
     fn_name: str | None,
     memory_limit: int | None,
+    timeout_per_case: float | None = None,
 ) -> tuple[bool, str, int]:
     """Run the submitted code against every test case, stopping at the first failure.
 
@@ -153,6 +207,11 @@ def _unsafe_execute(
     real count without the cost of running the remaining cases. Anything that
     fails before the loop (arity mismatch, compile error, missing function)
     passed zero cases.
+
+    When *timeout_per_case* is set, each case additionally gets its own wall-clock
+    budget and a case that exceeds it fails like any other -- with the count intact,
+    unlike the whole-suite wall, which kills the worker and loses it. Compilation is
+    budgeted on the same clock, which is where upstream also arms it.
     """
     if len(inputs) != len(expect_outputs):
         return False, "failed: number of inputs and outputs mismatch", 0
@@ -162,30 +221,39 @@ def _unsafe_execute(
     limit_bytes = int(memory_limit * 1024 * 1024) if memory_limit else None
     reliability_guard(maximum_memory_bytes=limit_bytes)
 
-    if fn_name is not None:
-        code_to_compile = import_string + "\n\n" + code
-        compiled_sol = compile_code(code_to_compile)
-        if compiled_sol is None:
-            return False, "failed: compile error", 0
-        fn = get_function(compiled_sol, fn_name)
-        if fn is None:
-            return False, "failed: no function defined", 0
-    else:
-        code_to_compile = clean_if_name(code)
-        code_to_compile = make_function(code_to_compile)
-        compiled_sol = compile_code(code_to_compile)
-        if compiled_sol is None:
-            return False, "failed: compile error", 0
-        fn = get_function(compiled_sol, "wrapped_function")
-        if fn is None:
-            return False, "failed: no function defined", 0
+    # Compilation runs on the per-case clock, as upstream does -- see `compile_code`.
+    # A timeout here passed zero cases, which is what the count already reports.
+    try:
+        if fn_name is not None:
+            code_to_compile = import_string + "\n\n" + code
+            compiled_sol = compile_code(code_to_compile, timeout_per_case)
+            if compiled_sol is None:
+                return False, "failed: compile error", 0
+            fn = get_function(compiled_sol, fn_name)
+            if fn is None:
+                return False, "failed: no function defined", 0
+        else:
+            code_to_compile = clean_if_name(code)
+            code_to_compile = make_function(code_to_compile)
+            compiled_sol = compile_code(code_to_compile, timeout_per_case)
+            if compiled_sol is None:
+                return False, "failed: compile error", 0
+            fn = get_function(compiled_sol, "wrapped_function")
+            if fn is None:
+                return False, "failed: no function defined", 0
+    except CaseTimeout:
+        return False, f"failed: compile timeout: {timeout_per_case}s", 0
 
     n_passed = 0
     for single_input, single_output in zip(inputs, expect_outputs):
-        if fn_name is not None:
-            ok, msg = _unsafe_execute_fn_call(fn, single_input, single_output)
-        else:
-            ok, msg = _unsafe_execute_stdio(fn, single_input, single_output)
+        try:
+            with _case_time_limit(timeout_per_case):
+                if fn_name is not None:
+                    ok, msg = _unsafe_execute_fn_call(fn, single_input, single_output)
+                else:
+                    ok, msg = _unsafe_execute_stdio(fn, single_input, single_output)
+        except CaseTimeout:
+            return False, f"failed: case timeout: {timeout_per_case}s", n_passed
         if not ok:
             return False, f"failed: {msg}", n_passed
         n_passed += 1
@@ -383,8 +451,13 @@ def get_function(compiled_sol, fn_name: str):
         return
 
 
-def compile_code(code: str):
-    try:
+def compile_code(code: str, timeout_per_case: float | None = None):
+    # Upstream budgets this `exec` on the per-case clock too, arming
+    # `signal.alarm(timeout)` on entry and cancelling it in a `finally`. It matters on
+    # the call-based path, where `exec` runs the submission's module-level statements
+    # and a hang there is inside no case. The vendored copy had kept that `finally`
+    # with a bare `pass` once the alarm was dropped; the guard restores both halves.
+    with _case_time_limit(timeout_per_case):
         tmp_sol = ModuleType("tmp_sol", "")
         exec(code, tmp_sol.__dict__)
         if "class Solution" in code:
@@ -398,8 +471,6 @@ def compile_code(code: str):
             compiled_sol = tmp_sol
 
         assert compiled_sol is not None
-    finally:
-        pass
 
     return compiled_sol
 
