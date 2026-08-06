@@ -380,8 +380,85 @@ class TestDatasetOperations:
             "test_ds",
         )
         ds.stratified_sample.assert_called_once_with(
-            "Subject", num=800, per_group=None, min_per_group=5, seed=42, split="test"
+            "Subject",
+            num=800,
+            per_group=None,
+            fraction=None,
+            min_per_group=5,
+            seed=42,
+            split="test",
         )
+
+    def test_stratified_sample_fraction_dispatch(self):
+        # MMMLU's efficient-eval setting: a share of every (Locale, Subject) cell.
+        runner = self._make_runner()
+        ds = MagicMock()
+        ds.stratified_sample.return_value = ds
+        runner._apply_dataset_operations(
+            ds,
+            [
+                {
+                    "stratified_sample": {
+                        "by": ["Locale", "Subject"],
+                        "fraction": 0.1,
+                        "seed": 0,
+                    }
+                }
+            ],
+            "test_ds",
+        )
+        ds.stratified_sample.assert_called_once_with(
+            ["Locale", "Subject"],
+            num=None,
+            per_group=None,
+            fraction=0.1,
+            min_per_group=None,
+            seed=0,
+            split="test",
+        )
+
+    def test_stratified_sample_fraction_accepts_min_per_group(self):
+        runner = self._make_runner()
+        ds = MagicMock()
+        ds.stratified_sample.return_value = ds
+        runner._apply_dataset_operations(
+            ds,
+            [
+                {
+                    "stratified_sample": {
+                        "by": "Subject",
+                        "fraction": 0.05,
+                        "min_per_group": 3,
+                    }
+                }
+            ],
+            "test_ds",
+        )
+        ds.stratified_sample.assert_called_once_with(
+            "Subject",
+            num=None,
+            per_group=None,
+            fraction=0.05,
+            min_per_group=3,
+            seed=0,
+            split="test",
+        )
+
+    @pytest.mark.parametrize("bad", [True, False, "0.1", 0, 1.5, -0.5])
+    def test_stratified_sample_rejects_a_bad_fraction_naming_the_dataset(self, bad):
+        # Guarded at this layer too so the message names the offending dataset,
+        # like the 'by' and budget-count guards. `True` is the trap: an `int`
+        # subclass that passes a bare range test and keeps every row.
+        runner = self._make_runner()
+        ds = MagicMock()
+        ds.stratified_sample.return_value = ds
+        with pytest.raises(ValueError, match=r"test_ds.*'fraction' must be a number"):
+            runner._apply_dataset_operations(
+                ds,
+                [{"stratified_sample": {"by": "Subject", "fraction": bad}}],
+                "test_ds",
+            )
+        ds.stratified_sample.assert_not_called()
 
     def test_stratified_sample_defaults(self):
         runner = self._make_runner()
@@ -394,6 +471,7 @@ class TestDatasetOperations:
             "category",
             num=600,
             per_group=None,
+            fraction=None,
             min_per_group=None,
             seed=0,
             split="test",
@@ -409,18 +487,21 @@ class TestDatasetOperations:
         with pytest.raises(ValueError, match="requires 'by'"):
             runner._apply_dataset_operations(ds, [{"stratified_sample": {}}], "test_ds")
 
-    def test_stratified_sample_requires_exactly_one_budget(self):
+    @pytest.mark.parametrize(
+        "budgets",
+        [
+            {},
+            {"num": 5, "per_group": 2},
+            {"num": 5, "fraction": 0.5},
+            {"per_group": 2, "fraction": 0.5},
+        ],
+    )
+    def test_stratified_sample_requires_exactly_one_budget(self, budgets):
         runner = self._make_runner()
         ds = MagicMock()
-        with pytest.raises(ValueError, match="exactly one of 'num' or 'per_group'"):
+        with pytest.raises(ValueError, match="exactly one of 'num', 'per_group'"):
             runner._apply_dataset_operations(
-                ds, [{"stratified_sample": {"by": "Subject"}}], "test_ds"
-            )
-        with pytest.raises(ValueError, match="exactly one of 'num' or 'per_group'"):
-            runner._apply_dataset_operations(
-                ds,
-                [{"stratified_sample": {"by": "Subject", "num": 5, "per_group": 2}}],
-                "test_ds",
+                ds, [{"stratified_sample": {"by": "Subject", **budgets}}], "test_ds"
             )
 
     def test_stratified_sample_min_per_group_excludes_per_group(self):
@@ -462,6 +543,7 @@ class TestDatasetOperations:
             ["locale", "subject"],
             num=None,
             per_group=20,
+            fraction=None,
             min_per_group=None,
             seed=42,
             split="test",
