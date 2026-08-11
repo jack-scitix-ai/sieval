@@ -304,16 +304,15 @@ def infer_start(
 
     prelaunch_plan: dict[str, Any] | None = None
     if yaml_mode:
-        from sieval.cli.leaderboard.session import EvalSession, unwrap_proxies
+        from sieval.cli.validation import prepare_prelaunch_reconciliation
 
-        session = EvalSession(
+        reconciled = prepare_prelaunch_reconciliation(
             target_path,
             deterministic_override=deterministic,
-            infer_plans={model_name: unwrap_proxies(plan)},
+            infer_plans={model_name: plan},
             invocation=shlex.join(sys.argv),
             self_managed_endpoints=frozenset({model_name}),
         )
-        reconciled = session.prepare_prelaunch()
         prelaunch_plan = reconciled.to_json_value()
         root_key = f"model:{model_name}"
         deployment_plan = reconciled.deployment_plans.get(root_key)

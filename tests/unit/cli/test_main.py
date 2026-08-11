@@ -223,9 +223,6 @@ class TestInfer:
             ),
         )
         mock_resolve = AsyncMock(return_value=("qwen3-8b", plan, {}))
-        session = MagicMock()
-        session.prepare_prelaunch.side_effect = ValueError("binding is invalid")
-        session_cls = MagicMock(return_value=session)
 
         with (
             patch(
@@ -233,9 +230,9 @@ class TestInfer:
                 mock_resolve,
             ),
             patch(
-                "sieval.cli.leaderboard.session.EvalSession",
-                session_cls,
-            ),
+                "sieval.cli.validation.prepare_prelaunch_reconciliation",
+                side_effect=ValueError("binding is invalid"),
+            ) as prepare_prelaunch,
             patch("sieval.cli.infer.commands.claim_handle") as claim_handle,
             patch(
                 "sieval.cli.infer.commands.launch_model",
@@ -243,12 +240,22 @@ class TestInfer:
             ) as launch_model,
             patch("sieval.cli.infer.commands.get_translator") as get_translator,
         ):
-            result = runner.invoke(app, ["infer", "start", str(config_path)])
+            result = runner.invoke(
+                app,
+                ["infer", "start", str(config_path), "--output", "json"],
+            )
 
-        assert result.exit_code != 0
-        assert isinstance(result.exception, ValueError)
-        assert str(result.exception) == "binding is invalid"
-        session.prepare_prelaunch.assert_called_once_with()
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        import json
+
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is False
+        assert payload["error"] == "binding is invalid"
+        prepare_prelaunch.assert_called_once()
+        call = prepare_prelaunch.call_args
+        assert call.args == (config_path,)
+        assert call.kwargs["infer_plans"] == {"qwen3-8b": plan}
         claim_handle.assert_not_called()
         launch_model.assert_not_awaited()
         get_translator.assert_not_called()

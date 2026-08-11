@@ -220,10 +220,11 @@ async def _run_all(
         # plan must reconcile as one batch before the first subprocess starts.
         # The final EvalSession intentionally repeats this pure check so its
         # execution setup never trusts orchestration-only state.
-        from sieval.cli.leaderboard.session import EvalSession, arun_session
+        from sieval.cli.leaderboard.session import arun_session
+        from sieval.cli.validation import prepare_prelaunch_reconciliation
 
-        prelaunch_session = EvalSession(
-            config_path=config_path,
+        prelaunch_result = prepare_prelaunch_reconciliation(
+            config_path,
             model_override=model,
             resume=resume,
             result_dir_override=result_dir,
@@ -232,7 +233,6 @@ async def _run_all(
             invocation=invocation,
             self_managed_endpoints=frozenset(prepared_launches),
         )
-        prelaunch_result = prelaunch_session.prepare_prelaunch()
         launch_patches = {
             root_key: dict(deployment_plan.launch_patch)
             for root_key, deployment_plan in prelaunch_result.deployment_plans.items()

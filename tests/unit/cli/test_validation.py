@@ -5,7 +5,7 @@ AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
@@ -1213,6 +1213,65 @@ class TestRunDryRunCli:
 # ---------------------------------------------------------------------------
 # run_dry_run() unit tests
 # ---------------------------------------------------------------------------
+
+
+class TestPreparePrelaunchReconciliation:
+    def test_normalizes_typed_plans_and_delegates(self, tmp_path: Path):
+        from sieval.cli.validation import prepare_prelaunch_reconciliation
+        from sieval.infer.topology.models import (
+            DeploymentPlan,
+            DeviceGroup,
+            ParallelTopology,
+            RoleAssignment,
+            WellKnownRole,
+        )
+
+        plan = DeploymentPlan(
+            checkpoint="/models/example",
+            backend="vllm",
+            assignments=(
+                RoleAssignment(
+                    role=WellKnownRole.FULL,
+                    devices=DeviceGroup(count=1),
+                    topology=ParallelTopology(),
+                    engine_params={"max_model_len": 4096},
+                ),
+            ),
+        )
+        expected = object()
+        session = MagicMock()
+        session.prepare_prelaunch.return_value = expected
+
+        with patch(
+            "sieval.cli.leaderboard.session.EvalSession",
+            return_value=session,
+        ) as session_type:
+            result = prepare_prelaunch_reconciliation(
+                tmp_path / "config.yaml",
+                infer_plans={"model": plan},
+                self_managed_endpoints=frozenset({"model"}),
+            )
+
+        assert result is expected
+        session.prepare_prelaunch.assert_called_once_with()
+        normalized = session_type.call_args.kwargs["infer_plans"]["model"]
+        assert normalized["assignments"][0]["engine_params"] == {"max_model_len": 4096}
+        assert isinstance(normalized["assignments"], list)
+
+    def test_propagates_prepare_error(self, tmp_path: Path):
+        from sieval.cli.validation import prepare_prelaunch_reconciliation
+
+        session = MagicMock()
+        session.prepare_prelaunch.side_effect = ValueError("binding is invalid")
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.EvalSession",
+                return_value=session,
+            ),
+            pytest.raises(ValueError, match="binding is invalid"),
+        ):
+            prepare_prelaunch_reconciliation(tmp_path / "config.yaml")
 
 
 class TestRunDryRun:

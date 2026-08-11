@@ -224,11 +224,9 @@ class TestPrelaunchSequencing:
                 health_url="http://localhost:8000/health",
             )
         ]
-        prelaunch_session = MagicMock()
-        prelaunch_session.prepare_prelaunch.side_effect = ValueError(
-            "binding capability mismatch"
+        prepare_prelaunch = MagicMock(
+            side_effect=ValueError("binding capability mismatch")
         )
-        session_type = MagicMock(return_value=prelaunch_session)
         launch = AsyncMock()
         cleanup = AsyncMock()
 
@@ -240,7 +238,10 @@ class TestPrelaunchSequencing:
             patch("sieval.cli.run.get_translator", return_value=translator),
             patch("sieval.cli.run.launch_model", new=launch),
             patch("sieval.cli.run.cleanup_model", new=cleanup),
-            patch("sieval.cli.leaderboard.session.EvalSession", new=session_type),
+            patch(
+                "sieval.cli.validation.prepare_prelaunch_reconciliation",
+                new=prepare_prelaunch,
+            ),
             pytest.raises(ValueError, match="binding capability mismatch"),
         ):
             await _run_all(config_path)
@@ -249,8 +250,8 @@ class TestPrelaunchSequencing:
         assert translator.translate.call_count == 2
         launch.assert_not_awaited()
         cleanup.assert_not_awaited()
-        prelaunch_session.prepare_prelaunch.assert_called_once_with()
-        assert set(session_type.call_args.kwargs["infer_plans"]) == {
+        prepare_prelaunch.assert_called_once()
+        assert set(prepare_prelaunch.call_args.kwargs["infer_plans"]) == {
             "model_a",
             "model_b",
         }
@@ -280,8 +281,6 @@ class TestPrelaunchSequencing:
         deployment_plan.launch_patch = {"disable_prefix_cache": True}
         prelaunch_result = MagicMock()
         prelaunch_result.deployment_plans = {"model:model_a": deployment_plan}
-        prelaunch_session = MagicMock()
-        prelaunch_session.prepare_prelaunch.return_value = prelaunch_result
         launch = AsyncMock()
 
         with (
@@ -293,8 +292,8 @@ class TestPrelaunchSequencing:
             patch("sieval.cli.run.launch_model", new=launch),
             patch("sieval.cli.run.cleanup_model", new=AsyncMock()),
             patch(
-                "sieval.cli.leaderboard.session.EvalSession",
-                return_value=prelaunch_session,
+                "sieval.cli.validation.prepare_prelaunch_reconciliation",
+                return_value=prelaunch_result,
             ),
             pytest.raises(RuntimeError, match="#47 launch-patch translator"),
         ):

@@ -33,6 +33,7 @@ from sieval.core.models.dialect_registry import (
     capability_decisions_for,
     get_dialect_spec,
 )
+from sieval.core.models.reconcile import ReconcileResult
 from sieval.core.runners import TaskRunnerConfig
 from sieval.core.tasks.consts import TaskAction
 
@@ -619,6 +620,56 @@ class DryRunResult(TypedDict):
     n_warnings: int
 
 
+def prepare_prelaunch_reconciliation(
+    config: str | Path,
+    *,
+    model_override: str | None = None,
+    resume: bool = False,
+    result_dir_override: str | None = None,
+    deterministic_override: bool | None = None,
+    infer_plans: Mapping[str, object] | None = None,
+    invocation: str | None = None,
+    self_managed_endpoints: frozenset[str] = frozenset(),
+) -> ReconcileResult:
+    """Run the shared pure prelaunch reconciliation and fail loud on errors.
+
+    This root-level CLI seam keeps the ``infer`` subpackage independent of the
+    sibling ``leaderboard`` implementation.  It also owns conversion of typed
+    infer-layer plans into the plain mapping shape consumed and persisted by
+    :class:`EvalSession`.
+
+    Exceptions deliberately propagate.  Only presentation boundaries such as
+    :func:`run_dry_run` may turn them into structured diagnostics.
+    """
+
+    # Keep the composition-root import local.  ``sieval.cli`` initializes the
+    # infer commands before the leaderboard package, and an eager import here
+    # would make that package initialization order load-bearing.
+    from sieval.cli.leaderboard.session import EvalSession, unwrap_proxies
+
+    normalized_plans: dict[str, dict[str, Any]] | None = None
+    if infer_plans is not None:
+        normalized_plans = {}
+        for model_name, plan in infer_plans.items():
+            normalized = unwrap_proxies(plan)
+            if not isinstance(normalized, dict):
+                raise TypeError(
+                    f"infer plan for {model_name!r} must normalize to a mapping"
+                )
+            normalized_plans[model_name] = normalized
+
+    return EvalSession(
+        config,
+        model_override=model_override,
+        resume=resume,
+        result_dir_override=result_dir_override,
+        deterministic_override=deterministic_override,
+        infer_plans=normalized_plans,
+        invocation=invocation,
+        self_managed_endpoints=self_managed_endpoints,
+    ).prepare_prelaunch()
+
+
 def _capability_reconcile_check(
     config: Path,
     *,
@@ -632,12 +683,8 @@ def _capability_reconcile_check(
 ) -> DryRunCheck:
     """Run the same pure prelaunch reconcile used by normal execution."""
 
-    # Keep the composition-root import local: validation is imported by both
-    # eval/run entrypoints, while session imports CLI-adjacent definitions.
-    from sieval.cli.leaderboard.session import EvalSession
-
     try:
-        result = EvalSession(
+        result = prepare_prelaunch_reconciliation(
             config,
             model_override=model_override,
             resume=resume,
@@ -646,7 +693,7 @@ def _capability_reconcile_check(
             infer_plans=infer_plans,
             invocation=invocation,
             self_managed_endpoints=self_managed_endpoints,
-        ).prepare_prelaunch()
+        )
     except Exception as exc:
         return {
             "name": "capability_reconcile",
