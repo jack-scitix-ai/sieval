@@ -16,7 +16,7 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.models.gen_model import GenModel
 from sieval.core.tasks import build_judgement_record, build_rollout_judgement
@@ -32,32 +32,27 @@ from sieval.tasks.livecodebench_code_generation_kshot_base_gen import (
     LiveCodeBenchCodeGenerationFewShotBaseGenTask,
 )
 from sieval.tasks.mbpp_kshot_base_gen import MBPPFewShotBaseGenTask
+from tests.conftest import HandlerTransport
 
 
 class _StubChatModel(ChatModel):
     def __init__(self):
         super().__init__(model="mock-chat", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=["pass"])
-
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(_stub_arun, "openai_chat")
 
 
 class _StubGenModel(GenModel):
     def __init__(self):
         super().__init__(model="mock-gen", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=["pass"])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(_stub_arun, "openai_completions")
 
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+
+async def _stub_arun(req: Request) -> Response:
+    return Response(texts=("pass",) * req.sampling.n)
 
 
 def _human_eval() -> HumanEvalDataset:

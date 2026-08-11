@@ -10,7 +10,7 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelMeta, ModelOutput
+from sieval.core.models import ModelMeta, ModelOutput, Request, Response
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import (
     TaskAction,
@@ -22,6 +22,7 @@ from sieval.core.tasks import (
 )
 from sieval.datasets.ugmathbench import UGMathBenchDataset
 from sieval.tasks.ugmathbench_0shot_gen_fixed import UGMathBenchZeroShotGenFixedTask
+from tests.conftest import HandlerTransport
 
 
 def _sample(
@@ -391,12 +392,12 @@ class _CapturingChatModel(ChatModel):
         super().__init__(model="mock-chat", api_key="fake")
         self.last_kwargs: dict[str, object] = {}
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = {**self._kwargs, **kwargs}
-        requested = self.last_kwargs.get("n", 1)
-        n = requested if isinstance(requested, int) and requested > 0 else 1
-        return _inferred(*[r"\boxed{4}"] * n)
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
+
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_kwargs = {**self._kwargs, "n": req.sampling.n}
+        return Response(texts=(r"\boxed{4}",) * req.sampling.n)
 
 
 @pytest.mark.anyio

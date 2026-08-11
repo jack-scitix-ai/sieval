@@ -18,10 +18,11 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.models.gen_model import GenModel
 from sieval.core.tasks import TaskContext
+from tests.conftest import HandlerTransport
 
 DRAW = 4
 
@@ -34,29 +35,35 @@ class _StubMixin:
     """
 
     _texts: list[str]
+    _dialect_id: str
     last_kwargs: dict
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        n = int(kwargs.get("n", len(self._texts)))
-        return ModelOutput(model=self.meta(), texts=self._texts[:n])  # type: ignore[attr-defined]
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, self._dialect_id)
 
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])  # type: ignore[attr-defined]
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_kwargs = {"n": req.sampling.n}
+        return Response(
+            texts=tuple(
+                self._texts[index % len(self._texts)] for index in range(req.sampling.n)
+            )
+        )
 
 
 class _StubChatModel(_StubMixin, ChatModel):
+    _dialect_id = "openai_chat"
+
     def __init__(self, texts):
-        ChatModel.__init__(self, model="mock-chat", api_key="fake")
+        ChatModel.__init__(self, model="mock-chat", api_key="fake", n=len(texts))
         self.last_kwargs = {}
         self._texts = list(texts)
 
 
 class _StubGenModel(_StubMixin, GenModel):
+    _dialect_id = "openai_completions"
+
     def __init__(self, texts):
-        GenModel.__init__(self, model="mock-gen", api_key="fake")
+        GenModel.__init__(self, model="mock-gen", api_key="fake", n=len(texts))
         self.last_kwargs = {}
         self._texts = list(texts)
 
