@@ -7,6 +7,10 @@ and with varying payload sizes.
 AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
+import gc
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import orjson
 import pytest
 
@@ -18,6 +22,30 @@ from tests.conftest import (
     _make_bench_ctx,
     samples_per_second,
 )
+
+
+@contextmanager
+def _gc_paused() -> Iterator[None]:
+    """Take Python's cyclic collector out of a timed *ratio*.
+
+    A gen2 collection costs in proportion to the whole live heap, which by the time
+    a suite run reaches here is thousands of other tests' fixtures. Only the
+    numerator pays it -- this loop retains every result, while ``orjson.dumps``
+    returns an untracked ``bytes`` -- so the same code has measured 12x and 184x
+    against a 50x bar, deciding only whether one gen2 fell inside the window.
+
+    Only the ratio needs this; the absolute bounds elsewhere have the headroom to
+    absorb a collection. Reference counting is untouched, and the collector is put
+    back as found, so a suite measured under ``gc.disable()`` stays that way.
+    """
+    was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 class TestSerializeThroughput:
@@ -64,20 +92,27 @@ class TestSerializeThroughput:
         n = 1000
         contexts = [_make_bench_ctx(i, TaskStage.FINAL) for i in range(n)]
 
-        # Measure serialize (Python side)
         dicts: list[dict] = []
         timer_ser = PerfTimer()
-        with timer_ser:
-            for ctx in contexts:
-                dicts.append(ctx.serialize(store_type_metadata=True, include_meta=True))
-
-        # Measure orjson.dumps (C side)
         timer_json = PerfTimer()
-        with timer_json:
-            for d in dicts:
-                orjson.dumps(d, option=orjson.OPT_SERIALIZE_NUMPY)
+        # Both halves under one pause: re-enabling for the C half would land the
+        # deferred collections in the denominator and mask a real regression.
+        with _gc_paused():
+            with timer_ser:
+                for ctx in contexts:
+                    dicts.append(
+                        ctx.serialize(store_type_metadata=True, include_meta=True)
+                    )
 
-        ratio = timer_ser.elapsed / timer_json.elapsed if timer_json.elapsed > 0 else 0
+            with timer_json:
+                for d in dicts:
+                    orjson.dumps(d, option=orjson.OPT_SERIALIZE_NUMPY)
+
+        # Scoring a zero denominator 0 would sail past the bar below.
+        assert timer_json.elapsed > 0, (
+            "orjson.dumps measured 0s: the clock is too coarse to form a ratio"
+        )
+        ratio = timer_ser.elapsed / timer_json.elapsed
         print(
             f"PERF: serialize={timer_ser.elapsed:.4f}s, "
             f"orjson.dumps={timer_json.elapsed:.4f}s, "
