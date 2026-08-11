@@ -403,6 +403,29 @@
       "checksums": {}
     },
     {
+      "name": "gsm_plus",
+      "display_name": "GSM-Plus",
+      "description": "GSM-Plus - GSM8K test problems rewritten under 8 adversarial math perturbations.",
+      "source": [
+        "hf:qintongli/GSM-Plus@3b708db57b96a16e8e3368ed2956990c0809440e"
+      ],
+      "categories": [
+        {
+          "level1": "Mathematics",
+          "level2": "ElementaryMath"
+        }
+      ],
+      "tags": [
+        "english",
+        "math-word-problems",
+        "open-ended",
+        "robustness"
+      ],
+      "deps_group": null,
+      "license": "CC-BY-SA-4.0",
+      "checksums": {}
+    },
+    {
       "name": "hellaswag",
       "display_name": "HellaSwag",
       "description": "Commonsense sentence completion — pick the most plausible ending.",
@@ -1483,6 +1506,29 @@
         "source": "lm-evaluation-harness",
         "url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/1dd931087362abba74e0375c8c631295559f48b2/lm_eval/tasks/gsm8k/gsm8k.yaml",
         "notes": "Uses lm-eval-harness strict-match extraction, aligned with the original GSM8K dataset.py #### answer delimiter. Also reports lm-eval-harness flexible-extract as a secondary metric, not as the original GSM8K official metric. Default n_shot=8 follows the DeepSeek-V3 Table 3 comparison target (Qwen2.5-72B-Base GSM8K 8-shot EM = 88.3); DeepSeek-V3 does not specify strict vs flexible extraction."
+      },
+      "status": "stable",
+      "reference_kind": "value"
+    },
+    {
+      "name": "gsm_plus_0shot_gen",
+      "display_name": "GSM-Plus (0-shot, generative)",
+      "description": "GSM-Plus 0-shot CoT eval, scored overall and per perturbation type.",
+      "dataset": "gsm_plus",
+      "eval_mode": "gen",
+      "n_shot": 0,
+      "tags": [
+        "english",
+        "math-word-problems",
+        "open-ended",
+        "robustness"
+      ],
+      "deps_group": "math",
+      "model_type": "chat",
+      "reference_impl": {
+        "source": "qtli/GSM-Plus",
+        "url": "https://github.com/qtli/GSM-Plus/tree/3474129ec12fcd3e8ac08cb037aca1928efca98c/scripts",
+        "notes": "Zero-shot CoT protocol (--prompt_type cot): system turn = the \"#### [value]\" instruction, user turn = \"Question:\\n{question}\\nAnswer:\\nLet's think step by step.\"; chat template applied by the serving backend. Gold from `solution` via extract_gold_ans; extraction dispatches on perturbation_type (extract_pred_ans_none for `critical thinking`, whose gold is the string \"None\"); normalize_final_answer + check_sympy_equivalence scoring, all vendored in sieval.community.gsm_plus. LICENSE: that file is CC-BY-SA-4.0, not the repo's Apache-2.0 -- upstream's code repo states none at the pinned commit, so the dataset's own CC-BY-SA-4.0 is applied to the scoring code accompanying it; share-alike attaches to that one file, not the rest of the tree (see its header). Grading is offloaded to a worker process under GRADE_TIMEOUT, as for every sympy-backed grader here. FIDELITY: replaying both published 0-shot rows reproduces upstream's gold and pred 10552/10552 each, and its verdict on 10527/10552 (99.76%, 61.19 -> 61.43 overall) for gpt-3.5-turbo and 10537/10552 (99.86%, 85.58 -> 85.72) for gpt4 (v0 labels mapped). All 40 diffs are genuinely-equal fraction/decimal pairs upstream scored wrong because it pins sympy without the ANTLR runtime parse_latex needs, so its bare `except:` fell back to string equality; the integer-decimal-fraction cell moves most (62.32 -> 63.84). MAGNITUDES ARE NOT COMPARABLE across models: only 2 of upstream's 28 published rows came from this 0-shot chat path, the other 26 being n-shot raw completions via general_model_inference.py. The transferable anchor is the shape -- critical thinking is the lowest cell in 26 of 26 published rows, reproduced by two live runs (gemma-3-27b-it full 10552: 84.11 overall / 63.08 that cell; gpt-oss-120b testmini: 80.83 / 47.67; Spearman rho +0.976 vs the GPT-4 row for both). Live scoring differential vs upstream's unmodified extract_ans.py: 13752/13752 on gold, pred and verdict. NOTE the critical-thinking cell is format-gated -- extract_pred_ans_none scores any response with no '####' marker as correct, so an empty response scores correct there; 80.9% of that cell was refusal-earned on the gemma run but only 1.4% on gpt-oss-120b, so read it with n_unextracted. Single-rollout only (upstream's cot_sc majority-votes 5 samples at temperature 0.7). Upstream decoding: temperature 0, top_p 1, max_tokens 512, no stop -- valid for a NON-REASONING model only, since a reasoning model spends 512 on hidden reasoning and returns empty content, which the gate scores correct on critical thinking and wrong elsewhere (paired control, only max_tokens differing: that cell 92.00 at 512 vs 64.00 at 4096, rank 8/8 -> 1/8, all seven numeric cells rising)."
       },
       "status": "stable",
       "reference_kind": "value"
