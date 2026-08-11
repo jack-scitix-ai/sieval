@@ -287,8 +287,7 @@ All async tests use `@pytest.mark.anyio`. Do **not** use `@pytest.mark.asyncio`.
 
 ```python
 @pytest.mark.anyio
-async def test_my_async_test(self, tmp_path):
-    ...
+async def test_my_async_test(self, tmp_path): ...
 ```
 
 ---

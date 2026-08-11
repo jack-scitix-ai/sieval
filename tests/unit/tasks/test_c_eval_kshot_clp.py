@@ -7,9 +7,15 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput, Request, Response, TopKEntry
+from sieval.core.models import (
+    CompletionInput,
+    ModelOutput,
+    Request,
+    Response,
+    TokenLogprob,
+    TopKEntry,
+)
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     JudgementRecord,
     TaskContext,
@@ -32,18 +38,18 @@ class _ScriptedGenModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
-        if not (req.return_logprobs or req.score_input):  # pragma: no cover
+        wants_logprobs = req.scoring.sampled_logprobs or req.scoring.input_scoring
+        if not wants_logprobs:  # pragma: no cover
             raise AssertionError("clp task must not call agenerate")
-        assert isinstance(req.input, str)
+        assert isinstance(req.input, CompletionInput)
         self.calls += 1
-        self.prompts.append(req.input)
+        self.prompts.append(req.input.text)
         return Response(
             texts=("",),
+            logprobs=(TokenLogprob(token="", logprob=-0.1),),
             top_logprobs=(
                 tuple(
                     TopKEntry(token=t, logprob=lp)

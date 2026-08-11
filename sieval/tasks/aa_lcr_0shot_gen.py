@@ -65,12 +65,16 @@ from sieval.core.models import ChatModel, Model, ModelOutput
 from sieval.core.tasks import (
     GRADER_OUTPUT_KEY,
     EvalMode,
+    InputKind,
     JudgementRecord,
     PredictionRecord,
     PromptRecord,
     ReferenceImpl,
+    RequirementContext,
     RolloutJudgement,
     Task,
+    TaskModelRequirement,
+    TaskRequirements,
     build_judgement_record,
     build_prediction_record,
     build_prompt_record,
@@ -147,6 +151,19 @@ class AALCRZeroShotGenTask(
         dict[str, float | str],
     ]
 ):
+    @classmethod
+    @override
+    def model_requirements_for(
+        cls, context: RequirementContext
+    ) -> tuple[TaskModelRequirement, ...]:
+        candidate = super().model_requirements_for(context)
+        grader = cls._bind_role_requirement(
+            context,
+            "grader",
+            TaskRequirements(input=InputKind.CHAT),
+        )
+        return candidate + grader
+
     def __init__(
         self,
         dataset,
@@ -154,10 +171,28 @@ class AALCRZeroShotGenTask(
         name: str | None = None,
         grader: Mapping | Model | None = None,
         n: int = 1,
+        models_by_role: Mapping[str, Model] | None = None,
     ):
         super().__init__(dataset=dataset, model=model, name=name)
         self._n = n
-        self._grader = self._build_grader(grader)
+        self._grader = self._resolve_grader(grader, models_by_role)
+
+    @classmethod
+    def _resolve_grader(
+        cls,
+        grader: Mapping | Model | None,
+        models_by_role: Mapping[str, Model] | None,
+    ) -> Model:
+        if models_by_role is not None:
+            if grader is not None:
+                raise ValueError("grader and models_by_role cannot both be supplied")
+            try:
+                return models_by_role["grader"]
+            except KeyError as exc:
+                raise ValueError(
+                    "models_by_role is missing the 'grader' model"
+                ) from exc
+        return cls._build_grader(grader)
 
     @staticmethod
     def _build_grader(grader: Mapping | Model | None) -> Model:

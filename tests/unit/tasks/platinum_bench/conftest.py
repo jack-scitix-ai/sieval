@@ -7,7 +7,9 @@ row/task factories live here instead of being copied into six files.
 AI-Generated Code - Claude Opus 5 (Anthropic)
 """
 
-from sieval.core.models import ModelOutput
+from dataclasses import fields
+
+from sieval.core.models import Request, Response, SamplingParams
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import EvalMode
 from sieval.core.tasks.meta import get_task_class, get_task_meta
@@ -19,6 +21,7 @@ from sieval.tasks.platinum_bench._base import (
     PLATINUM_UPSTREAM_URL,
     PlatinumMathGenTask,
 )
+from tests.conftest import HandlerTransport
 
 # Both columns are shaped like the real ones, because the wording is load-bearing:
 # the no-CoT column really does open its last sentence with "Then, provide" — a
@@ -39,12 +42,9 @@ class CapturingChatModel(ChatModel):
     """Returns a fixed completion and records the request the model would send.
 
     ``last_kwargs`` is the **merged** result, not what ``infer()`` passed. The
-    override point (``_agenerate_impl``) sits below ``ChatModel``'s own
-    ``{**self._kwargs, **kwargs}``, so recording the call-time kwargs alone
-    would make every "the task injects no decoding params" assertion vacuous —
-    a task-side value that silently outranks the configured one would look
-    identical to no value at all. Reproducing the merge here is what lets a test
-    assert which side wins.
+    handler sees the canonical ``Request`` after ``ChatModel`` has merged its
+    configured defaults with call-time values. Recording that request rather
+    than either source alone lets a test assert which side wins.
     """
 
     def __init__(
@@ -53,32 +53,24 @@ class CapturingChatModel(ChatModel):
         texts: list[str] | None = None,
         **model_kwargs,
     ):
-        super().__init__(model="mock-chat", api_key="fake", **model_kwargs)
         self.last_kwargs: dict[str, object] = {}
         self._texts = list(texts) if texts is not None else [text]
+        super().__init__(model="mock-chat", api_key="fake", **model_kwargs)
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = {**self._kwargs, **kwargs}
-        # Honouring `n` is what lets a test tell "the task asked for n" apart
-        # from "the stub happened to hand back a list".
-        requested = self.last_kwargs.get("n", 1)
-        n = requested if isinstance(requested, int) and requested > 0 else 1
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
+
+    async def _stub_arun(self, req: Request) -> Response:
+        default = SamplingParams()
+        self.last_kwargs = {
+            item.name: getattr(req.sampling, item.name)
+            for item in fields(req.sampling)
+            if item.name == "n"
+            or getattr(req.sampling, item.name) != getattr(default, item.name)
+        }
+        n = req.sampling.n
         texts = (self._texts * n)[:n] if len(self._texts) < n else self._texts[:n]
-        return ModelOutput(model=self.meta(), texts=texts)
-
-    async def _alogprobs_impl(
-        self,
-        prompt,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+        return Response(texts=tuple(texts))
 
 
 def make_sample(
@@ -167,7 +159,7 @@ def assert_leaf_meta(
     # decorator and `_abc_impl` from ABCMeta. Every stage method is public, so an
     # override still trips this.
     own = {key for key in vars(task_cls) if not key.startswith("_")}
-    assert own == {"subset", "tags", "model_type", "n_shot"}
+    assert own == {"subset", "tags", "model_type", "n_shot", "requires"}
 
 
 def make_task[T: PlatinumMathGenTask](

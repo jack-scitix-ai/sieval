@@ -187,6 +187,71 @@ class TestInfer:
         assert "vllm" in data["command"]
         assert "/models/qwen3-8b" in data["command"]
         assert "health_check" in data
+        prelaunch_plan = data["prelaunch_plan"]
+        assert set(prelaunch_plan) == {
+            "binding_plans",
+            "deployment_plans",
+            "runtime_plans",
+            "diagnostics",
+        }
+        assert "model:qwen3-8b" in prelaunch_plan["binding_plans"]
+        assert "model:qwen3-8b" in prelaunch_plan["deployment_plans"]
+        # A prelaunch plan deliberately has no realized-route runtime plans.
+        assert prelaunch_plan["runtime_plans"] == {}
+
+    def test_infer_start_prelaunch_failure_precedes_claim_and_launch(self, tmp_path):
+        """A YAML binding error must not claim a handle or launch a service."""
+        config_path = self._make_config(tmp_path)
+
+        from sieval.infer.topology.models import (
+            DeploymentPlan,
+            DeviceGroup,
+            ParallelTopology,
+            RoleAssignment,
+            WellKnownRole,
+        )
+
+        plan = DeploymentPlan(
+            checkpoint="/models/qwen3-8b",
+            backend="vllm",
+            assignments=(
+                RoleAssignment(
+                    role=WellKnownRole.FULL,
+                    devices=DeviceGroup(count=2),
+                    topology=ParallelTopology(tp=2),
+                ),
+            ),
+        )
+        mock_resolve = AsyncMock(return_value=("qwen3-8b", plan, {}))
+        session = MagicMock()
+        session.prepare_prelaunch.side_effect = ValueError("binding is invalid")
+        session_cls = MagicMock(return_value=session)
+
+        with (
+            patch(
+                "sieval.cli.infer.commands.resolve_infer_config",
+                mock_resolve,
+            ),
+            patch(
+                "sieval.cli.leaderboard.session.EvalSession",
+                session_cls,
+            ),
+            patch("sieval.cli.infer.commands.claim_handle") as claim_handle,
+            patch(
+                "sieval.cli.infer.commands.launch_model",
+                new_callable=AsyncMock,
+            ) as launch_model,
+            patch("sieval.cli.infer.commands.get_translator") as get_translator,
+        ):
+            result = runner.invoke(app, ["infer", "start", str(config_path)])
+
+        assert result.exit_code != 0
+        assert isinstance(result.exception, ValueError)
+        assert str(result.exception) == "binding is invalid"
+        session.prepare_prelaunch.assert_called_once_with()
+        claim_handle.assert_not_called()
+        launch_model.assert_not_awaited()
+        get_translator.assert_not_called()
 
     def test_infer_start_missing_infer_section(self, tmp_path):
         cfg = {"models": {"test": {"name": "test"}}}

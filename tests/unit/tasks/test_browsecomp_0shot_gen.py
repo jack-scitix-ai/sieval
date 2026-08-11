@@ -10,7 +10,6 @@ from datasets import DatasetDict as HFDatasetDict
 from sieval.community.browsecomp import aggregate_metrics, parse_grade
 from sieval.core.models import Request, Response
 from sieval.core.models.chat_model import ChatModel
-from sieval.core.models.transports import OpenAIChatTransport
 from sieval.core.tasks import (
     TaskContext,
     build_judgement_record,
@@ -36,7 +35,7 @@ class _ScriptedChatModel(ChatModel):
         super().__init__(model=model, api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
     async def _stub_arun(self, req: Request) -> Response:
         self.last_req = req
@@ -81,6 +80,33 @@ def test_build_grader_accepts_mapping_and_model():
     assert isinstance(built, ChatModel)
     existing = _ScriptedChatModel(reply="correct: no")
     assert BrowseCompZeroShotGenTask._build_grader(existing) is existing
+
+
+def test_constructor_accepts_composed_grader_model():
+    base, grader = _task()
+    task = BrowseCompZeroShotGenTask(
+        base.dataset,
+        base.model,
+        models_by_role={"grader": grader},
+    )
+    assert task._grader is grader
+
+
+def test_constructor_rejects_missing_composed_grader_role():
+    base, _ = _task()
+    with pytest.raises(ValueError, match="missing the 'grader'"):
+        BrowseCompZeroShotGenTask(base.dataset, base.model, models_by_role={})
+
+
+def test_constructor_rejects_ambiguous_grader_sources():
+    base, grader = _task()
+    with pytest.raises(ValueError, match="cannot both be supplied"):
+        BrowseCompZeroShotGenTask(
+            base.dataset,
+            base.model,
+            grader=grader,
+            models_by_role={"grader": grader},
+        )
 
 
 # --- preprocess: wraps the question in the BrowseComp QUERY_TEMPLATE ---

@@ -5,16 +5,18 @@ dataset operations, and runner config building.
 AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
+import dataclasses
 import json
 import re
 import types
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
 import pytest
+import yaml
 
 from sieval.cli.leaderboard.session import (
     _NONMATCH_RUNNER_KEYS,
@@ -41,7 +43,17 @@ from sieval.cli.leaderboard.session import (
     run_session,
     unwrap_proxies,
 )
+from sieval.cli.resolution import derive_model_type
 from sieval.core.models.model import Model
+from sieval.core.models.reconcile import CheckStage, Configured, DeferredCheck
+from sieval.core.models.requirements import (
+    AggregatedTaskRequirements,
+    InlineModelBinding,
+    InputKind,
+    NamedModelBinding,
+    TaskModelRequirement,
+    TaskRequirements,
+)
 from sieval.core.runners import TaskRunnerConfig
 from sieval.core.runners.multi_runner import MultiTaskRunner
 from tests.conftest import MockChatModel
@@ -56,7 +68,7 @@ def _write_yaml_config(tmp_path: Path, filename: str, content: str) -> Path:
 def _prepare_eval_session(
     config_path: Path,
     *,
-    models: dict[str, Model[Any]] | None = None,
+    models: dict[str, Model] | None = None,
     resume: bool = False,
 ) -> MultiTaskRunner:
     runner = EvalSession(config_path=str(config_path), resume=resume)
@@ -420,149 +432,53 @@ class TestDatasetOperations:
 
 
 # ===================================================================
-# Model type inference
+# Model type derivation from normalized task requirements
 # ===================================================================
-class TestInferModelType:
-    def _make_runner(self, tasks_cfg=None):
-        runner = object.__new__(EvalSession)
-        runner.config = {"tasks": tasks_cfg or {}}
-        return runner
+class TestDeriveModelType:
+    @staticmethod
+    def _requirements(
+        *kinds: InputKind,
+    ) -> AggregatedTaskRequirements:
+        return AggregatedTaskRequirements(
+            input=frozenset(kinds),
+            input_sources={kind: frozenset({f"{kind.value}_task"}) for kind in kinds},
+        )
 
-    def test_explicit_type_and_default(self):
-        runner = self._make_runner()
-        assert runner._infer_model_type("m", "gen") == "gen"
-        assert runner._infer_model_type("m", "chat") == "chat"
-        assert runner._infer_model_type("m", None) == "chat"
+    def test_explicit_type_and_default_without_task_evidence(self):
+        empty = self._requirements()
+        assert derive_model_type("m", "gen", empty) == "gen"
+        assert derive_model_type("m", "chat", empty) == "chat"
+        assert derive_model_type("m", None, empty) == "chat"
 
-    def test_inferred_from_task(self):
-        """When a task class has model_type attribute, it's used."""
+    def test_normalized_completion_evidence_derives_gen(self):
+        requirements = self._requirements(InputKind.COMPLETION)
+        assert derive_model_type("m", None, requirements) == "gen"
+        assert derive_model_type("m", "gen", requirements) == "gen"
 
-        class FakeTask:
-            model_type = "gen"
-
-        tasks_cfg = {
-            "t1": {"model": "m", "class": "fake.FakeTask"},
-        }
-        runner = self._make_runner(tasks_cfg)
-
-        with patch(
-            "sieval.cli.resolution.resolve_task_class",
-            return_value=FakeTask,
+    def test_explicit_type_is_assertion_when_evidence_exists(self):
+        requirements = self._requirements(InputKind.COMPLETION)
+        with pytest.raises(
+            ValueError,
+            match=r"declares type: chat.*require 'gen'.*checked assertion",
         ):
-            assert runner._infer_model_type("m", None) == "gen"
+            derive_model_type("m", "chat", requirements)
 
-    def test_conflicting_types_raises(self):
-        class GenTask:
-            model_type = "gen"
+    def test_conflicting_normalized_inputs_report_sources(self):
+        requirements = self._requirements(InputKind.CHAT, InputKind.COMPLETION)
+        with pytest.raises(ValueError, match="conflicting normalized input") as exc:
+            derive_model_type("m", None, requirements)
 
-        class ChatTask:
-            model_type = "chat"
+        message = str(exc.value)
+        assert "chat_task" in message
+        assert "completion_task" in message
+        assert "separate root model configs" in message
 
-        tasks_cfg = {
-            "t1": {"model": "m", "class": "fake.GenTask"},
-            "t2": {"model": "m", "class": "fake.ChatTask"},
-        }
-        runner = self._make_runner(tasks_cfg)
-
-        call_count = 0
-
-        def mock_resolve(_spec):
-            nonlocal call_count
-            call_count += 1
-            return GenTask if call_count == 1 else ChatTask
-
-        with (
-            patch(
-                "sieval.cli.resolution.resolve_task_class",
-                side_effect=mock_resolve,
-            ),
-            pytest.raises(ValueError, match="different types"),
-        ):
-            runner._infer_model_type("m", None)
-
-
-class TestSetupModelsEngine:
-    """`engine` field dispatches a gen model to GenModel vs SglangGenModel."""
-
-    def _make_runner(self, models_cfg):
-        runner = object.__new__(EvalSession)
-        runner.config = {"models": models_cfg, "tasks": {}}
-        runner.models = {}
-        runner.deterministic = False
-        runner.model_override = None
-        return runner
-
-    def test_default_engine_is_gen_model(self):
-        from sieval.core.models import GenModel, SglangGenModel
-
-        runner = self._make_runner(
-            {"m": {"name": "x", "type": "gen", "api_key": "local"}}
-        )
-        runner._setup_models()
-        assert isinstance(runner.models["m"], GenModel)
-        assert not isinstance(runner.models["m"], SglangGenModel)
-
-    def test_sglang_engine_is_sglang_gen_model(self):
-        from sieval.core.models import SglangGenModel
-
-        runner = self._make_runner(
-            {"m": {"name": "x", "type": "gen", "engine": "sglang", "api_key": "local"}}
-        )
-        runner._setup_models()
-        assert isinstance(runner.models["m"], SglangGenModel)
-
-    def test_explicit_vllm_engine_is_gen_model(self):
-        from sieval.core.models import GenModel, SglangGenModel
-
-        runner = self._make_runner(
-            {"m": {"name": "x", "type": "gen", "engine": "vllm", "api_key": "local"}}
-        )
-        runner._setup_models()
-        assert isinstance(runner.models["m"], GenModel)
-        assert not isinstance(runner.models["m"], SglangGenModel)
-
-    def test_invalid_engine_raises(self):
-        runner = self._make_runner(
-            {"m": {"name": "x", "type": "gen", "engine": "bogus", "api_key": "local"}}
-        )
-        with pytest.raises(ValueError, match="invalid engine"):
-            runner._setup_models()
-
-    def test_engine_on_chat_model_raises(self):
-        runner = self._make_runner(
-            {"m": {"name": "x", "type": "chat", "engine": "sglang", "api_key": "local"}}
-        )
-        with pytest.raises(ValueError, match="only valid for type: gen"):
-            runner._setup_models()
-
-    def test_engine_on_derived_model_raises(self):
-        runner = self._make_runner(
-            {
-                "base_m": {"name": "x", "type": "gen", "api_key": "local"},
-                "d": {"base": "base_m", "engine": "sglang"},
-            }
-        )
-        with pytest.raises(ValueError, match="cannot set 'engine'"):
-            runner._setup_models()
-
-    def test_derived_type_gen_preserves_sglang_base(self):
-        """`type: gen` on a derived model of an sglang base must NOT downgrade it
-        to GenModel (which would silently switch to /v1/completions)."""
-        from sieval.core.models import SglangGenModel
-
-        runner = self._make_runner(
-            {
-                "base_m": {
-                    "name": "x",
-                    "type": "gen",
-                    "engine": "sglang",
-                    "api_key": "local",
-                },
-                "d": {"base": "base_m", "type": "gen", "args": {"temperature": 0.5}},
-            }
-        )
-        runner._setup_models()
-        assert isinstance(runner.models["d"], SglangGenModel)
+    def test_rejects_invalid_explicit_type_and_non_normalized_evidence(self):
+        empty = self._requirements()
+        with pytest.raises(ValueError, match="invalid type"):
+            derive_model_type("m", "other", empty)
+        with pytest.raises(TypeError, match="AggregatedTaskRequirements"):
+            derive_model_type("m", None, cast(Any, object()))
 
 
 # ===================================================================
@@ -1035,361 +951,23 @@ class TestEvalSessionConfigLoading:
 
 
 # ===================================================================
-# _setup_models: base model creation, derived model creation,
-# type conversion, api_key/api_base injection, missing name error
+# _setup_models: canonical post-launch binding gate
 # ===================================================================
 class TestSetupModels:
-    """Test _setup_models for base model creation, derivation, type conversion."""
+    def test_requires_postlaunch_reconciliation(self):
+        session = object.__new__(EvalSession)
 
-    def _make_runner(self, config: dict) -> EvalSession:
-        runner = object.__new__(EvalSession)
-        runner.config = config
-        runner.model_override = None
-        runner.resume_override = False
-        runner.deterministic = False
-        runner.models = {}
-        runner.datasets = {}
-        runner.runner = None
-        return runner
+        with pytest.raises(RuntimeError, match="post-launch capability"):
+            session._setup_models()
 
-    def test_models_not_dict_raises(self):
-        runner = self._make_runner({"models": None})
-        with pytest.raises(ValueError, match="must be a dictionary"):
-            runner._setup_models()
+    def test_delegates_to_canonical_binding_path(self):
+        session = object.__new__(EvalSession)
+        session.postlaunch_reconcile_result = MagicMock()
 
-    def test_model_item_not_dict_raises(self):
-        runner = self._make_runner({"models": {"m1": "not-a-dict"}})
-        with pytest.raises(
-            ValueError, match="'models.m1' configuration must be a dictionary"
-        ):
-            runner._setup_models()
+        with patch.object(session, "_setup_bound_models") as setup_bound:
+            session._setup_models()
 
-    def test_base_model_validation_errors(self):
-        """Base model setup should reject missing name and invalid type."""
-        # (yaml_config, expected_error_pattern)
-        cases = [
-            # Base model requires name when no override is given.
-            (
-                {"models": {"m1": {"args": {}}}},
-                "requires 'name'",
-            ),
-            # Base model type must be one of the supported families.
-            (
-                {"models": {"m1": {"name": "mock-model", "type": "unknown_type"}}},
-                "invalid type",
-            ),
-        ]
-        for config, error_match in cases:
-            runner = self._make_runner(config)
-            with pytest.raises(ValueError, match=error_match):
-                runner._setup_models()
-
-    def test_base_model_args_type_error_mentions_model_name(self):
-        runner = self._make_runner(
-            {"models": {"m1": {"name": "mock-model", "type": "chat", "args": 123}}}
-        )
-        with pytest.raises(ValueError, match="Model 'm1' args must be a dictionary"):
-            runner._setup_models()
-
-    def test_model_override_replaces_name(self):
-        """model_override should replace the 'name' field for base models."""
-        runner = self._make_runner(
-            {"models": {"m1": {"type": "chat", "args": {"api_key": "fake"}}}}
-        )
-        runner.model_override = "override-model-name"
-
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=MagicMock(),
-        ) as MockCls:
-            runner._setup_models()
-            # The first positional/keyword argument must be the overridden name
-            call_kwargs = MockCls.call_args
-            assert call_kwargs is not None
-            # model kwarg should use override
-            assert call_kwargs.kwargs.get("model") == "override-model-name" or (
-                call_kwargs.args and call_kwargs.args[0] == "override-model-name"
-            )
-
-    def test_base_model_infer_uses_model_key_and_forwards_model_name(self):
-        runner = self._make_runner(
-            {"models": {"m1": {"name": "mock-gen", "args": {"temperature": 0.1}}}}
-        )
-        created_model = MagicMock()
-
-        with (
-            patch.object(runner, "_infer_model_type", return_value="gen") as infer_mock,
-            patch(
-                "sieval.cli.leaderboard.session.GenModel",
-                return_value=created_model,
-            ) as gen_cls,
-        ):
-            runner._setup_models()
-
-        infer_mock.assert_called_once_with("m1", None)
-        gen_cls.assert_called_once_with(model="mock-gen", temperature=0.1)
-        assert runner.models["m1"] is created_model
-
-    def test_derived_model_no_type_conversion(self):
-        """A derived model without 'type' should call with_args (no type conversion)."""
-        base = MockChatModel(concurrency_limit=64)
-        runner = self._make_runner(
-            {
-                "models": {
-                    "base": {
-                        "name": "mock-chat",
-                        "type": "chat",
-                        "args": {"api_key": "fake"},
-                    },
-                    "child": {"base": "base", "args": {"concurrency_limit": 32}},
-                }
-            }
-        )
-        # Inject pre-built base model to avoid real ChatModel creation
-        runner.models["base"] = base
-
-        # Patch the first-pass loop to skip re-creating 'base'
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=base,
-        ):
-            runner._setup_models()
-
-        child = runner.models.get("child")
-        assert child is not None
-        # child should share parent_limiter = base._limiter
-        assert child._parent_limiter is base._limiter
-
-    def test_derived_model_matching_type_is_accepted(self):
-        """`type:` on a derived model is a no-op when it matches the base kind."""
-        base = MockChatModel(concurrency_limit=64)
-        runner = self._make_runner(
-            {
-                "models": {
-                    "base": {
-                        "name": "mock-chat",
-                        "type": "chat",
-                        "args": {"api_key": "fake"},
-                    },
-                    "child": {"base": "base", "type": "chat", "args": {}},
-                }
-            }
-        )
-        runner.models["base"] = base
-
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=base,
-        ):
-            runner._setup_models()
-
-        # No conversion machinery: the child derives directly from the base
-        # (no args → no with_args fork either).
-        assert runner.models["child"] is base
-
-    def test_derived_model_cross_kind_type_raises(self):
-        """RFC #25 dropped as_type: cross-kind derived `type:` is a config error."""
-        base = MockChatModel(concurrency_limit=64)
-        runner = self._make_runner(
-            {
-                "models": {
-                    "base": {
-                        "name": "mock-chat",
-                        "type": "chat",
-                        "args": {"api_key": "fake"},
-                    },
-                    "child": {"base": "base", "type": "gen", "args": {}},
-                }
-            }
-        )
-        runner.models["base"] = base
-
-        with (
-            patch(
-                "sieval.cli.leaderboard.session.ChatModel",
-                return_value=base,
-            ),
-            pytest.raises(ValueError, match="cross-kind conversion was removed"),
-        ):
-            runner._setup_models()
-
-    def test_derived_model_validation_errors(self):
-        """Derived model should reject unknown base and invalid type."""
-        runner = self._make_runner(
-            {"models": {"child": {"base": "non_existent_base", "args": {}}}}
-        )
-        with pytest.raises(ValueError, match="unknown base model"):
-            runner._setup_models()
-
-        base = MockChatModel()
-        runner = self._make_runner(
-            {
-                "models": {
-                    "base": {
-                        "name": "mock-chat",
-                        "type": "chat",
-                        "args": {"api_key": "fake"},
-                    },
-                    "child": {"base": "base", "type": "bad_type", "args": {}},
-                }
-            }
-        )
-        runner.models["base"] = base
-
-        with (
-            patch(
-                "sieval.cli.leaderboard.session.ChatModel",
-                return_value=base,
-            ),
-            pytest.raises(ValueError, match="invalid type"),
-        ):
-            runner._setup_models()
-
-    def test_derived_model_non_string_base_raises_even_if_key_exists(self):
-        """Non-string base should fail validation before base lookup."""
-        base = MockChatModel()
-        runner = self._make_runner(
-            {"models": {"child": {"base": 123, "args": {"temperature": 0.2}}}}
-        )
-        runner.models[123] = base  # type: ignore[index]
-
-        with pytest.raises(ValueError, match="invalid 'base' value"):
-            runner._setup_models()
-
-    def test_derived_model_out_of_order_definition(self):
-        """Derived models should resolve even if YAML order is child-before-parent."""
-        base = MockChatModel(concurrency_limit=128)
-        runner = self._make_runner(
-            {
-                "models": {
-                    "child": {"base": "mid", "args": {"temperature": 0.2}},
-                    "mid": {"base": "base", "args": {"concurrency_limit": 32}},
-                    "base": {
-                        "name": "mock-chat",
-                        "type": "chat",
-                        "args": {"api_key": "fake", "concurrency_limit": 128},
-                    },
-                }
-            }
-        )
-
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=base,
-        ):
-            runner._setup_models()
-
-        assert runner.models["mid"]._parent_limiter is base._limiter
-        assert runner.models["child"]._limiter is runner.models["mid"]._limiter
-        assert runner.models["child"]._kwargs["temperature"] == 0.2
-
-    def test_derived_model_cycle_raises(self):
-        runner = self._make_runner(
-            {
-                "models": {
-                    "model_a": {"base": "model_b", "args": {}},
-                    "model_b": {"base": "model_a", "args": {}},
-                }
-            }
-        )
-
-        with pytest.raises(ValueError, match="cyclic dependencies"):
-            runner._setup_models()
-
-    def test_base_model_created_by_type(self):
-        """Base model should instantiate expected concrete model type."""
-        from sieval.core.models.chat_model import ChatModel as RealChatModel
-        from sieval.core.models.gen_model import GenModel as RealGenModel
-
-        # (model_type_literal, model_name, expected_concrete_class)
-        cases = [
-            ("chat", "mock-chat", RealChatModel),
-            ("gen", "mock-gen", RealGenModel),
-        ]
-        for model_type, model_name, expected_cls in cases:
-            runner = self._make_runner(
-                {
-                    "models": {
-                        "m1": {
-                            "name": model_name,
-                            "type": model_type,
-                            "args": {"api_key": "fake"},
-                        }
-                    }
-                }
-            )
-            runner._setup_models()
-            assert "m1" in runner.models
-            assert isinstance(runner.models["m1"], expected_cls)
-
-
-class TestSetupModelsApiKeyInjection:
-    """Test top-level api_key/api_base handling in model setup."""
-
-    def _make_runner(self, config: dict) -> EvalSession:
-        runner = object.__new__(EvalSession)
-        runner.config = config
-        runner.model_override = None
-        runner.resume_override = False
-        runner.deterministic = False
-        runner.models = {}
-        runner.datasets = {}
-        runner.runner = None
-        return runner
-
-    def test_top_level_api_key_forwarded_for_base_model(self):
-        """Top-level api_key/api_base should be forwarded for base models."""
-        runner = self._make_runner(
-            {
-                "models": {
-                    "m1": {
-                        "name": "mock-chat",
-                        "type": "chat",
-                        "api_key": "top-level-key",
-                        "api_base": "https://custom.endpoint/v1",
-                        "args": {},
-                    }
-                }
-            }
-        )
-
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=MagicMock(),
-        ) as MockCls:
-            runner._setup_models()
-
-        call_kwargs = MockCls.call_args.kwargs
-        assert call_kwargs.get("api_key") == "top-level-key"
-        assert call_kwargs.get("api_base") == "https://custom.endpoint/v1"
-
-    @pytest.mark.parametrize(
-        "override_field,override_value",
-        [
-            ("api_key", "child-key"),
-            ("api_base", "https://child.endpoint/v1"),
-        ],
-    )
-    def test_derived_model_api_override_rejected(
-        self, override_field: str, override_value: str
-    ):
-        """Derived models cannot override api_key/api_base from base model."""
-        base = MockChatModel()
-        runner = self._make_runner(
-            {
-                "models": {
-                    "child": {
-                        "base": "base",
-                        override_field: override_value,
-                        "args": {"temperature": 0.3},
-                    },
-                }
-            }
-        )
-        runner.models["base"] = base
-
-        with pytest.raises(ValueError, match="cannot override api_key/api_base"):
-            runner._setup_models()
+        setup_bound.assert_called_once_with()
 
 
 # ===================================================================
@@ -1650,6 +1228,1970 @@ class TestSetupDatasetsErrors:
         assert "mock_ds" in runner.datasets
 
 
+# ===================================================================
+# RFC #25 pre-launch requirement composition and reconciliation
+# ===================================================================
+class TestPrelaunchReconciliation:
+    class ChatTask:
+        model_type = "chat"
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="chat_task",
+                ),
+            )
+
+    class CompletionScoringTask:
+        model_type = "gen"
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(
+                        input=InputKind.COMPLETION,
+                        input_scoring=True,
+                        sampled_logprobs=True,
+                        min_top_logprobs=7,
+                    ),
+                    source_task="completion_scoring",
+                ),
+            )
+
+    class CompletionTask:
+        model_type = "gen"
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.COMPLETION),
+                    source_task="completion_task",
+                ),
+            )
+
+    class JudgeTask:
+        model_type = "chat"
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="judge_task",
+                ),
+                TaskModelRequirement(
+                    role="grader",
+                    binding=context.model_bindings["grader"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="judge_task",
+                ),
+            )
+
+    class ScoringJudgeTask:
+        model_type = "chat"
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="scoring_judge_task",
+                ),
+                TaskModelRequirement(
+                    role="grader",
+                    binding=context.model_bindings["grader"],
+                    requires=TaskRequirements(
+                        input=InputKind.COMPLETION,
+                        input_scoring=True,
+                        sampled_logprobs=True,
+                        min_top_logprobs=1,
+                    ),
+                    source_task="scoring_judge_task",
+                ),
+            )
+
+    @staticmethod
+    def _config(tmp_path: Path, body: str) -> Path:
+        return _write_yaml_config(tmp_path, "prelaunch.yaml", body)
+
+    def test_implicit_single_model_completion_uses_normalized_hook_evidence(
+        self, tmp_path: Path
+    ) -> None:
+        class CompletionWithMisleadingLegacyMetadata:
+            # The resolver must not read this legacy projection.
+            model_type = "chat"
+            provisional_dialect: str | None = "not-called"
+
+            @classmethod
+            def model_requirements_for(cls, context):
+                binding = context.model_bindings["candidate"]
+                cls.provisional_dialect = binding.dialect_id
+                return (
+                    TaskModelRequirement(
+                        role="candidate",
+                        binding=binding,
+                        requires=TaskRequirements(input=InputKind.COMPLETION),
+                        source_task="implicit_completion",
+                    ),
+                )
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  only:
+    name: org/model
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+""",
+        )
+        session = EvalSession(config_path)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=CompletionWithMisleadingLegacyMetadata,
+        ):
+            session.prepare_prelaunch()
+
+        assert CompletionWithMisleadingLegacyMetadata.provisional_dialect is None
+        finalized = session._normalized_model_bindings["model:only"]
+        assert finalized.dialect_id == "openai_completions"
+        assert session._model_types_by_root == {"model:only": "gen"}
+        assert (
+            session._task_requirement_contexts["completion"]
+            .model_bindings["candidate"]
+            .dialect_id
+            == "openai_completions"
+        )
+        assert session._task_model_requirements[0].binding == finalized
+
+    def test_task_requirement_hook_cannot_replace_context_binding(
+        self, tmp_path: Path
+    ) -> None:
+        class ForgedBindingTask:
+            @classmethod
+            def model_requirements_for(cls, context):
+                binding = dataclasses.replace(
+                    context.model_bindings["candidate"],
+                    binding_id="model:forged",
+                )
+                return (
+                    TaskModelRequirement(
+                        role="candidate",
+                        binding=binding,
+                        requires=TaskRequirements(input=InputKind.CHAT),
+                        source_task="forged_binding",
+                    ),
+                )
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  only:
+    name: org/model
+tasks:
+  forged:
+    class: fake.ForgedBindingTask
+    dataset:
+      class: fake.Dataset
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=ForgedBindingTask,
+            ),
+            pytest.raises(ValueError, match="changed the normalized binding"),
+        ):
+            session.prepare_prelaunch()
+
+    def test_derived_binding_evidence_is_resolved_once_for_shared_root(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  base:
+    name: org/model
+  derived:
+    base: base
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: derived
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            patch(
+                "sieval.cli.leaderboard.session.derive_model_type",
+                wraps=derive_model_type,
+            ) as resolver,
+        ):
+            session.prepare_prelaunch()
+
+        resolver.assert_called_once()
+        assert session._model_types_by_root == {"model:base": "gen"}
+        assert session._normalized_model_bindings["model:base"].dialect_id == (
+            "openai_completions"
+        )
+        assert session._normalized_model_bindings["model:derived"].dialect_id == (
+            "openai_completions"
+        )
+
+    def test_root_type_assertion_cannot_override_derived_task_evidence(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  base:
+    name: org/model
+    type: chat
+  derived:
+    base: base
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: derived
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            pytest.raises(
+                ValueError,
+                match=r"root 'base' declares type: chat.*require 'gen'",
+            ),
+        ):
+            session.prepare_prelaunch()
+
+    def test_sibling_derived_kinds_conflict_at_shared_root(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  base:
+    name: org/model
+  chat_view:
+    base: base
+  completion_view:
+    base: base
+tasks:
+  chat:
+    class: fake.ChatTask
+    dataset:
+      class: fake.Dataset
+    model: chat_view
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: completion_view
+""",
+        )
+        session = EvalSession(config_path)
+
+        def resolve(task_spec: str):
+            if task_spec.endswith("ChatTask"):
+                return self.ChatTask
+            return self.CompletionTask
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                side_effect=resolve,
+            ),
+            pytest.raises(ValueError, match="conflicting normalized input") as exc,
+        ):
+            session.prepare_prelaunch()
+
+        message = str(exc.value)
+        assert "chat_task" in message
+        assert "completion_task" in message
+        assert "separate root model configs" in message
+
+    def test_derived_and_root_type_assertions_must_agree(self, tmp_path: Path) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  base:
+    name: org/model
+    type: chat
+  derived:
+    base: base
+    type: gen
+tasks: {}
+""",
+        )
+        session = EvalSession(config_path)
+
+        with pytest.raises(
+            ValueError,
+            match=r"sharing deployment root 'base'.*base='chat'.*derived='gen'",
+        ):
+            session.prepare_prelaunch()
+
+    def test_external_completions_without_engine_remains_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: provider/model
+    type: gen
+    api_base: https://provider.example/v1
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=self.CompletionTask,
+        ):
+            session.prepare_prelaunch()
+
+        deployment_input = session._prelaunch_deployment_inputs["model:m"]
+        assert deployment_input.engine_id == "unknown"
+        deployment = session._configured_deployment_for(
+            session._normalized_model_bindings["model:m"],
+            deployment_input,
+            session._get_named_config_map("models"),
+        )
+        assert deployment.engine.engine_id == "unknown"
+        assert deployment.engine_source == "unknown"
+        assert deployment.deployment_id is None
+        assert deployment.plan is None
+
+    def test_infer_overrides_are_projected_as_explicit_engine_parameters(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    type: gen
+    infer:
+      backend: vllm
+      checkpoint: /models/org-model
+      overrides:
+        max-logprobs: 20
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        raw_plan = {
+            "backend": "vllm",
+            "checkpoint": "/models/org-model",
+            "assignments": [],
+        }
+        session = EvalSession(config_path, infer_plans={"m": raw_plan})
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=self.CompletionTask,
+        ):
+            result = session.prepare_prelaunch()
+
+        deployment_input = session._prelaunch_deployment_inputs["model:m"]
+        assert deployment_input.explicit_parameters == {"max_logprobs": 20}
+        assert deployment_input.recipe_parameters == {}
+        deployment_plan = result.deployment_plans["model:m"]
+        assert deployment_plan.explicit_parameters == {"max_logprobs": 20}
+        assert deployment_input.plan is not None
+        assert deployment_plan.desired_plan_fingerprint == (
+            deployment_input.plan.fingerprint
+        )
+
+    def test_missing_realized_managed_deployment_is_not_synthesized(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    type: gen
+    api_base: https://unverified.example/v1
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        raw_plan = {
+            "backend": "vllm",
+            "checkpoint": "/models/org-model",
+            "assignments": [],
+        }
+        session = EvalSession(config_path, infer_plans={"m": raw_plan})
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=self.CompletionTask,
+        ):
+            session.prepare_prelaunch()
+            with pytest.raises(ValueError, match="no realized Deployment"):
+                session._setup_postlaunch_reconciliation()
+
+    @pytest.mark.anyio
+    async def test_registered_future_family_needs_no_session_branch(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.cli.leaderboard import session as session_module
+        from sieval.core.models.connection_factory import (
+            CONNECTION_FACTORY_REGISTRY,
+            ConnectionFactorySpec,
+            ConnectionRequest,
+        )
+        from sieval.core.models.deployment import (
+            ConnectionIdentity,
+            Deployment,
+            Engine,
+            ResolvedRoute,
+            ServingFacts,
+        )
+        from sieval.core.models.reconcile import RuntimeBindingPlan
+
+        class FutureConnection:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        connection = FutureConnection()
+        requests: list[ConnectionRequest] = []
+
+        def build(request: ConnectionRequest) -> FutureConnection:
+            requests.append(request)
+            return connection
+
+        future_registry = CONNECTION_FACTORY_REGISTRY.with_factory(
+            ConnectionFactorySpec(
+                connection_family="future_sdk",
+                retry_policy_prefix="future-sdk:max-retries=",
+                builder=build,
+            )
+        )
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: future/model
+    api_base: https://future.example/v1
+    api_key: future-secret
+    max_retries: 5
+tasks: {}
+""",
+        )
+        session = EvalSession(config_path)
+        binding = NamedModelBinding(
+            binding_id="model:m",
+            root_deployment_key="model:m",
+            requested_model_id="future/model",
+            config_name="m",
+            dialect_id="future_dialect",
+        )
+        models_cfg = session._get_named_config_map("models")
+
+        with (
+            patch.object(
+                session_module,
+                "CONNECTION_FACTORY_REGISTRY",
+                future_registry,
+            ),
+            patch.object(
+                session_module,
+                "get_dialect_spec",
+                return_value=types.SimpleNamespace(connection_family="future_sdk"),
+            ),
+        ):
+            scope = session._connection_scope_for(binding, models_cfg)
+            identity = ConnectionIdentity(
+                endpoint="https://future.example/v1",
+                connection_family="future_sdk",
+                credential_scope=scope.credential_scope,
+                retry_policy=scope.retry_policy,
+                quota_scope=scope.quota_scope,
+            )
+            route = ResolvedRoute(
+                service_role="default",
+                endpoint=identity.endpoint,
+                connection_family="future_sdk",
+                fingerprint="future-route",
+            )
+            runtime_plan = cast(
+                RuntimeBindingPlan,
+                types.SimpleNamespace(
+                    dialect_id="future_dialect",
+                    resolved_route=route,
+                    connection_identity=identity,
+                ),
+            )
+            deployment = Deployment(
+                deployment_id=None,
+                plan=None,
+                engine=Engine("future-engine"),
+                engine_source="config",
+                api_base=identity.endpoint,
+                endpoints={},
+                topology=None,
+                metrics_url=None,
+                facts=ServingFacts(),
+            )
+            pool = session._create_owned_pool(
+                "model:m",
+                deployment,
+                runtime_plan,
+                models_cfg["m"],
+                nested_args=True,
+            )
+
+        assert scope.retry_policy == "future-sdk:max-retries=5"
+        assert pool.connection is connection
+        assert len(requests) == 1
+        assert requests[0].endpoint == "https://future.example/v1"
+        assert requests[0].credential == "future-secret"
+        assert "future-secret" not in repr(identity)
+
+        await pool.aclose()
+        assert connection.closed is True
+
+    def test_scoring_unknowns_retain_named_request_time_verifier(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+tasks:
+  score:
+    class: fake.ScoreTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=self.CompletionScoringTask,
+        ):
+            prepared = session.prepare_prelaunch()
+
+        result = session.prelaunch_reconcile_result
+        assert result is not None
+        assert prepared is result
+        plan = result.binding_plans["model:m"]
+        assert plan.dialect_id == "openai_completions"
+        assert plan.pending_capabilities == {
+            "input_scoring",
+            "sampled_logprobs",
+            "top_logprobs",
+        }
+        assert session._aggregated_requirements["model:m"].min_top_logprobs == 7
+        checks = result.deployment_plans["model:m"].request_checks
+        assert {check.verifier for check in checks} == {"validate_response_channel"}
+        assert {check.capability for check in checks} == {
+            "input_scoring",
+            "sampled_logprobs",
+            "top_logprobs",
+        }
+
+    @pytest.mark.anyio
+    async def test_invalid_dialect_fails_before_model_setup(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    dialect: openai_chat
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+        setup_models = MagicMock()
+
+        with (
+            patch.object(session, "_setup_models", setup_models),
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            pytest.raises(ValueError, match="input_kind_unsupported"),
+        ):
+            await session._prepare_execution()
+
+        setup_models.assert_not_called()
+
+    def test_explicit_sglang_without_dialect_stays_named_legacy_bypass(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    type: gen
+    engine: sglang
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=self.CompletionTask,
+        ):
+            session._setup_prelaunch_reconciliation()
+
+        assert session._legacy_bypass_bindings == {"model:m"}
+        assert session._normalized_model_bindings["model:m"].dialect_id == (
+            "sglang_legacy"
+        )
+        assert session.prelaunch_reconcile_result is not None
+        assert not session.prelaunch_reconcile_result.binding_plans
+
+    def test_explicit_sglang_uses_native_dialect_when_binder_is_active(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    type: gen
+    engine: sglang
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+        models_cfg = session._get_named_config_map("models")
+        provisional = session._provisional_named_binding("m", models_cfg)
+        assert provisional.dialect_id is None
+
+        with patch(
+            "sieval.cli.leaderboard.session.dialect_is_bindable",
+            return_value=True,
+        ) as bindable:
+            binding = session._finalize_named_binding(provisional, "gen", models_cfg)
+
+        bindable.assert_called_once_with("sglang_native")
+        assert binding.dialect_id == "sglang_native"
+
+    def test_sglang_legacy_bypass_rejects_capability_declarations(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    type: gen
+    engine: sglang
+    capabilities:
+      input_scoring: true
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            pytest.raises(ValueError, match="sglang_legacy bypass"),
+        ):
+            session._setup_prelaunch_reconciliation()
+
+    def test_model_args_cannot_repeat_canonical_reasoning(self, tmp_path: Path) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    dialect: openai_chat
+    capabilities:
+      reasoning:
+        effort: high
+    args:
+      reasoning_effort: high
+tasks:
+  chat:
+    class: fake.ChatTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ChatTask,
+            ),
+            pytest.raises(
+                ValueError,
+                match=(
+                    r"models\.m\.capabilities and models\.m\.args.*"
+                    r"reasoning via reasoning_effort"
+                ),
+            ),
+        ):
+            session.prepare_prelaunch()
+
+    def test_inherited_capability_conflicts_with_derived_model_args(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  base:
+    name: org/model
+    dialect: openai_chat
+    capabilities:
+      reasoning: false
+  derived:
+    base: base
+    args:
+      reasoning_effort: low
+tasks:
+  chat:
+    class: fake.ChatTask
+    dataset:
+      class: fake.Dataset
+    model: derived
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ChatTask,
+            ),
+            pytest.raises(
+                ValueError,
+                match=(
+                    r"models\.derived\.capabilities and models\.derived\.args.*"
+                    r"reasoning via reasoning_effort"
+                ),
+            ),
+        ):
+            session.prepare_prelaunch()
+
+    @pytest.mark.parametrize(
+        ("capability", "legacy_key", "legacy_value", "dialect", "task_class"),
+        [
+            ("function_tools", "tools", [], "openai_chat", ChatTask),
+            (
+                "structured_output",
+                "response_format",
+                {"type": "json_object"},
+                "openai_chat",
+                ChatTask,
+            ),
+            ("input_scoring", "echo", False, "openai_completions", CompletionTask),
+            (
+                "stateful_session",
+                "session_id",
+                "prior-response",
+                "openai_chat",
+                ChatTask,
+            ),
+            ("fim", "suffix", "tail", "openai_completions", CompletionTask),
+        ],
+    )
+    def test_infer_args_cannot_repeat_canonical_capability(
+        self,
+        tmp_path: Path,
+        capability: str,
+        legacy_key: str,
+        legacy_value: object,
+        dialect: str,
+        task_class: type,
+    ) -> None:
+        config = {
+            "models": {
+                "m": {
+                    "name": "org/model",
+                    "dialect": dialect,
+                    # false is still an explicit canonical owner; allowing a
+                    # legacy argument to override it would restore last-wins.
+                    "capabilities": {capability: False},
+                }
+            },
+            "tasks": {
+                "eval": {
+                    "class": "fake.Task",
+                    "dataset": {"class": "fake.Dataset"},
+                    "model": "m",
+                    "infer_args": {legacy_key: legacy_value},
+                }
+            },
+        }
+        config_path = self._config(tmp_path, yaml.safe_dump(config, sort_keys=False))
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=task_class,
+            ),
+            pytest.raises(
+                ValueError,
+                match=rf"tasks\.eval\.infer_args.*{capability} via {legacy_key}",
+            ),
+        ):
+            session.prepare_prelaunch()
+
+    def test_sampling_infer_args_remain_outside_capability_ambiguity(
+        self, tmp_path: Path
+    ) -> None:
+        config = {
+            "models": {
+                "m": {
+                    "name": "org/model",
+                    "dialect": "openai_chat",
+                    "capabilities": {"reasoning": False},
+                }
+            },
+            "tasks": {
+                "chat": {
+                    "class": "fake.ChatTask",
+                    "dataset": {"class": "fake.Dataset"},
+                    "model": "m",
+                    "infer_args": {
+                        "temperature": 0.7,
+                        "top_p": 0.9,
+                        "top_k": 40,
+                        "max_tokens": 128,
+                        "stop": ["done"],
+                        "seed": 7,
+                    },
+                }
+            },
+        }
+        config_path = self._config(tmp_path, yaml.safe_dump(config, sort_keys=False))
+        session = EvalSession(config_path)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=self.ChatTask,
+        ):
+            result = session.prepare_prelaunch()
+
+        assert result.is_valid
+
+    def test_active_infer_args_enter_reconcile_before_runtime(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    dialect: openai_completions
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+    infer_args:
+      reasoning_effort: high
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            pytest.raises(ValueError, match=r"dialect_unsupported.*reasoning"),
+        ):
+            session.prepare_prelaunch()
+
+    def test_active_model_args_enter_reconcile_before_runtime(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    dialect: openai_completions
+    args:
+      response_format:
+        type: json_object
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            pytest.raises(
+                ValueError,
+                match=r"dialect_unsupported.*structured_output",
+            ),
+        ):
+            session.prepare_prelaunch()
+
+    def test_infer_logprobs_contributes_numeric_minimum(self, tmp_path: Path) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    dialect: openai_chat
+tasks:
+  chat:
+    class: fake.ChatTask
+    dataset:
+      class: fake.Dataset
+    model: m
+    infer_args:
+      logprobs: 8
+""",
+        )
+        session = EvalSession(config_path)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=self.ChatTask,
+        ):
+            result = session.prepare_prelaunch()
+
+        plan = result.binding_plans["model:m"]
+        assert plan.required_capabilities >= {
+            "sampled_logprobs",
+            "top_logprobs",
+        }
+        assert plan.capability_minimums["top_logprobs"] == {"minimum": 8}
+        assert {
+            check.capability
+            for check in result.deployment_plans["model:m"].request_checks
+        } == {"sampled_logprobs", "top_logprobs"}
+
+    def test_inline_grader_is_normalized_before_task_construction(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      grader:
+        model: org/grader
+        api_base: https://grader.example/v1
+        api_key: secret-value
+        temperature: 0
+""",
+        )
+        session = EvalSession(config_path)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=self.JudgeTask,
+        ):
+            session._setup_prelaunch_reconciliation()
+
+        context = session._task_requirement_contexts["judged"]
+        assert "grader" not in context.task_args
+        grader = context.model_bindings["grader"]
+        assert isinstance(grader, InlineModelBinding)
+        assert grader.dialect_id == "openai_chat"
+        assert "api_key" not in grader.config
+        grader_source = cast(
+            dict[str, object],
+            session._task_role_model_sources["judged"]["grader"],
+        )
+        assert grader_source["api_key"] == "secret-value"
+        assert {record.role for record in session._task_model_requirements} == {
+            "candidate",
+            "grader",
+        }
+        result = session.prelaunch_reconcile_result
+        assert result is not None
+        assert set(result.binding_plans) == {
+            "model:candidate",
+            grader.binding_id,
+        }
+
+    @pytest.mark.anyio
+    async def test_postlaunch_binds_pool_per_identity_and_shares_root_limiter(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import Deployment, Engine, GenModel, ServingFacts
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  leaf:
+    base: derived
+    type: gen
+    args:
+      temperature: 0.3
+  base:
+    name: org/model
+    type: gen
+    api_base: https://configured.example/v1
+    api_key: local
+    service_role: decode
+    args:
+      concurrency_limit: 8
+      temperature: 0.1
+  derived:
+    base: base
+    type: gen
+    service_role: prefill
+    args:
+      concurrency_limit: 2
+      temperature: 0.2
+tasks:
+  root_task:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: base
+  child_task:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: derived
+  leaf_task:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: leaf
+""",
+        )
+        realized = Deployment(
+            deployment_id=None,
+            plan=None,
+            engine=Engine("vllm"),
+            engine_source="deployment",
+            api_base="https://realized.example/v1",
+            endpoints={
+                "prefill": "https://prefill.example/v1",
+                "decode": "https://decode.example/v1",
+            },
+            topology=None,
+            metrics_url=None,
+            facts=ServingFacts(engine_version="test"),
+        )
+        session = EvalSession(
+            config_path,
+            realized_deployments={"base": realized},
+        )
+        closes = [AsyncMock(), AsyncMock()]
+        connections = [types.SimpleNamespace(close=close) for close in closes]
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI",
+                side_effect=connections,
+            ) as client_factory,
+        ):
+            session._setup_prelaunch_reconciliation()
+            session._setup_postlaunch_reconciliation()
+            session._setup_models()
+
+        base = session.models["base"]
+        derived = session.models["derived"]
+        leaf = session.models["leaf"]
+        assert isinstance(base, GenModel)
+        assert isinstance(derived, GenModel)
+        assert isinstance(leaf, GenModel)
+        assert base.pool is not derived.pool
+        assert derived.pool is leaf.pool
+        assert base.pool.shared_limiter is derived.pool.shared_limiter
+        assert base.deployment is realized
+        assert base.runtime_plan is not None
+        assert derived.runtime_plan is not None
+        assert leaf.runtime_plan is not None
+        assert base.runtime_plan.binding_id == "model:base"
+        assert derived.runtime_plan.binding_id == "model:derived"
+        assert leaf.runtime_plan.binding_id == "model:leaf"
+        assert base._kwargs["temperature"] == 0.1
+        assert derived._kwargs["temperature"] == 0.2
+        assert leaf._kwargs["temperature"] == 0.3
+        assert derived._parent_limiter is derived.pool.shared_limiter
+        assert leaf._limiter is derived._limiter
+        assert leaf._parent_limiter is derived.pool.shared_limiter
+        assert len(session._owned_pools) == 2
+        assert {call.kwargs["base_url"] for call in client_factory.call_args_list} == {
+            "https://decode.example/v1",
+            "https://prefill.example/v1",
+        }
+        assert all(
+            call.kwargs["api_key"] == "local" and call.kwargs["max_retries"] == 3
+            for call in client_factory.call_args_list
+        )
+
+        await session._close_owned_model_resources()
+        await session._close_owned_model_resources()
+        for close in closes:
+            close.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_managed_pre_and_postlaunch_keep_connection_scope_identity(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import Deployment, Engine, ServingFacts
+        from sieval.infer import deployment_plan_projection
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  base:
+    name: org/model
+    type: gen
+    max_retries: 9
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: base
+""",
+        )
+        raw_plan = {
+            "backend": "vllm",
+            "checkpoint": "/models/org-model",
+            "assignments": [],
+        }
+        plan = deployment_plan_projection(raw_plan)
+        realized = Deployment(
+            deployment_id="served-base",
+            plan=plan,
+            engine=Engine("vllm"),
+            engine_source="deployment",
+            api_base="https://realized.example/v1",
+            endpoints={},
+            topology=None,
+            metrics_url=None,
+            facts=ServingFacts(engine_version="test"),
+        )
+        session = EvalSession(
+            config_path,
+            infer_plans={"base": raw_plan},
+            realized_deployments={"base": realized},
+        )
+        close = AsyncMock()
+        connection = types.SimpleNamespace(close=close)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=self.CompletionTask,
+        ):
+            prelaunch = session.prepare_prelaunch()
+            pre_binding = prelaunch.binding_plans["model:base"]
+            assert pre_binding.connection_scope.credential_scope == (
+                "model:base:managed-local-credential"
+            )
+            assert pre_binding.connection_scope.retry_policy == (
+                "openai-sdk:max-retries=9"
+            )
+            session._setup_postlaunch_reconciliation()
+
+        postlaunch = session.postlaunch_reconcile_result
+        assert postlaunch is not None
+        post_binding = postlaunch.binding_plans["model:base"]
+        runtime = postlaunch.runtime_plans["model:base"]
+        assert post_binding.fingerprint == pre_binding.fingerprint
+        assert runtime.binding_plan_fingerprint == pre_binding.fingerprint
+        assert runtime.connection_identity.credential_scope == (
+            pre_binding.connection_scope.credential_scope
+        )
+        assert runtime.connection_identity.retry_policy == (
+            pre_binding.connection_scope.retry_policy
+        )
+        assert runtime.connection_identity.quota_scope == (
+            pre_binding.connection_scope.quota_scope
+        )
+        assert runtime.connection_identity.endpoint == "https://realized.example/v1"
+
+        with patch(
+            "sieval.core.models.connection_factory.AsyncOpenAI",
+            return_value=connection,
+        ) as client_factory:
+            session._setup_models()
+        client_factory.assert_called_once_with(
+            base_url="https://realized.example/v1",
+            api_key=None,
+            max_retries=9,
+        )
+        await session._close_owned_model_resources()
+        close.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("api_key", "child-key"),
+            ("api_base", "https://child.example/v1"),
+            ("engine", "sglang"),
+            ("max_retries", 7),
+            ("connection_family", "native-http"),
+            ("authorization", "Bearer secret"),
+        ],
+    )
+    def test_derived_model_cannot_override_root_binding_resources(
+        self, tmp_path: Path, field: str, value: object
+    ) -> None:
+        config = {
+            "models": {
+                "base": {
+                    "name": "org/model",
+                    "type": "gen",
+                    "api_base": "https://base.example/v1",
+                    "api_key": "base-key",
+                },
+                "child": {"base": "base", "type": "gen", field: value},
+            },
+            "tasks": {
+                "completion": {
+                    "class": "fake.CompletionTask",
+                    "dataset": {"class": "fake.Dataset"},
+                    "model": "child",
+                }
+            },
+        }
+        config_path = self._config(tmp_path, yaml.safe_dump(config, sort_keys=False))
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            pytest.raises(ValueError, match="places binding resource"),
+        ):
+            session.prepare_prelaunch()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("api_key", "child-key"),
+            ("api_base", "https://child.example/v1"),
+            ("max_retries", 7),
+            ("connection_family", "native-http"),
+            ("authorization", "Bearer secret"),
+        ],
+    )
+    def test_derived_model_args_cannot_override_root_binding_resources(
+        self, tmp_path: Path, field: str, value: object
+    ) -> None:
+        config = {
+            "models": {
+                "base": {
+                    "name": "org/model",
+                    "type": "gen",
+                    "api_base": "https://base.example/v1",
+                },
+                "child": {
+                    "base": "base",
+                    "type": "gen",
+                    "args": {field: value},
+                },
+            },
+            "tasks": {
+                "completion": {
+                    "class": "fake.CompletionTask",
+                    "dataset": {"class": "fake.Dataset"},
+                    "model": "child",
+                }
+            },
+        }
+        config_path = self._config(tmp_path, yaml.safe_dump(config, sort_keys=False))
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            pytest.raises(ValueError, match=rf"args\.{field}"),
+        ):
+            session.prepare_prelaunch()
+
+    def test_task_infer_args_cannot_change_connection_family(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+tasks:
+  chat:
+    class: fake.ChatTask
+    dataset:
+      class: fake.Dataset
+    model: m
+    infer_args:
+      connection_family: native-http
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ChatTask,
+            ),
+            pytest.raises(
+                ValueError, match="infer_args cannot change.*connection_family"
+            ),
+        ):
+            session.prepare_prelaunch()
+
+    def test_inline_grader_rejects_authorization_before_redaction(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      grader:
+        model: org/grader
+        api_base: https://grader.example/v1
+        authorization: Bearer-secret
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.JudgeTask,
+            ),
+            pytest.raises(ValueError, match="inline grader.*authorization"),
+        ):
+            session.prepare_prelaunch()
+
+    def test_inline_grader_rejects_non_string_engine(self, tmp_path: Path) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      grader:
+        model: org/grader
+        engine: 17
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.JudgeTask,
+            ),
+            pytest.raises(TypeError, match="Inline binding.*engine"),
+        ):
+            session.prepare_prelaunch()
+
+    @pytest.mark.anyio
+    async def test_postlaunch_inline_grader_gets_own_pool_and_role_binding(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import ChatModel
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+    api_base: https://candidate.example/v1
+    api_key: candidate-key
+tasks:
+  judged:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      grader:
+        model: org/grader
+        api_base: https://grader.example/v1
+        api_key: grader-key
+        temperature: 0
+""",
+        )
+        session = EvalSession(config_path)
+        closes = [AsyncMock(), AsyncMock()]
+        connections = [types.SimpleNamespace(close=close) for close in closes]
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.JudgeTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI",
+                side_effect=connections,
+            ) as client_factory,
+        ):
+            session._setup_prelaunch_reconciliation()
+            session._setup_postlaunch_reconciliation()
+            session._setup_models()
+
+        grader = session._bound_task_role_models["judged"]["grader"]
+        assert isinstance(session.models["candidate"], ChatModel)
+        assert isinstance(grader, ChatModel)
+        assert grader is not session.models["candidate"]
+        assert grader.pool is not session.models["candidate"].pool
+        assert len(session._owned_pools) == 2
+        assert {call.kwargs["base_url"] for call in client_factory.call_args_list} == {
+            "https://candidate.example/v1",
+            "https://grader.example/v1",
+        }
+
+        await session._close_owned_model_resources()
+        for close in closes:
+            close.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_external_grader_pool_is_borrowed_not_closed(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import ChatModel
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+    api_base: https://candidate.example/v1
+    api_key: candidate-key
+tasks:
+  judged:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args: {}
+""",
+        )
+        external = ChatModel(
+            model="org/external-grader",
+            api_base="https://external.example/v1",
+            api_key="external-key",
+        )
+        session = EvalSession(config_path)
+        tasks = session.config["tasks"]
+        assert isinstance(tasks, dict)
+        task = tasks["judged"]
+        args = task["args"]
+        assert isinstance(args, dict)
+        args["grader"] = external
+        candidate_close = AsyncMock()
+        candidate_connection = types.SimpleNamespace(close=candidate_close)
+        external_close = AsyncMock()
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.JudgeTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI",
+                return_value=candidate_connection,
+            ),
+            patch.object(external.pool, "aclose", external_close),
+        ):
+            session._setup_prelaunch_reconciliation()
+            session._setup_postlaunch_reconciliation()
+            session._setup_models()
+            rebound = session._bound_task_role_models["judged"]["grader"]
+            assert rebound is not external
+            assert rebound.pool is external.pool
+            assert rebound.runtime_plan is not None
+            postlaunch = session.postlaunch_reconcile_result
+            assert postlaunch is not None
+            assert external.runtime_plan is not None
+            assert (
+                rebound.runtime_plan
+                is postlaunch.runtime_plans[external.runtime_plan.binding_id]
+            )
+            assert external.pool not in session._owned_pools.values()
+            await session._close_owned_model_resources()
+
+        candidate_close.assert_awaited_once()
+        external_close.assert_not_awaited()
+        await external._client.close()
+
+    @pytest.mark.anyio
+    async def test_external_runtime_plan_preserves_request_safety_checks(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import GenModel
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.ScoringJudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args: {}
+""",
+        )
+        external = GenModel(
+            model="org/external-grader",
+            api_base="https://external.example/v1",
+            api_key="external-key",
+        )
+        assert external.runtime_plan is not None
+        guarded_plan = dataclasses.replace(
+            external.runtime_plan,
+            request_checks=(
+                DeferredCheck(
+                    "top_logprobs",
+                    CheckStage.REQUEST,
+                    "validate_response_channel",
+                    "preserve the caller's established response guard",
+                ),
+            ),
+        )
+        guarded_external = external.with_dialect(guarded_plan.dialect_id, guarded_plan)
+        session = EvalSession(config_path)
+        task = cast(dict, cast(dict, session.config["tasks"])["judged"])
+        cast(dict, task["args"])["grader"] = guarded_external
+
+        try:
+            with patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ScoringJudgeTask,
+            ):
+                prelaunch = session.prepare_prelaunch()
+                session._setup_postlaunch_reconciliation()
+
+            binding_id = guarded_plan.binding_id
+            prelaunch_plan = prelaunch.runtime_plans[binding_id]
+            postlaunch = session.postlaunch_reconcile_result
+            assert postlaunch is not None
+            postlaunch_plan = postlaunch.runtime_plans[binding_id]
+            expected = {"input_scoring", "sampled_logprobs", "top_logprobs"}
+            assert {
+                check.capability for check in prelaunch_plan.request_checks
+            } == expected
+            assert postlaunch_plan.request_checks == prelaunch_plan.request_checks
+            assert postlaunch_plan.capability_minimums["top_logprobs"] == {"minimum": 1}
+        finally:
+            await external.aclose()
+
+    @pytest.mark.anyio
+    async def test_custom_reconciler_cannot_erase_external_baseline(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import GenModel
+
+        class BlindReconciler:
+            def reconcile(self, requirements, deployment):
+                del deployment
+                return {
+                    requirement.capability: Configured(evidence={"probe": "ok"})
+                    for requirement in requirements
+                }
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.ScoringJudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args: {}
+""",
+        )
+        external = GenModel(
+            model="org/external-grader",
+            api_base="https://external.example/v1",
+            api_key="external-key",
+        )
+        assert external.runtime_plan is not None
+        guarded_plan = dataclasses.replace(
+            external.runtime_plan,
+            request_checks=(
+                DeferredCheck(
+                    "top_logprobs",
+                    CheckStage.REQUEST,
+                    "validate_response_channel",
+                    "preserve the caller's established response guard",
+                ),
+            ),
+        )
+        guarded_external = external.with_dialect(guarded_plan.dialect_id, guarded_plan)
+        session = EvalSession(config_path, serving_reconciler=BlindReconciler())
+        task = cast(dict, cast(dict, session.config["tasks"])["judged"])
+        cast(dict, task["args"])["grader"] = guarded_external
+
+        try:
+            with patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ScoringJudgeTask,
+            ):
+                result = session.prepare_prelaunch()
+
+            rebound = result.runtime_plans[guarded_plan.binding_id]
+            assert guarded_plan.request_checks[0] in rebound.request_checks
+            evidence = result.deployment_plans[
+                guarded_plan.root_deployment_key
+            ].outcome_evidence["top_logprobs"]
+            assert evidence["plan_fingerprints"] == [guarded_plan.fingerprint]
+            assert evidence["injected_reconciler"] == {"probe": "ok"}
+        finally:
+            await external.aclose()
+
+    @pytest.mark.anyio
+    async def test_external_bindings_can_share_root_with_distinct_plans(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import GenModel
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged_a:
+    class: fake.ScoringJudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args: {}
+  judged_b:
+    class: fake.ScoringJudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args: {}
+""",
+        )
+        external = GenModel(
+            model="org/external-grader",
+            api_base="https://external.example/v1",
+            api_key="external-key",
+        )
+        assert external.runtime_plan is not None
+        top_check = DeferredCheck(
+            "top_logprobs",
+            CheckStage.REQUEST,
+            "validate_response_channel",
+            "first binding guard",
+        )
+        input_check = DeferredCheck(
+            "input_scoring",
+            CheckStage.REQUEST,
+            "validate_response_channel",
+            "second binding guard",
+        )
+        first_plan = dataclasses.replace(
+            external.runtime_plan,
+            request_checks=(top_check,),
+        )
+        second_plan = dataclasses.replace(
+            external.runtime_plan,
+            binding_id=f"{external.runtime_plan.binding_id}:sibling",
+            binding_plan_fingerprint="external:sibling-binding",
+            request_checks=(input_check,),
+        )
+        first = external.with_dialect(first_plan.dialect_id, first_plan)
+        second = external.with_dialect(second_plan.dialect_id, second_plan)
+        session = EvalSession(config_path)
+        tasks = cast(dict, session.config["tasks"])
+        cast(dict, cast(dict, tasks["judged_a"])["args"])["grader"] = first
+        cast(dict, cast(dict, tasks["judged_b"])["args"])["grader"] = second
+
+        try:
+            with patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ScoringJudgeTask,
+            ):
+                result = session.prepare_prelaunch()
+
+            assert first_plan.binding_id in result.runtime_plans
+            assert second_plan.binding_id in result.runtime_plans
+            for binding_id in (first_plan.binding_id, second_plan.binding_id):
+                rebound = result.runtime_plans[binding_id]
+                assert top_check in rebound.request_checks
+                assert input_check in rebound.request_checks
+            evidence = result.deployment_plans[
+                first_plan.root_deployment_key
+            ].outcome_evidence["top_logprobs"]
+            assert evidence["plan_fingerprints"] == sorted(
+                [first_plan.fingerprint, second_plan.fingerprint]
+            )
+        finally:
+            await external.aclose()
+
+    @pytest.mark.anyio
+    async def test_external_postlaunch_rejects_evidence_drift(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import GenModel
+
+        class StatefulReconciler:
+            def __init__(self) -> None:
+                self.calls: dict[str, int] = {}
+
+            def reconcile(self, requirements, deployment):
+                round_ = self.calls.get(deployment.root_deployment_key, 0) + 1
+                self.calls[deployment.root_deployment_key] = round_
+                return {
+                    requirement.capability: Configured(
+                        evidence={"observation_round": round_}
+                    )
+                    for requirement in requirements
+                }
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.ScoringJudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args: {}
+""",
+        )
+        external = GenModel(
+            model="org/external-grader",
+            api_base="https://external.example/v1",
+            api_key="external-key",
+        )
+        session = EvalSession(
+            config_path,
+            serving_reconciler=StatefulReconciler(),
+        )
+        task = cast(dict, cast(dict, session.config["tasks"])["judged"])
+        cast(dict, task["args"])["grader"] = external
+
+        try:
+            with patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ScoringJudgeTask,
+            ):
+                session.prepare_prelaunch()
+                with pytest.raises(
+                    RuntimeError,
+                    match="changed serving evidence or checks",
+                ):
+                    session._setup_postlaunch_reconciliation()
+        finally:
+            await external.aclose()
+
+    @pytest.mark.anyio
+    async def test_sglang_legacy_remains_outside_runtime_plans(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import SglangGenModel
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  m:
+    name: org/model
+    type: gen
+    engine: sglang
+    api_base: https://sglang.example/v1
+    api_key: local
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+        close = AsyncMock()
+        connection = types.SimpleNamespace(
+            close=close,
+            base_url="https://sglang.example/v1",
+        )
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            patch(
+                "sieval.core.models.sglang_gen_model.AsyncOpenAI",
+                return_value=connection,
+            ),
+        ):
+            session._setup_prelaunch_reconciliation()
+            session._setup_postlaunch_reconciliation()
+            session._setup_models()
+
+        assert session.postlaunch_reconcile_result is not None
+        assert not session.postlaunch_reconcile_result.runtime_plans
+        assert isinstance(session.models["m"], SglangGenModel)
+        assert not session._owned_pools
+        assert set(session._owned_legacy_models) == {"model:m"}
+
+        await session._close_owned_model_resources()
+        close.assert_awaited_once()
+
+
 class TestEvalSessionWrappers:
     @pytest.mark.anyio
     async def test_arun_session_delegates_to_runner(self):
@@ -1677,6 +3219,7 @@ class TestEvalSessionWrappers:
             infer_plans=None,
             invocation=None,
             self_managed_endpoints=frozenset(),
+            realized_deployments=None,
         )
         assert result == {"task_a": {"ok": True}}
 
@@ -1707,6 +3250,7 @@ class TestEvalSessionWrappers:
             infer_plans=None,
             invocation=None,
             self_managed_endpoints=frozenset(),
+            realized_deployments=None,
         )
         assert result == {"task_a": {"ok": True}}
 
@@ -1734,11 +3278,12 @@ class TestEvalSessionWrappers:
             None,
             None,
             frozenset(),
+            None,
         )
         assert result == {"task_b": {"ok": True}}
 
     @pytest.mark.anyio
-    async def test_arun_session_forwards_endpoint_map_and_infer_plans(self):
+    async def test_arun_session_forwards_legacy_external_endpoint_adapter(self):
         fake_arun = AsyncMock(return_value={"t": {}})
         fake_runner = types.SimpleNamespace(arun=fake_arun)
         endpoint_map = {"m": "http://host:8000/v1"}
@@ -1764,9 +3309,12 @@ class TestEvalSessionWrappers:
             infer_plans=plans,
             invocation=None,
             self_managed_endpoints=frozenset(),
+            realized_deployments=None,
         )
 
-    def test_run_session_forwards_endpoint_map_and_infer_plans_positionally(self):
+    def test_run_session_forwards_legacy_external_endpoint_adapter_positionally(
+        self,
+    ):
         with patch("sieval.cli.leaderboard.session.anyio.run") as run_mock:
             run_mock.return_value = {}
             endpoint_map = {"m": "http://host:8000/v1"}
@@ -1788,6 +3336,7 @@ class TestEvalSessionWrappers:
             plans,
             None,
             frozenset(),
+            None,
         )
 
     def test_eval_session_run_calls_anyio_run(self):
@@ -1816,6 +3365,64 @@ class TestEvalSessionWrappers:
             pytest.raises(RuntimeError, match="Runner not initialized"),
         ):
             await runner.arun()
+
+    @pytest.mark.anyio
+    async def test_arun_closes_owned_pool_once_when_runner_fails(self):
+        runner = object.__new__(EvalSession)
+        runner.runner = types.SimpleNamespace(
+            arun=AsyncMock(side_effect=RuntimeError("evaluation failed"))
+        )
+        pool = types.SimpleNamespace(aclose=AsyncMock())
+        runner._owned_pools = {"model:m": pool}
+        runner._owned_legacy_models = {}
+
+        with (
+            patch.object(runner, "_prepare_execution", AsyncMock(return_value=None)),
+            patch.object(
+                runner, "_persist_effective_config", AsyncMock(return_value=None)
+            ),
+            patch.object(runner, "_persist_infer_plans", AsyncMock(return_value=None)),
+            pytest.raises(RuntimeError, match="evaluation failed"),
+        ):
+            await runner.arun()
+
+        pool.aclose.assert_awaited_once()
+        await runner._close_owned_model_resources()
+        pool.aclose.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_cleanup_deduplicates_same_pool_registered_under_two_roots(self):
+        runner = object.__new__(EvalSession)
+        pool = types.SimpleNamespace(aclose=AsyncMock())
+        runner._owned_pools = {"model:a": pool, "model:b": pool}
+        runner._owned_legacy_models = {}
+
+        await runner._close_owned_model_resources()
+
+        pool.aclose.assert_awaited_once()
+        assert not runner._owned_pools
+
+    @pytest.mark.anyio
+    async def test_cleanup_continues_after_first_close_error_and_does_not_retry(self):
+        runner = object.__new__(EvalSession)
+        first = types.SimpleNamespace(
+            aclose=AsyncMock(side_effect=RuntimeError("first close failed"))
+        )
+        second = types.SimpleNamespace(aclose=AsyncMock())
+        legacy = types.SimpleNamespace(aclose=AsyncMock())
+        runner._owned_pools = {"model:a": first, "model:b": second}
+        runner._owned_legacy_models = {"model:legacy": legacy}
+
+        with pytest.raises(RuntimeError, match="first close failed"):
+            await runner._close_owned_model_resources()
+
+        first.aclose.assert_awaited_once()
+        second.aclose.assert_awaited_once()
+        legacy.aclose.assert_awaited_once()
+        await runner._close_owned_model_resources()
+        first.aclose.assert_awaited_once()
+        second.aclose.assert_awaited_once()
+        legacy.aclose.assert_awaited_once()
 
 
 # ===================================================================
@@ -2067,17 +3674,49 @@ class TestDeterministicMode:
     are first-class.
     """
 
-    def _make_setup_models_runner(self, config: dict) -> EvalSession:
-        """Create a minimal EvalSession for _setup_models tests."""
-        runner = object.__new__(EvalSession)
-        runner.config = config
-        runner.model_override = None
-        runner.resume_override = False
-        runner.models = {}
-        runner.datasets = {}
-        runner.runner = None
-        runner.deterministic = config.get("deterministic", False)
-        return runner
+    class ChatTask:
+        model_type = "chat"
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="deterministic_test",
+                ),
+            )
+
+    def _bind_models(self, tmp_path: Path, config: dict) -> EvalSession:
+        """Exercise the same prelaunch -> postlaunch -> bind path as a run."""
+
+        config.setdefault("tasks", {})["eval"] = {
+            "class": "fake.ChatTask",
+            "dataset": {"class": "fake.Dataset"},
+            "model": next(reversed(config["models"])),
+        }
+        config_path = _write_yaml_config(
+            tmp_path,
+            "deterministic.yaml",
+            yaml.safe_dump(config, sort_keys=False),
+        )
+        session = EvalSession(config_path)
+        connection = types.SimpleNamespace(close=AsyncMock())
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ChatTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI",
+                return_value=connection,
+            ),
+        ):
+            session._setup_prelaunch_reconciliation()
+            session._setup_postlaunch_reconciliation()
+            session._setup_models()
+        return session
 
     # ------------------------------------------------------------------
     # EvalSession resolves deterministic internally: the kwarg is the
@@ -2123,24 +3762,21 @@ class TestDeterministicMode:
     # seed: required key, injected if absent, user value preserved
     # ------------------------------------------------------------------
 
-    def test_seed_auto_injected_when_absent(self):
+    def test_seed_auto_injected_when_absent(self, tmp_path):
         """Deterministic mode injects seed=0 when user doesn't specify."""
-        runner = self._make_setup_models_runner(
+        session = self._bind_models(
+            tmp_path,
             {
                 "deterministic": True,
                 "models": {"m1": {"name": "mock-chat", "type": "chat", "args": {}}},
-            }
+            },
         )
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=MagicMock(),
-        ) as MockCls:
-            runner._setup_models()
-        assert MockCls.call_args.kwargs.get("seed") == 0
+        assert session.models["m1"]._kwargs.get("seed") == 0
 
-    def test_seed_user_override_preserved(self):
+    def test_seed_user_override_preserved(self, tmp_path):
         """User's explicit seed=42 is preserved; no injection override."""
-        runner = self._make_setup_models_runner(
+        session = self._bind_models(
+            tmp_path,
             {
                 "deterministic": True,
                 "models": {
@@ -2150,31 +3786,22 @@ class TestDeterministicMode:
                         "args": {"seed": 42},
                     }
                 },
-            }
+            },
         )
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=MagicMock(),
-        ) as MockCls:
-            runner._setup_models()
-        assert MockCls.call_args.kwargs.get("seed") == 42
+        assert session.models["m1"]._kwargs.get("seed") == 42
 
-    def test_no_seed_injection_when_not_deterministic(self):
+    def test_no_seed_injection_when_not_deterministic(self, tmp_path):
         """seed is NOT auto-injected when deterministic=False."""
-        runner = self._make_setup_models_runner(
+        session = self._bind_models(
+            tmp_path,
             {
                 "deterministic": False,
                 "models": {"m1": {"name": "mock-chat", "type": "chat", "args": {}}},
-            }
+            },
         )
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=MagicMock(),
-        ) as MockCls:
-            runner._setup_models()
-        assert "seed" not in MockCls.call_args.kwargs
+        assert "seed" not in session.models["m1"]._kwargs
 
-    def test_derived_model_inherits_injected_seed(self):
+    def test_derived_model_inherits_injected_seed(self, tmp_path):
         """Derived models inherit seed=0 from base via with_args kwarg merge.
 
         seed is injected only on the first (base) pass; derived models pick it
@@ -2182,7 +3809,8 @@ class TestDeterministicMode:
         ``{**base._kwargs, **args}``. Uses a real ``MockChatModel`` so the
         merge is exercised rather than mocked.
         """
-        runner = self._make_setup_models_runner(
+        session = self._bind_models(
+            tmp_path,
             {
                 "deterministic": True,
                 "models": {
@@ -2191,19 +3819,10 @@ class TestDeterministicMode:
                     # no concurrency_limit would just alias base).
                     "child": {"base": "base", "args": {"temperature": 0.7}},
                 },
-            }
+            },
         )
-        # MockChatModel hardcodes model/api_key in its super().__init__; drop
-        # those here so _setup_models's `model=...` kwarg doesn't collide.
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            side_effect=lambda **kw: MockChatModel(
-                **{k: v for k, v in kw.items() if k not in ("model", "api_key")}
-            ),
-        ):
-            runner._setup_models()
-        base = runner.models["base"]
-        child = runner.models["child"]
+        base = session.models["base"]
+        child = session.models["child"]
         assert base._kwargs.get("seed") == 0
         # Derived model keeps seed=0 from base and picks up its own override.
         assert child._kwargs.get("seed") == 0
@@ -2213,9 +3832,10 @@ class TestDeterministicMode:
     # Sampling params: transparent — user configures freely, no lock
     # ------------------------------------------------------------------
 
-    def test_temperature_sampling_allowed(self):
+    def test_temperature_sampling_allowed(self, tmp_path):
         """temperature > 0 is allowed under deterministic mode (seeded sampling)."""
-        runner = self._make_setup_models_runner(
+        session = self._bind_models(
+            tmp_path,
             {
                 "deterministic": True,
                 "models": {
@@ -2225,20 +3845,16 @@ class TestDeterministicMode:
                         "args": {"temperature": 0.6},
                     }
                 },
-            }
+            },
         )
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=MagicMock(),
-        ) as MockCls:
-            runner._setup_models()  # must not raise
-        call_kwargs = MockCls.call_args.kwargs
-        assert call_kwargs.get("temperature") == 0.6
-        assert call_kwargs.get("seed") == 0  # still injected
+        defaults = session.models["m1"]._kwargs
+        assert defaults.get("temperature") == 0.6
+        assert defaults.get("seed") == 0  # still injected
 
-    def test_full_sampling_config_passes_through(self):
+    def test_full_sampling_config_passes_through(self, tmp_path):
         """Full pass@k sampling config (temperature, top_p, top_k) all pass through."""
-        runner = self._make_setup_models_runner(
+        session = self._bind_models(
+            tmp_path,
             {
                 "deterministic": True,
                 "models": {
@@ -2254,36 +3870,27 @@ class TestDeterministicMode:
                         },
                     }
                 },
-            }
+            },
         )
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=MagicMock(),
-        ) as MockCls:
-            runner._setup_models()
-        call_kwargs = MockCls.call_args.kwargs
-        assert call_kwargs.get("temperature") == 0.6
-        assert call_kwargs.get("top_p") == 0.95
-        assert call_kwargs.get("top_k") == 20
-        assert call_kwargs.get("max_tokens") == 32768
-        assert call_kwargs.get("frequency_penalty") == 0.1
-        assert call_kwargs.get("seed") == 0
+        defaults = session.models["m1"]._kwargs
+        assert defaults.get("temperature") == 0.6
+        assert defaults.get("top_p") == 0.95
+        assert defaults.get("top_k") == 20
+        assert defaults.get("max_tokens") == 32768
+        assert defaults.get("frequency_penalty") == 0.1
+        assert defaults.get("seed") == 0
 
-    def test_no_temperature_injection_under_deterministic(self):
+    def test_no_temperature_injection_under_deterministic(self, tmp_path):
         """Deterministic mode does NOT inject temperature (only seed)."""
-        runner = self._make_setup_models_runner(
+        session = self._bind_models(
+            tmp_path,
             {
                 "deterministic": True,
                 "models": {"m1": {"name": "mock-chat", "type": "chat", "args": {}}},
-            }
+            },
         )
-        with patch(
-            "sieval.cli.leaderboard.session.ChatModel",
-            return_value=MagicMock(),
-        ) as MockCls:
-            runner._setup_models()
         # temperature left to engine default — not force-injected to 0.0
-        assert "temperature" not in MockCls.call_args.kwargs
+        assert "temperature" not in session.models["m1"]._kwargs
 
     def test_per_task_infer_args_temperature_allowed(self):
         """Per-task infer_args with temperature > 0 is accepted (no lock)."""
@@ -2956,7 +4563,7 @@ class TestEvalSessionRawConfig:
         assert session.config["deterministic"] is True
         assert session.config["models"]["base"]["args"]["seed"] == 0
 
-    def test_raw_config_unaffected_by_endpoint_map(self, tmp_path):
+    def test_raw_config_unaffected_by_legacy_external_endpoint_adapter(self, tmp_path):
         config_path = _write_yaml_config(
             tmp_path,
             "cfg.yaml",
@@ -2971,6 +4578,36 @@ class TestEvalSessionRawConfig:
         assert (
             session.config["models"]["base"]["api_base"] == "http://localhost:8000/v1"
         )
+
+    def test_rejects_legacy_endpoint_adapter_with_typed_deployment(self, tmp_path):
+        from sieval.core.models import Deployment, Engine, ServingFacts
+
+        config_path = _write_yaml_config(
+            tmp_path,
+            "cfg.yaml",
+            "models:\n  base:\n    path: /ckpts/m\n",
+        )
+        deployment = Deployment(
+            deployment_id=None,
+            plan=None,
+            engine=Engine("vllm"),
+            engine_source="deployment",
+            api_base="http://localhost:8000/v1",
+            endpoints={"full": "http://localhost:8000/v1"},
+            topology=None,
+            metrics_url=None,
+            facts=ServingFacts(),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="legacy endpoint-only adapter.*realized_deployments",
+        ):
+            EvalSession(
+                config_path=str(config_path),
+                endpoint_map={"base": "http://localhost:8000/v1"},
+                realized_deployments={"base": deployment},
+            )
 
     def test_infer_plans_kwarg_is_stored(self, tmp_path):
         config_path = _write_yaml_config(tmp_path, "cfg.yaml", "models: {}\n")

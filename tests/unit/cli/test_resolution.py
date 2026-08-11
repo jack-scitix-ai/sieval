@@ -13,7 +13,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-import yaml
 
 from sieval.cli.resolution import (
     _guess_submodule_names,
@@ -21,6 +20,13 @@ from sieval.cli.resolution import (
     load_class_from_name,
     load_class_from_path,
     resolve_class,
+    resolve_config_model_types,
+)
+from sieval.core.models.requirements import (
+    AggregatedTaskRequirements,
+    InputKind,
+    TaskModelRequirement,
+    TaskRequirements,
 )
 
 # ===================================================================
@@ -208,80 +214,110 @@ class TestGuessSubmoduleNames:
 
 
 class TestDeriveModelType:
-    """`derive_model_type` is shared by the eval session and recipe resolution,
-    so both reach the same answer for one model. Tested directly because
-    `sieval run` calls the function, not the session method."""
+    """The shared resolver accepts only normalized task-side evidence."""
 
-    def test_explicit_type_wins(self):
-        assert derive_model_type("m", "gen", {}) == "gen"
+    @staticmethod
+    def _requirements(*kinds: InputKind) -> AggregatedTaskRequirements:
+        return AggregatedTaskRequirements(
+            input=frozenset(kinds),
+            input_sources={kind: frozenset({f"{kind.value}_task"}) for kind in kinds},
+        )
 
-    def test_defaults_to_chat_with_no_tasks(self):
-        assert derive_model_type("m", None, {}) == "chat"
+    def test_explicit_type_is_fallback_only_without_evidence(self):
+        empty = self._requirements()
+        assert derive_model_type("m", "gen", empty) == "gen"
+        assert derive_model_type("m", None, empty) == "chat"
 
-    def test_rejects_non_mapping_tasks_section(self):
-        """A list-shaped `tasks:` must not surface as an AttributeError.
+    def test_normalized_task_evidence_is_authoritative(self):
+        completion = self._requirements(InputKind.COMPLETION)
+        assert derive_model_type("m", None, completion) == "gen"
+        with pytest.raises(ValueError, match="checked assertion"):
+            derive_model_type("m", "chat", completion)
 
-        The infer layer reaches this before an EvalSession exists, and full
-        config validation only runs under `--dry-run`, so this is the first
-        code to touch the section on a normal `sieval run`. The shapes come
-        from `yaml.safe_load` rather than a literal because that is how an
-        untyped config actually reaches the annotated parameter.
-        """
-        tasks_cfg = yaml.safe_load("tasks:\n  - arc\n  - hellaswag\n")["tasks"]
-        with pytest.raises(ValueError, match="'tasks' configuration must be"):
-            derive_model_type("m", None, tasks_cfg)
+    def test_conflicting_normalized_inputs_report_sources(self):
+        requirements = self._requirements(InputKind.CHAT, InputKind.COMPLETION)
+        with pytest.raises(ValueError, match="conflicting normalized input") as exc:
+            derive_model_type("m", None, requirements)
+        assert "chat_task" in str(exc.value)
+        assert "completion_task" in str(exc.value)
 
-    def test_rejects_non_mapping_task_entry(self):
-        tasks_cfg = yaml.safe_load("tasks:\n  arc: ARCEasyFewShotPplTask\n")["tasks"]
-        with pytest.raises(ValueError, match="'tasks.arc' configuration must be"):
-            derive_model_type("m", None, tasks_cfg)
 
-    def test_infers_gen_from_task_without_explicit_type(self):
-        """The case explicit-only reading would miss: no `type:` in config."""
+class TestResolveConfigModelTypes:
+    """The YAML adapter invokes requirement hooks and delegates kind choice."""
 
-        class FakeTask:
-            model_type = "gen"
+    class MisleadingCompletionTask:
+        model_type = "chat"  # Legacy metadata must not be consulted.
 
-        tasks_cfg = {"t1": {"model": "m", "class": "fake.FakeTask"}}
+        @classmethod
+        def model_requirements_for(cls, context):
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.COMPLETION),
+                    source_task="normalized_completion",
+                ),
+            )
+
+    def test_hook_evidence_flows_through_derived_model_root(self):
+        config = {
+            "models": {
+                "base": {"name": "org/model"},
+                "child": {"base": "base"},
+            },
+            "tasks": {"task": {"model": "child", "class": "fake.CompletionTask"}},
+        }
         with patch(
             "sieval.cli.resolution.resolve_task_class",
-            return_value=FakeTask,
+            return_value=self.MisleadingCompletionTask,
         ):
-            assert derive_model_type("m", None, tasks_cfg) == "gen"
+            result = resolve_config_model_types(config)
 
-    def test_ignores_tasks_pointing_at_other_models(self):
-        class FakeTask:
-            model_type = "gen"
+        assert result.model_types_by_root == {"model:base": "gen"}
+        assert result.model_types_by_config == {"base": "gen", "child": "gen"}
 
-        tasks_cfg = {"t1": {"model": "other", "class": "fake.FakeTask"}}
-        with patch(
-            "sieval.cli.resolution.resolve_task_class",
-            return_value=FakeTask,
+    def test_explicit_type_cannot_override_hook_evidence(self):
+        config = {
+            "models": {"m": {"name": "org/model", "type": "chat"}},
+            "tasks": {"task": {"model": "m", "class": "fake.Task"}},
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.MisleadingCompletionTask,
+            ),
+            pytest.raises(ValueError, match="checked assertion"),
         ):
-            assert derive_model_type("m", None, tasks_cfg) == "chat"
+            resolve_config_model_types(config)
+
+    @pytest.mark.parametrize("tasks", [["arc"], {"arc": "Task"}])
+    def test_rejects_malformed_tasks_mapping(self, tasks):
+        with pytest.raises(ValueError, match="'tasks.*configuration must be"):
+            resolve_config_model_types({"models": {"m": {}}, "tasks": tasks})
 
     @pytest.mark.parametrize(
         "error",
         [ImportError("module not found"), AttributeError("class not found")],
     )
     def test_unresolvable_task_class_is_skipped(self, error):
-        """Validation reports import errors; derivation must not raise here."""
-        tasks_cfg = {"t1": {"model": "m", "class": "missing.Task"}}
+        config = {
+            "models": {"m": {}},
+            "tasks": {"t1": {"model": "m", "class": "missing.Task"}},
+        }
         with patch(
             "sieval.cli.resolution.resolve_task_class",
             side_effect=error,
         ):
-            assert derive_model_type("m", None, tasks_cfg) == "chat"
+            result = resolve_config_model_types(config)
+        assert result.model_types_by_config == {"m": "chat"}
 
     def test_unresolvable_task_does_not_block_resolvable_task(self):
-        """One task failing to resolve must not hide a sibling that succeeds."""
-
-        class GenTask:
-            model_type = "gen"
-
-        tasks_cfg = {
-            "bad_task": {"model": "m", "class": "bad.module.BadTask"},
-            "good_task": {"model": "m", "class": "good.module.GenTask"},
+        config = {
+            "models": {"m": {}},
+            "tasks": {
+                "bad_task": {"model": "m", "class": "bad.module.BadTask"},
+                "good_task": {"model": "m", "class": "good.module.GenTask"},
+            },
         }
 
         call_count = 0
@@ -291,13 +327,14 @@ class TestDeriveModelType:
             call_count += 1
             if call_count == 1:
                 raise ImportError("bad module")
-            return GenTask
+            return self.MisleadingCompletionTask
 
         with patch(
             "sieval.cli.resolution.resolve_task_class",
             side_effect=mock_resolve,
         ):
-            assert derive_model_type("m", None, tasks_cfg) == "gen"
+            result = resolve_config_model_types(config)
+        assert result.model_types_by_config == {"m": "gen"}
         assert call_count == 2
 
 

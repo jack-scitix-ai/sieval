@@ -1,6 +1,6 @@
-"""Unit tests for the provider-agnostic Model IR.
+"""Unit tests for the provider-neutral model Request/Response records.
 
-AI-Generated Code - Claude Fable 5 (Anthropic)
+AI-Generated Code - GPT-5.4 (OpenAI)
 """
 
 import dataclasses
@@ -8,20 +8,36 @@ import dataclasses
 import pytest
 
 from sieval.core.models.ir import (
+    CapabilityEvidence,
+    ChatInput,
+    ChatMessage,
     Citation,
+    CompletionInput,
+    DialectOptions,
     GroundingChunk,
     GroundingMetadata,
+    ImagePart,
     InputScoringResult,
+    ModelIdentity,
+    ModelProvenance,
+    OpaqueContinuation,
     ReasoningOutput,
     ReasoningParams,
     Request,
     Response,
     SamplingParams,
-    ServerToolSpec,
     ServerToolUse,
+    SessionParams,
+    StructuredOutput,
+    StructuredOutputParams,
+    TextPart,
     TokenLogprob,
+    ToolCallPart,
+    ToolResultPart,
     TopKEntry,
     UsageStats,
+    normalize_chat_input,
+    response_field_contract,
 )
 from sieval.core.utils.serialization import (
     dict_to_obj,
@@ -31,95 +47,338 @@ from sieval.core.utils.serialization import (
 
 
 class TestRequestConstruction:
-    def test_minimal_completion_request(self):
-        req = Request(input="hello")
-        assert req.input == "hello"
-        assert req.sampling is None
-        assert req.return_logprobs is False
-        assert req.top_k == 0
-        assert req.score_input is False
-        assert req.session_id is None
-        assert req.extra_wire_params is None
+    def test_minimal_completion_request_uses_group_defaults(self):
+        req = Request(input=CompletionInput("hello"))
+        assert req.input == CompletionInput("hello")
+        assert req.sampling == SamplingParams()
+        assert req.scoring.input_scoring is False
+        assert req.reasoning == ReasoningParams()
+        assert req.dialect_options is None
 
-    def test_chat_request_input_is_message_list(self):
-        req = Request(input=[{"role": "user", "content": "hi"}])
-        assert isinstance(req.input, list)
-        assert req.input[0]["role"] == "user"
+    def test_chat_input_is_explicitly_tagged(self):
+        req = Request(
+            input=ChatInput(
+                (ChatMessage("user", (TextPart("hi"), ImagePart(url="x"))),)
+            )
+        )
+        assert isinstance(req.input, ChatInput)
+        assert isinstance(req.input.messages[0].content[1], ImagePart)
 
-    def test_extra_wire_params_passthrough_field(self):
-        req = Request(input="x", extra_wire_params={"logit_bias": {"1": -100}})
-        assert req.extra_wire_params == {"logit_bias": {"1": -100}}
+    def test_legacy_openai_messages_normalize_once(self):
+        chat = normalize_chat_input(
+            [
+                {"role": "system", "content": "rules"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {"type": "image_url", "image_url": {"url": "https://x"}},
+                    ],
+                },
+            ]
+        )
+        assert chat.messages[0].content == (TextPart("rules"),)
+        assert chat.messages[1].content[1] == ImagePart(url="https://x")
 
-    def test_stream_defaults_to_transport_choice(self):
-        # None → the transport picks (single-shot); pure scheduling knob.
-        assert Request(input="x").stream is None
-        assert Request(input="x", stream=True).stream is True
+    def test_legacy_inline_image_preserves_media_type_and_base64_payload(self):
+        chat = normalize_chat_input(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,YWJj"},
+                        }
+                    ],
+                }
+            ]
+        )
 
-    def test_sampling_params_defaults(self):
-        sp = SamplingParams()
-        assert sp.temperature is None
-        assert sp.n == 1
-        assert sp.stop is None
+        assert chat.messages[0].content == (
+            ImagePart(data="YWJj", media_type="image/png"),
+        )
 
-    def test_reasoning_params_opaque_roundtrip_is_str_or_none(self):
-        rp = ReasoningParams(opaque_roundtrip="sig-abc")
-        assert rp.opaque_roundtrip == "sig-abc"
-        assert ReasoningParams().opaque_roundtrip is None
+    def test_legacy_tool_calls_reject_non_mapping_items(self):
+        with pytest.raises(TypeError, match=r"tool_calls\[1\] must be a mapping"):
+            normalize_chat_input(
+                [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            },
+                            "silently-dropped-before",
+                        ],
+                    }
+                ]
+            )
 
-    def test_server_tool_spec(self):
-        spec = ServerToolSpec(type="web_search", config={"max_uses": 3})
-        req = Request(input="x", server_tools=(spec,))
-        assert req.server_tools is not None
-        assert req.server_tools[0].type == "web_search"
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_legacy_json_values_reject_non_finite_floats(self, value):
+        with pytest.raises(ValueError, match="non-finite"):
+            normalize_chat_input(
+                [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": {"value": value},
+                                },
+                            }
+                        ],
+                    }
+                ]
+            )
+
+    def test_completion_suffix_is_part_of_completion_modality(self):
+        req = Request(input=CompletionInput("prefix", suffix="suffix"))
+        assert isinstance(req.input, CompletionInput)
+        assert req.input.suffix == "suffix"
+
+    def test_dialect_options_are_tagged_and_copied(self):
+        raw = {"min_p": 0.1}
+        options = DialectOptions("openai_completions", raw)
+        raw["min_p"] = 0.9
+        assert options.values == {"min_p": 0.1}
+
+    def test_reasoning_choices_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            ReasoningParams(effort="high", budget_tokens=128)
+
+    def test_opaque_continuation_carries_originating_dialect(self):
+        session = SessionParams(
+            opaque_continuation=OpaqueContinuation("openai_responses", "opaque")
+        )
+        assert session.opaque_continuation is not None
+        assert session.opaque_continuation.dialect_id == "openai_responses"
+
+    @pytest.mark.parametrize(
+        ("dialect_id", "value", "message"),
+        [
+            ("", "opaque", "dialect_id"),
+            ("openai_responses", "", "value"),
+        ],
+    )
+    def test_opaque_continuation_rejects_empty_identity_or_payload(
+        self, dialect_id, value, message
+    ):
+        with pytest.raises(ValueError, match=message):
+            OpaqueContinuation(dialect_id, value)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"url": "https://image", "data": "YWJj"},
+        ],
+    )
+    def test_image_part_requires_exactly_one_payload(self, kwargs):
+        with pytest.raises(ValueError, match="exactly one"):
+            ImagePart(**kwargs)
+
+    def test_chat_input_and_dialect_options_require_nonempty_identity(self):
+        with pytest.raises(ValueError, match="messages"):
+            ChatInput(())
+        with pytest.raises(ValueError, match="dialect_id"):
+            DialectOptions("", {})
+
+    def test_legacy_plain_string_content_part_is_normalized(self):
+        chat = normalize_chat_input([{"role": "user", "content": ["plain text"]}])
+
+        assert chat.messages[0].content == (TextPart("plain text"),)
+
+    @pytest.mark.parametrize(
+        ("content", "message"),
+        [
+            ([7], "content part must be a mapping"),
+            ([{"type": "text", "text": 7}], "string `text`"),
+            ([{"type": "image_url"}], "string URL or data"),
+            (
+                [{"type": "image_url", "image_url": "data:image/png,raw"}],
+                "base64 encoding",
+            ),
+            ([{"type": "function_call", "name": "tool"}], "string id and name"),
+            (
+                [{"type": "tool_result", "content": "result"}],
+                "string tool_call_id",
+            ),
+            ([{"type": "unknown"}], "unsupported chat content part"),
+        ],
+    )
+    def test_legacy_content_parts_fail_loudly(self, content, message):
+        with pytest.raises((TypeError, ValueError), match=message):
+            normalize_chat_input([{"role": "user", "content": content}])
+
+    def test_flattened_tool_call_and_result_parts_are_normalized(self):
+        chat = normalize_chat_input(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call-1",
+                            "name": "lookup",
+                            "arguments": ("x", 1),
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "function_result",
+                            "call_id": "call-1",
+                            "result": {"ok": True},
+                            "is_error": True,
+                        }
+                    ],
+                },
+            ]
+        )
+
+        assert chat.messages[0].content == (ToolCallPart("call-1", "lookup", ["x", 1]),)
+        assert chat.messages[1].content == (
+            ToolResultPart("call-1", {"ok": True}, True),
+        )
+
+    @pytest.mark.parametrize(
+        ("arguments", "message"),
+        [({1: "bad"}, "keys must be strings"), (object(), "JSON-compatible")],
+    )
+    def test_legacy_tool_arguments_must_be_json_compatible(self, arguments, message):
+        with pytest.raises(TypeError, match=message):
+            normalize_chat_input(
+                [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    }
+                ]
+            )
+
+    @pytest.mark.parametrize(
+        ("message", "error"),
+        [
+            (7, "chat message must be a mapping"),
+            ({"role": "invalid", "content": "x"}, "unsupported chat role"),
+            ({"role": "user", "content": {"text": "x"}}, "string or iterable"),
+            ({"role": "assistant", "tool_calls": "invalid"}, "must be an iterable"),
+        ],
+    )
+    def test_legacy_messages_reject_invalid_shapes(self, message, error):
+        with pytest.raises((TypeError, ValueError), match=error):
+            normalize_chat_input([message])
+
+    def test_existing_chat_message_and_tool_role_are_preserved(self):
+        existing = ChatMessage("user", (TextPart("existing"),))
+        chat = normalize_chat_input(
+            [
+                existing,
+                {
+                    "role": "tool",
+                    "content": [
+                        {"type": "text", "text": "a"},
+                        {"type": "text", "text": "b"},
+                    ],
+                    "tool_call_id": "call-1",
+                },
+            ]
+        )
+
+        assert chat.messages[0] is existing
+        assert chat.messages[1].content == (
+            ToolResultPart(
+                "call-1",
+                "[{'type': 'text', 'text': 'a'}, {'type': 'text', 'text': 'b'}]",
+            ),
+        )
+
+    def test_reasoning_budget_and_json_schema_are_validated(self):
+        with pytest.raises(ValueError, match=">= 1"):
+            ReasoningParams(budget_tokens=0)
+        with pytest.raises(ValueError, match="requires a schema"):
+            StructuredOutputParams(format="json_schema")
+
+    @pytest.mark.parametrize(
+        ("dialect_id", "value", "message"),
+        [
+            (7, "opaque", "dialect_id"),
+            ("openai_responses", 7, "value"),
+        ],
+    )
+    def test_opaque_continuation_rejects_non_string_values(
+        self, dialect_id, value, message
+    ):
+        with pytest.raises(ValueError, match=message):
+            OpaqueContinuation(dialect_id, value)
 
 
-class TestResponseConstruction:
-    def test_minimal_response(self):
-        resp = Response(texts=("hi",))
-        assert resp.texts == ("hi",)
-        assert resp.reasoning is None
-        assert resp.logprobs is None
-        assert resp.session_id is None
-        assert resp.finish_reasons is None
+class TestResponseContract:
+    def test_every_root_field_declares_role_and_cardinality(self):
+        contract = response_field_contract()
+        assert set(contract) == {f.name for f in dataclasses.fields(Response)}
+        assert contract["reasoning"] == ("channel", True)
+        assert contract["input_scoring"] == ("channel", False)
+        assert contract["provenance"] == ("provenance", False)
 
-    def test_provenance_fields_default_none(self):
-        resp = Response(texts=("hi",))
-        assert resp.request_params is None
-        assert resp.response_model is None
-        assert resp.system_fingerprint is None
+    def test_reasoning_must_align_with_choices(self):
+        with pytest.raises(ValueError, match="reasoning must align"):
+            Response(texts=("a", "b"), reasoning=(ReasoningOutput(text="one"),))
 
-    def test_usage_defaults_to_none(self):
-        # Absence != zeros: a server that reported no usage must not be
-        # recorded as zero tokens (the bridge relies on this distinction).
-        resp = Response(texts=("hi",))
-        assert resp.usage is None
+    def test_finish_reasons_must_align_with_choices(self):
+        with pytest.raises(ValueError, match="finish_reasons must align"):
+            Response(texts=("a", "b"), finish_reasons=("stop",))
 
-    def test_usage_stats_fields_default_zero(self):
-        usage = UsageStats()
-        assert usage.input_tokens == 0
-        assert usage.output_tokens == 0
-        assert usage.reasoning_tokens == 0
-        assert usage.cached_tokens == 0
-        assert usage.total_tokens == 0
+    def test_optional_usage_absence_differs_from_zero_usage(self):
+        assert Response(texts=("x",)).usage is None
+        assert UsageStats().total_tokens == 0
 
-    def test_grounding_metadata_rendered_content_optional(self):
-        gm = GroundingMetadata(chunks=(GroundingChunk(uri="http://x"),))
-        assert gm.rendered_content is None
-        assert dataclasses.fields(GroundingMetadata)  # field exists
-        gm2 = GroundingMetadata(chunks=(), rendered_content="<div/>")
-        assert gm2.rendered_content == "<div/>"
+    def test_grounding_rendered_content_remains_a_real_field(self):
+        grounding = GroundingMetadata((), rendered_content="<div/>")
+        assert grounding.rendered_content == "<div/>"
+
+    def test_response_detaches_request_params(self):
+        params = {"temperature": 0.2}
+        response = Response(texts=("x",), request_params=params)
+        params["temperature"] = 0.9
+
+        assert response.request_params == {"temperature": 0.2}
+
+    def test_structured_output_schema_is_detached(self):
+        schema = {"type": "object"}
+        params = StructuredOutputParams(format="json_schema", schema=schema)
+        schema["type"] = "array"
+
+        assert params.schema == {"type": "object"}
 
 
 class TestImmutability:
     @pytest.mark.parametrize(
         ("obj", "field_name", "value"),
         [
-            (Request(input="x"), "input", "y"),
+            (Request(input=CompletionInput("x")), "input", CompletionInput("y")),
             (Response(texts=("a",)), "texts", ("b",)),
             (SamplingParams(), "temperature", 0.5),
             (ReasoningParams(), "effort", "high"),
             (UsageStats(), "input_tokens", 5),
-            (TokenLogprob(token_id=1, token="a", logprob=-0.1), "logprob", 0.0),
         ],
     )
     def test_frozen_assignment_raises(self, obj, field_name, value):
@@ -128,89 +387,100 @@ class TestImmutability:
 
 
 class TestSerializationRoundTrip:
-    """Response is the persisted record schema; nested records must rehydrate
-    back into typed objects, not plain dicts."""
-
-    def test_response_round_trips_to_typed_object(self):
-        data = obj_to_dict(Response(texts=("hi", "there")), add_type=True)
-        back = dict_to_obj(data, global_type_registry)
+    def _round_trip(self, response: Response) -> Response:
+        back = dict_to_obj(obj_to_dict(response, add_type=True), global_type_registry)
         assert isinstance(back, Response)
-        assert back.texts == ("hi", "there")
+        return back
 
-    def test_nested_reasoning_and_usage_rehydrate_as_records(self):
-        resp = Response(
-            texts=("answer",),
-            reasoning=ReasoningOutput(text="think", thinking_tokens=12),
-            usage=UsageStats(input_tokens=3, output_tokens=4, total_tokens=7),
+    def test_choice_indexed_reasoning_and_usage_rehydrate(self):
+        back = self._round_trip(
+            Response(
+                texts=("answer",),
+                reasoning=(ReasoningOutput(text="think", thinking_tokens=12),),
+                usage=UsageStats(input_tokens=3, output_tokens=4, total_tokens=7),
+            )
         )
-        back = dict_to_obj(obj_to_dict(resp, add_type=True), global_type_registry)
-        assert isinstance(back.reasoning, ReasoningOutput)
-        assert back.reasoning.text == "think"
-        assert back.reasoning.thinking_tokens == 12
+        assert back.reasoning is not None
+        reasoning = back.reasoning[0]
+        assert isinstance(reasoning, ReasoningOutput)
+        assert reasoning.thinking_tokens == 12
         assert isinstance(back.usage, UsageStats)
-        assert back.usage.total_tokens == 7
 
-    def test_tuple_of_token_logprobs_rehydrates_element_type(self):
-        # The gap-4 case: a tuple of records only round-trips when the element
-        # type is itself @sieval_record.
-        resp = Response(
-            texts=("x",),
-            logprobs=(
-                TokenLogprob(token_id=10, token=" A", logprob=-0.5),
-                TokenLogprob(token_id=None, token="B", logprob=-1.5),
-            ),
-        )
-        back = dict_to_obj(obj_to_dict(resp, add_type=True), global_type_registry)
-        assert isinstance(back.logprobs, tuple)
-        assert all(isinstance(t, TokenLogprob) for t in back.logprobs)
-        assert back.logprobs[0].token_id == 10
-        assert back.logprobs[0].token == " A"
-        assert back.logprobs[1].token_id is None
-
-    def test_nested_tuple_of_topk_entries_rehydrates(self):
-        resp = Response(
-            texts=("x",),
-            top_logprobs=(
-                (
-                    TopKEntry(token_id=1, token="A", logprob=-0.1),
-                    TopKEntry(token_id=2, token="B", logprob=-2.0),
+    def test_scoring_records_rehydrate(self):
+        back = self._round_trip(
+            Response(
+                texts=("x",),
+                input_scoring=InputScoringResult(
+                    (TokenLogprob(token="q", logprob=-0.2, token_id=5),)
                 ),
-            ),
+                logprobs=(TokenLogprob(token="a", logprob=-0.1),),
+                top_logprobs=((TopKEntry(token="b", logprob=-1.0),),),
+            )
         )
-        back = dict_to_obj(obj_to_dict(resp, add_type=True), global_type_registry)
-        assert isinstance(back.top_logprobs[0][0], TopKEntry)
-        assert back.top_logprobs[0][1].token == "B"
-
-    def test_input_scoring_and_grounding_and_tool_use_rehydrate(self):
-        resp = Response(
-            texts=("x",),
-            input_scoring=InputScoringResult(
-                token_logprobs=(TokenLogprob(token_id=5, token="q", logprob=-0.2),),
-                byte_count=3,
-                char_count=1,
-            ),
-            citations=(Citation(url="http://a", title="A"),),
-            grounding=GroundingMetadata(
-                chunks=(GroundingChunk(uri="http://c", title="C"),),
-                rendered_content="<w/>",
-            ),
-            server_tool_uses=(
-                ServerToolUse(
-                    tool_type="web_search",
-                    tool_use_id="t1",
-                    input={"q": "x"},
-                    result={"ok": True},
-                ),
-            ),
-        )
-        back = dict_to_obj(obj_to_dict(resp, add_type=True), global_type_registry)
         assert isinstance(back.input_scoring, InputScoringResult)
-        assert back.input_scoring.byte_count == 3
-        assert isinstance(back.input_scoring.token_logprobs[0], TokenLogprob)
+        assert back.logprobs is not None
+        assert isinstance(back.logprobs[0], TokenLogprob)
+        assert back.top_logprobs is not None
+        assert isinstance(back.top_logprobs[0][0], TopKEntry)
+
+    def test_grounding_citation_and_server_tool_use_rehydrate(self):
+        back = self._round_trip(
+            Response(
+                texts=("x",),
+                citations=(Citation(url="https://a"),),
+                grounding=GroundingMetadata(
+                    (GroundingChunk(uri="https://c"),), rendered_content="<w/>"
+                ),
+                server_tool_uses=(
+                    ServerToolUse(
+                        tool_type="web_search",
+                        tool_use_id="t1",
+                        input={"q": "x"},
+                        result={"ok": True},
+                    ),
+                ),
+            )
+        )
+        assert back.citations is not None
         assert isinstance(back.citations[0], Citation)
         assert isinstance(back.grounding, GroundingMetadata)
-        # Google ToS: rendered_content must survive the round-trip.
         assert back.grounding.rendered_content == "<w/>"
-        assert isinstance(back.grounding.chunks[0], GroundingChunk)
+        assert back.server_tool_uses is not None
         assert isinstance(back.server_tool_uses[0], ServerToolUse)
-        assert back.server_tool_uses[0].result == {"ok": True}
+
+    def test_structured_json_null_differs_from_absent(self):
+        absent = self._round_trip(Response(texts=("x",)))
+        present = self._round_trip(
+            Response(texts=("x",), structured_output=StructuredOutput(None))
+        )
+        assert absent.structured_output is None
+        assert isinstance(present.structured_output, StructuredOutput)
+        assert present.structured_output.value is None
+
+    def test_nested_provenance_rehydrates(self):
+        provenance = ModelProvenance(
+            dialect_id="openai_chat",
+            engine_id="unknown",
+            engine_source="unknown",
+            deployment_id=None,
+            model_identity=ModelIdentity("alias", "served"),
+            capabilities=CapabilityEvidence(
+                declared={"reasoning": {}},
+                effective={"reasoning": {"effort": "high"}},
+                plan_fingerprint="plan",
+            ),
+        )
+        back = self._round_trip(Response(texts=("x",), provenance=provenance))
+        assert isinstance(back.provenance, ModelProvenance)
+        assert isinstance(back.provenance.model_identity, ModelIdentity)
+        assert back.provenance.model_identity.requested_model_id == "alias"
+
+    def test_old_record_without_provenance_still_rehydrates(self):
+        old = {
+            "texts": {"__sieval_cls__": "tuple", "items": ["old"]},
+            "__sieval_mod__": Response.__module__,
+            "__sieval_cls__": "Response",
+        }
+        back = dict_to_obj(old, global_type_registry)
+        assert isinstance(back, Response)
+        assert back.provenance is None

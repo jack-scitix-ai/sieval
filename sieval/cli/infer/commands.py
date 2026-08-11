@@ -11,11 +11,12 @@ import contextlib
 import dataclasses
 import json
 import os
+import shlex
 import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import anyio
 import typer
@@ -224,9 +225,10 @@ def infer_start(
     engine_overrides = _parse_engine_args(ctx.args) if ctx.args else {}
 
     target_path = Path(target)
+    yaml_mode = target_path.suffix in (".yaml", ".yml") and target_path.is_file()
 
     # Decide mode: YAML file vs checkpoint directory
-    if target_path.suffix in (".yaml", ".yml") and target_path.is_file():
+    if yaml_mode:
         # YAML mode. The config already carries the model type (declared, or
         # derived from the tasks), so accepting the flag here would let the two
         # disagree silently — reject it rather than pick a winner.
@@ -300,6 +302,29 @@ def infer_start(
         render(result, output)
         raise typer.Exit(1)
 
+    prelaunch_plan: dict[str, Any] | None = None
+    if yaml_mode:
+        from sieval.cli.leaderboard.session import EvalSession, unwrap_proxies
+
+        session = EvalSession(
+            target_path,
+            deterministic_override=deterministic,
+            infer_plans={model_name: unwrap_proxies(plan)},
+            invocation=shlex.join(sys.argv),
+            self_managed_endpoints=frozenset({model_name}),
+        )
+        reconciled = session.prepare_prelaunch()
+        prelaunch_plan = reconciled.to_json_value()
+        root_key = f"model:{model_name}"
+        deployment_plan = reconciled.deployment_plans.get(root_key)
+        if deployment_plan is not None and deployment_plan.launch_patch:
+            raise RuntimeError(
+                "Pre-launch reconciliation produced engine launch parameters, "
+                "but `sieval infer start` has no #47 launch-patch translator yet; "
+                f"refusing to ignore {root_key}: "
+                f"{dict(deployment_plan.launch_patch)!r}"
+            )
+
     # Translate plan → commands
     translator = get_translator(plan.backend)
     commands = translator.translate(plan)
@@ -316,6 +341,8 @@ def infer_start(
         }
         if cmd.env:
             info["env"] = cmd.env
+        if prelaunch_plan is not None:
+            info["prelaunch_plan"] = prelaunch_plan
         dr_result = CommandResult(command="infer.dry_run", ok=True, data=info)
         render(dr_result, output)
         return

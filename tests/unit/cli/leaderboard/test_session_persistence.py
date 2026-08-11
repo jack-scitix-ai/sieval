@@ -42,7 +42,7 @@ class TestPersistEffectiveConfig:
 
     @pytest.mark.anyio
     async def test_body_is_raw_config_plus_cli_reify(self, tmp_path: Path):
-        """CLI overrides ARE baked into the body; endpoint injections are NOT."""
+        """CLI overrides are baked in; legacy endpoint injection is not."""
         cfg_path = _write_yaml(
             tmp_path,
             "cfg.yaml",
@@ -75,8 +75,8 @@ class TestPersistEffectiveConfig:
     ):
         """``sieval run`` is the universal reproduce command: for auto-
         served sessions it re-launches services from the preserved
-        ``path`` / ``infer`` fields (the endpoint_map is intentionally
-        NOT persisted); for pre-served sessions it's a pass-through.
+        ``path`` / ``infer`` fields (runtime endpoints are intentionally not
+        persisted); for pre-served sessions it's a pass-through.
 
         ``sieval eval`` would silently fail for any auto-served session
         because the persisted body has no ``name`` / ``api_base`` — so
@@ -108,9 +108,9 @@ class TestPersistEffectiveConfig:
     @pytest.mark.anyio
     async def test_user_declared_api_base_is_preserved(self, tmp_path: Path):
         """User-set ``api_base`` / ``api_key`` in the source YAML flow through
-        to effective_config.yaml unchanged. Only ``endpoint_map``-driven
-        auto-injection (the auto-serve path in ``sieval run``) is stripped;
-        the PR's "no api_base baked in" claim applies to injection only."""
+        to effective_config.yaml unchanged. Only runtime injection by the
+        legacy external endpoint adapter is stripped; the PR's "no api_base
+        baked in" claim applies to that adapter only."""
         cfg_path = _write_yaml(
             tmp_path,
             "cfg.yaml",
@@ -491,8 +491,10 @@ class TestStrictResumeMatch:
             await s2._persist_effective_config()
 
     @pytest.mark.anyio
-    async def test_endpoint_map_change_does_not_trigger_mismatch(self, tmp_path: Path):
-        """Endpoints change across runs by nature — not part of strict match."""
+    async def test_legacy_endpoint_change_does_not_trigger_mismatch(
+        self, tmp_path: Path
+    ):
+        """Legacy runtime endpoints are not part of the strict match."""
         cfg_path = _write_yaml(
             tmp_path,
             "cfg.yaml",
@@ -513,8 +515,8 @@ class TestStrictResumeMatch:
             result_dir_override=str(result_dir),
             endpoint_map={"base": "http://host:9000/v1"},  # different port
         )
-        # Must not raise — endpoint changes are expected, endpoint_map is
-        # not persisted into effective_config.yaml
+        # Must not raise — legacy adapter state is not persisted into
+        # effective_config.yaml.
         await s2._persist_effective_config()
 
     @pytest.mark.anyio

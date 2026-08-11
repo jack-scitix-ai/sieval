@@ -11,7 +11,6 @@ from datasets import DatasetDict as HFDatasetDict
 
 from sieval.core.models import Request, Response, TokenLogprob, TopKEntry
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     JudgementRecord,
     PredictionRecord,
@@ -40,12 +39,10 @@ _FinalCtx = TaskContext[
 
 class _TopLogprobGenModel(GenModel):
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
-        if not (req.return_logprobs or req.score_input):
+        if not (req.scoring.sampled_logprobs or req.scoring.input_scoring):
             return Response(texts=("",))
         return Response(
             texts=(" C",),

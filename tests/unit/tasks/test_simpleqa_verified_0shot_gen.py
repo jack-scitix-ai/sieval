@@ -10,7 +10,6 @@ from datasets import DatasetDict as HFDatasetDict
 from sieval.community.simpleqa_verified import aggregate_metrics, parse_grade
 from sieval.core.models import ReasoningOutput, Request, Response, UsageStats
 from sieval.core.models.chat_model import ChatModel
-from sieval.core.models.transports import OpenAIChatTransport
 from sieval.core.tasks import (
     RolloutJudgement,
     TaskContext,
@@ -59,17 +58,20 @@ class _ScriptedChatModel(ChatModel):
         self.last_req: Request | None = None
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
     async def _stub_arun(self, req: Request) -> Response:
         self.last_req = req
+        n = req.sampling.n
         return Response(
-            texts=(self._reply,),
+            texts=(self._reply,) * n,
             reasoning=(
-                ReasoningOutput(text=self._reasoning) if self._reasoning else None
+                (ReasoningOutput(text=self._reasoning),) * n
+                if self._reasoning
+                else None
             ),
             usage=UsageStats(input_tokens=40, output_tokens=3, total_tokens=43),
-            finish_reasons=(self._finish_reason,) if self._finish_reason else None,
+            finish_reasons=(self._finish_reason,) * n if self._finish_reason else None,
         )
 
 
@@ -121,6 +123,33 @@ def test_build_grader_accepts_mapping_and_model():
     assert isinstance(built, ChatModel)
     existing = _ScriptedChatModel(reply="A")
     assert SimpleQAVerifiedZeroShotGenTask._build_grader(existing) is existing
+
+
+def test_constructor_accepts_composed_grader_model():
+    base, grader = _task()
+    task = SimpleQAVerifiedZeroShotGenTask(
+        base.dataset,
+        base.model,
+        models_by_role={"grader": grader},
+    )
+    assert task._grader is grader
+
+
+def test_constructor_rejects_missing_composed_grader_role():
+    base, _ = _task()
+    with pytest.raises(ValueError, match="missing the 'grader'"):
+        SimpleQAVerifiedZeroShotGenTask(base.dataset, base.model, models_by_role={})
+
+
+def test_constructor_rejects_ambiguous_grader_sources():
+    base, grader = _task()
+    with pytest.raises(ValueError, match="cannot both be supplied"):
+        SimpleQAVerifiedZeroShotGenTask(
+            base.dataset,
+            base.model,
+            grader=grader,
+            models_by_role={"grader": grader},
+        )
 
 
 # --- preprocess: bare problem as a single user turn (no template) ---

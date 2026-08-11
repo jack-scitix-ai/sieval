@@ -8,8 +8,9 @@ import dataclasses
 import shlex
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import anyio
 import typer
@@ -18,14 +19,22 @@ from loguru import logger
 
 from sieval.cli.infer import cleanup_model, launch_model, resolve_infer_config
 from sieval.cli.leaderboard.session import resolve_deterministic, unwrap_proxies
-from sieval.cli.output import CommandResult, OutputFormat, cli_command, render
-from sieval.cli.resolution import derive_model_type
+from sieval.cli.output import (
+    CommandResult,
+    OutputFormat,
+    cli_command,
+    cli_error_message,
+    render,
+)
+from sieval.cli.resolution import resolve_config_model_types
+from sieval.core.models import Deployment
 from sieval.core.utils.logging import configure_logging, log_user
 from sieval.infer.backends import get_translator
-from sieval.infer.backends.translator import inject_user_env
+from sieval.infer.backends.translator import BackendCommand, inject_user_env
 from sieval.infer.config import InferHandle
 from sieval.infer.deployer import LocalDeployer
 from sieval.infer.recipes import capability_model_type
+from sieval.infer.topology import DeploymentPlan
 from sieval.infer.topology.resolver import auto_resolve_plan
 
 
@@ -41,6 +50,124 @@ def _needs_serve(model_config: dict) -> bool:
         return True
     infer_dict = model_config.get("infer")
     return infer_dict is not None and bool(infer_dict.get("checkpoint"))
+
+
+async def _prepare_launch_batch(
+    config_path: Path,
+    config: dict[str, Any],
+    *,
+    effective_deterministic: bool,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, tuple[DeploymentPlan, list[BackendCommand]]],
+]:
+    """Resolve and translate every managed deployment without launching it."""
+
+    models = config.get("models", {})
+    if not isinstance(models, dict):
+        raise ValueError("models must be a mapping")
+    model_type_resolution = resolve_config_model_types(config)
+    plan_dicts: dict[str, dict[str, Any]] = {}
+    prepared_launches: dict[str, tuple[DeploymentPlan, list[BackendCommand]]] = {}
+
+    for model_name, model_config in models.items():
+        if not isinstance(model_name, str) or not isinstance(model_config, dict):
+            raise ValueError("models entries must map names to model configurations")
+        if not _needs_serve(model_config):
+            continue
+
+        infer_dict = model_config.get("infer")
+        if infer_dict is not None:
+            _, plan, user_env = await resolve_infer_config(
+                config_path,
+                model_name,
+                model_type_resolution=model_type_resolution,
+            )
+        else:
+            checkpoint = model_config["path"]
+            result = await auto_resolve_plan(
+                checkpoint=checkpoint,
+                capability=capability_model_type(
+                    model_type_resolution.model_types_by_config[model_name]
+                ),
+            )
+            plan = result.plan
+            user_env = {}
+
+        if effective_deterministic and not plan.deterministic:
+            plan = dataclasses.replace(plan, deterministic=True)
+
+        plan_dicts[model_name] = unwrap_proxies(plan)
+
+        from sieval.infer.topology.validator import validate_plan
+
+        errors = validate_plan(plan)
+        if errors:
+            raise RuntimeError(
+                f"Invalid deployment plan for {model_name}: " + "; ".join(errors)
+            )
+
+        translator = get_translator(plan.backend)
+        commands = translator.translate(plan)
+        inject_user_env(commands, user_env)
+        prepared_launches[model_name] = (plan, commands)
+
+    return plan_dicts, prepared_launches
+
+
+async def _run_dry_run(
+    config_path: Path,
+    *,
+    resume: bool = False,
+    model: str | None = None,
+    result_dir: str | None = None,
+    deterministic: bool | None = None,
+) -> dict[str, object]:
+    """Resolve the same managed batch and return the pure prelaunch plan."""
+
+    from sieval.cli.validation import run_dry_run
+
+    if not config_path.exists():
+        return dict(
+            cast(
+                Mapping[str, object],
+                run_dry_run(
+                    config_path,
+                    model_override=model,
+                    resume=resume,
+                    result_dir_override=result_dir,
+                    deterministic_override=deterministic,
+                    invocation=shlex.join(sys.argv),
+                ),
+            )
+        )
+
+    with open(config_path) as stream:
+        loaded = yaml.safe_load(stream)
+    if not isinstance(loaded, dict):
+        raise ValueError("evaluation config must be a mapping")
+    effective_deterministic = resolve_deterministic(deterministic, loaded)
+    plan_dicts, prepared_launches = await _prepare_launch_batch(
+        config_path,
+        loaded,
+        effective_deterministic=effective_deterministic,
+    )
+
+    return dict(
+        cast(
+            Mapping[str, object],
+            run_dry_run(
+                config_path,
+                model_override=model,
+                resume=resume,
+                result_dir_override=result_dir,
+                deterministic_override=deterministic,
+                infer_plans=plan_dicts or None,
+                invocation=shlex.join(sys.argv),
+                self_managed_endpoints=frozenset(prepared_launches),
+            ),
+        )
+    )
 
 
 async def _run_all(
@@ -72,68 +199,58 @@ async def _run_all(
     # still honors it.
     effective_deterministic = resolve_deterministic(deterministic, config)
 
-    models = config.get("models", {})
     launched: dict[str, list[InferHandle]] = {}
-    endpoint_map: dict[str, str] = {}
     plan_dicts: dict[str, dict[str, Any]] = {}
+    prepared_launches: dict[str, tuple[DeploymentPlan, list[BackendCommand]]] = {}
+    realized_deployments: dict[str, Deployment] = {}
     deployer = LocalDeployer()
+    invocation = shlex.join(sys.argv)
 
     try:
-        for model_name, model_config in models.items():
-            if not _needs_serve(model_config):
-                # Malformed infer sections are flagged by schema validation.
-                continue
+        # Resolve the complete desired batch before starting any process.  The
+        # dry-run entry point calls this exact helper and omits only launch and
+        # post-launch verification.
+        plan_dicts, prepared_launches = await _prepare_launch_batch(
+            config_path,
+            config,
+            effective_deterministic=effective_deterministic,
+        )
 
+        # Task requirements, model declarations, and every managed desired
+        # plan must reconcile as one batch before the first subprocess starts.
+        # The final EvalSession intentionally repeats this pure check so its
+        # execution setup never trusts orchestration-only state.
+        from sieval.cli.leaderboard.session import EvalSession, arun_session
+
+        prelaunch_session = EvalSession(
+            config_path=config_path,
+            model_override=model,
+            resume=resume,
+            result_dir_override=result_dir,
+            deterministic_override=deterministic,
+            infer_plans=plan_dicts or None,
+            invocation=invocation,
+            self_managed_endpoints=frozenset(prepared_launches),
+        )
+        prelaunch_result = prelaunch_session.prepare_prelaunch()
+        launch_patches = {
+            root_key: dict(deployment_plan.launch_patch)
+            for root_key, deployment_plan in prelaunch_result.deployment_plans.items()
+            if deployment_plan.launch_patch
+        }
+        if launch_patches:
+            details = "; ".join(
+                f"{root_key}: {patch_values!r}"
+                for root_key, patch_values in sorted(launch_patches.items())
+            )
+            raise RuntimeError(
+                "Pre-launch reconciliation produced engine launch parameters, "
+                "but `sieval run` has no #47 launch-patch translator yet; "
+                f"refusing to ignore them: {details}"
+            )
+
+        for model_name, (plan, commands) in prepared_launches.items():
             log_user("Starting inference for model: {}", model_name)
-
-            # Resolve: explicit infer section or path-only auto-resolve
-            infer_dict = model_config.get("infer")
-            if infer_dict is not None:
-                _, plan, user_env = await resolve_infer_config(
-                    config_path,
-                    model_name,
-                )
-            else:
-                # Path-only mode: auto-resolve from checkpoint. The capability
-                # layer follows the same model type the eval session will use,
-                # which is usually inferred from the tasks rather than declared.
-                checkpoint = model_config["path"]
-                result = await auto_resolve_plan(
-                    checkpoint=checkpoint,
-                    capability=capability_model_type(
-                        derive_model_type(
-                            model_name,
-                            model_config.get("type"),
-                            config.get("tasks") or {},
-                        )
-                    ),
-                )
-                plan = result.plan
-                user_env = {}  # path-only mode has no YAML env section
-
-            # Stamp effective (YAML ∪ CLI) deterministic onto the plan.
-            # resolve_infer_config handles the YAML leg for `infer:` models;
-            # path-only models reach here without it, so we re-apply.
-            if effective_deterministic and not plan.deterministic:
-                plan = dataclasses.replace(plan, deterministic=True)
-
-            plan_dicts[model_name] = unwrap_proxies(plan)
-
-            # Validate plan before translation
-            from sieval.infer.topology.validator import validate_plan
-
-            errors = validate_plan(plan)
-            if errors:
-                raise RuntimeError(
-                    f"Invalid deployment plan for {model_name}: " + "; ".join(errors)
-                )
-
-            # Translate plan → commands
-            translator = get_translator(plan.backend)
-            commands = translator.translate(plan)
-
-            # Inject user-specified environment variables from YAML config
-            inject_user_env(commands, user_env)
 
             last_status = None
             last_log_time = 0.0
@@ -186,9 +303,8 @@ async def _run_all(
                 logger.opt(raw=True).log("USER", "\n")
             launched[model_name] = new_handles
 
-            # Use first handle's endpoint
-            if new_handles and new_handles[0].endpoint:
-                endpoint_map[model_name] = new_handles[0].endpoint
+            deployment = deployer.build_deployment(plan, new_handles)
+            realized_deployments[model_name] = deployment
 
             if env is not None:
                 log_user(
@@ -199,8 +315,6 @@ async def _run_all(
                     env.gpu_count,
                 )
 
-        from sieval.cli.leaderboard.session import arun_session
-
         # `self_managed_endpoints` scopes the best-effort warning away
         # from endpoints we launched ourselves.
         reports = await arun_session(
@@ -209,10 +323,10 @@ async def _run_all(
             resume=resume,
             result_dir=result_dir,
             deterministic=deterministic,
-            self_managed_endpoints=frozenset(endpoint_map.keys()),
-            endpoint_map=endpoint_map or None,
+            self_managed_endpoints=frozenset(realized_deployments),
             infer_plans=plan_dicts or None,
-            invocation=shlex.join(sys.argv),
+            invocation=invocation,
+            realized_deployments=realized_deployments or None,
         )
         return reports
 
@@ -280,15 +394,35 @@ def register_run_command(app: typer.Typer) -> None:
     ) -> None:
         """All-in-one: launch inference services, run evaluation, and cleanup."""
         if dry_run:
-            from sieval.cli.validation import run_dry_run
-
             configure_logging(verbose)
-            dry_result = run_dry_run(config)
+
+            async def _go_dry() -> dict[str, object]:
+                return await _run_dry_run(
+                    config,
+                    resume=resume,
+                    model=model,
+                    result_dir=result_dir,
+                    deterministic=deterministic,
+                )
+
+            try:
+                dry_result = anyio.run(_go_dry)
+            except Exception as exc:
+                result = CommandResult(
+                    command="run.dry_run",
+                    ok=False,
+                    error=cli_error_message(exc),
+                )
+                render(result, output)
+                raise typer.Exit(1) from exc
+            n_errors = dry_result.get("n_errors")
+            if not isinstance(n_errors, int):
+                raise RuntimeError("dry-run result omitted integer n_errors")
             result = CommandResult(
                 command="run.dry_run",
-                ok=dry_result["n_errors"] == 0,
+                ok=n_errors == 0,
                 data=dict(dry_result),
-                error="Dry-run failed" if dry_result["n_errors"] > 0 else None,
+                error="Dry-run failed" if n_errors > 0 else None,
             )
             render(result, output)
             if not result.ok:

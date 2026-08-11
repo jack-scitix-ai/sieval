@@ -1,20 +1,29 @@
 """
 Unit tests for sieval/core/tasks/task.py.
 
-Covers: name sanitisation, _validate_model_type, make_context
+Covers: name sanitisation, dialect-shape validation, requirement binding, make_context
 (with and without dataset test_set).
 
 AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
+
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.core.datasets import Dataset
-from sieval.core.models import Capability, CapabilityError
+from sieval.core.models import Model
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.models.gen_model import GenModel
+from sieval.core.models.requirements import (
+    InputKind,
+    NamedModelBinding,
+    RequirementContext,
+    TaskRequirements,
+)
 from sieval.core.models.sglang_gen_model import SglangGenModel
 from sieval.core.tasks.task import Task
 
@@ -43,6 +52,14 @@ class _MockChatModel(ChatModel):
     def __init__(self):
         super().__init__(model="mock", api_key="fake")
 
+    @property
+    def dialect_id(self) -> str:
+        return "openai_chat"
+
+    @property
+    def runtime_plan(self):
+        return getattr(self, "_test_runtime_plan", None)
+
 
 class _MockGenModel(GenModel):
     """Construction-only mock: Task validation never invokes the wire."""
@@ -50,12 +67,28 @@ class _MockGenModel(GenModel):
     def __init__(self):
         super().__init__(model="mock-gen", api_key="fake")
 
+    @property
+    def dialect_id(self) -> str:
+        return "openai_completions"
+
+    @property
+    def runtime_plan(self):
+        return getattr(self, "_test_runtime_plan", None)
+
 
 class _MockSglangGenModel(SglangGenModel):
     """Construction-only mock: Task validation never invokes the wire."""
 
     def __init__(self):
         super().__init__(model="mock-sglang", api_key="fake")
+
+    @property
+    def dialect_id(self) -> str:
+        return "sglang_legacy"
+
+    @property
+    def runtime_plan(self):
+        return getattr(self, "_test_runtime_plan", None)
 
 
 class _ConcreteTask(Task):
@@ -81,22 +114,42 @@ class _ConcreteTask(Task):
 
 class _ChatOnlyTask(_ConcreteTask):
     model_type = "chat"
+    requires = TaskRequirements(input=InputKind.CHAT)
 
 
 class _GenOnlyTask(_ConcreteTask):
     model_type = "gen"
+    requires = TaskRequirements(input=InputKind.COMPLETION)
 
 
 class _ScoringTask(_ConcreteTask):
     """Declares an IR capability requirement (prompt-side scoring)."""
 
-    requires = frozenset({Capability.InputScoring})
+    requires = TaskRequirements(
+        input=InputKind.COMPLETION,
+        input_scoring=True,
+        sampled_logprobs=True,
+    )
 
 
-class _TokenIdTask(_ConcreteTask):
-    """Requires native token ids (only the sglang transport supplies them)."""
+class _ChatScoringTask(_ConcreteTask):
+    """Impossible request used to prove dialect capability validation."""
 
-    requires = frozenset({Capability.SampledLogprobsWithTokenIds})
+    requires = TaskRequirements(
+        input=InputKind.CHAT,
+        input_scoring=True,
+        sampled_logprobs=True,
+    )
+
+
+class _TopLogprobsTask(_ConcreteTask):
+    """Declares the alternative-token breadth consumed by a CLP task."""
+
+    requires = TaskRequirements(
+        input=InputKind.COMPLETION,
+        sampled_logprobs=True,
+        min_top_logprobs=100,
+    )
 
 
 # ===================================================================
@@ -124,7 +177,7 @@ class TestTaskName:
 
 
 # ===================================================================
-# _validate_model_type
+# dialect-shape validation
 # ===================================================================
 class TestValidateModelType:
     def test_chat_task_with_chat_model_ok(self):
@@ -135,7 +188,7 @@ class TestValidateModelType:
         _GenOnlyTask(_SimpleDataset(), _MockGenModel())
 
     def test_gen_task_with_sglang_gen_model_ok(self):
-        """SglangGenModel extends Model[str], not GenModel — still counts as 'gen'."""
+        """The named SGLang legacy dialect still exposes completion input."""
         _GenOnlyTask(_SimpleDataset(), _MockSglangGenModel())
 
     def test_chat_task_with_gen_model_raises(self):
@@ -143,7 +196,7 @@ class TestValidateModelType:
             _ChatOnlyTask(_SimpleDataset(), _MockGenModel())
 
     def test_gen_task_with_chat_model_raises(self):
-        with pytest.raises(TypeError, match="gen"):
+        with pytest.raises(TypeError, match="completion"):
             _GenOnlyTask(_SimpleDataset(), _MockChatModel())
 
     def test_no_model_type_restriction_accepts_both(self):
@@ -151,19 +204,16 @@ class TestValidateModelType:
         _ConcreteTask(_SimpleDataset(), _MockGenModel())
 
     def test_unrecognized_model_type_raises(self):
-        """A model that is neither ChatModel nor GenModel should raise TypeError."""
-        from sieval.core.models.model import Model
-
         class _CustomModel(Model):
-            """Bare Model subclass: no transport, no kind."""
+            """Bare model with no bound dialect shape."""
 
-        custom = _CustomModel(model="custom", api_key="fake")
-        with pytest.raises(TypeError, match="requires a ChatModel or GenModel"):
+        custom = object.__new__(_CustomModel)
+        with pytest.raises(TypeError, match="bound dialect_id"):
             _ChatOnlyTask(_SimpleDataset(), custom)
 
 
 # ===================================================================
-# requires (IR capability gate)
+# requires (runtime/dialect capability gate)
 # ===================================================================
 class TestRequiresCapabilityGate:
     def test_no_requires_accepts_any_model(self):
@@ -180,20 +230,69 @@ class TestRequiresCapabilityGate:
 
     def test_input_scoring_task_with_chat_model_raises(self):
         """Chat completions cannot score the prompt — fail loud at construction."""
-        with pytest.raises(CapabilityError, match="InputScoring"):
-            _ScoringTask(_SimpleDataset(), _MockChatModel())
+        with pytest.raises(ValueError, match="input_scoring"):
+            _ChatScoringTask(_SimpleDataset(), _MockChatModel())
 
-    def test_token_id_task_with_sglang_model_ok(self):
-        """Only the sglang transport populates token ids."""
-        _TokenIdTask(_SimpleDataset(), _MockSglangGenModel())
+    def test_top_logprobs_task_uses_semantic_capability_without_token_id_flag(self):
+        _TopLogprobsTask(_SimpleDataset(), _MockGenModel())
+        _TopLogprobsTask(_SimpleDataset(), _MockSglangGenModel())
 
-    def test_token_id_task_with_gen_model_raises(self):
-        with pytest.raises(CapabilityError, match="SampledLogprobsWithTokenIds"):
-            _TokenIdTask(_SimpleDataset(), _MockGenModel())
+    def test_runtime_plan_must_retain_required_capability(self):
+        model = _MockGenModel()
+        cast(Any, model)._test_runtime_plan = SimpleNamespace(
+            dialect_id="openai_completions",
+            available_capabilities=frozenset({"sampled_logprobs"}),
+            capability_minimums={},
+        )
+        with pytest.raises(ValueError, match="top_logprobs"):
+            _TopLogprobsTask(_SimpleDataset(), model)
 
-    def test_token_id_task_with_chat_model_raises(self):
-        with pytest.raises(CapabilityError, match="SampledLogprobsWithTokenIds"):
-            _TokenIdTask(_SimpleDataset(), _MockChatModel())
+
+class TestModelRequirementsFor:
+    @staticmethod
+    def _binding(name: str) -> NamedModelBinding:
+        return NamedModelBinding(
+            binding_id=f"binding:{name}",
+            root_deployment_key=f"deployment:{name}",
+            requested_model_id=f"org/{name}",
+            config_name=name,
+        )
+
+    def test_binds_candidate_and_preserves_task_source(self):
+        candidate = self._binding("candidate")
+        context = RequirementContext(
+            model_bindings={
+                "candidate": candidate,
+                "judge": self._binding("judge"),
+            }
+        )
+
+        (result,) = _ScoringTask.model_requirements_for(context)
+
+        assert result.role == "candidate"
+        assert result.binding is candidate
+        assert result.requires is _ScoringTask.requires
+        assert result.source_task == "_ScoringTask"
+
+    def test_single_legacy_model_alias_is_accepted(self):
+        binding = self._binding("legacy")
+        (result,) = _ConcreteTask.model_requirements_for(
+            RequirementContext(model_bindings={"model": binding})
+        )
+
+        assert result.role == "model"
+        assert result.binding is binding
+
+    def test_candidate_and_model_alias_are_ambiguous(self):
+        context = RequirementContext(
+            model_bindings={
+                "candidate": self._binding("candidate"),
+                "model": self._binding("legacy"),
+            }
+        )
+
+        with pytest.raises(ValueError, match="ambiguous"):
+            _ConcreteTask.model_requirements_for(context)
 
 
 # ===================================================================

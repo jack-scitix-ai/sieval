@@ -86,8 +86,8 @@ from sieval.core.models import ChatModel
 
 base = ChatModel("gpt-4o", concurrency_limit=128)
 
-math_model = base.with_args(concurrency_limit=64)   # reserves 64
-code_model = base.with_args(concurrency_limit=32)   # reserves 32
+math_model = base.with_args(concurrency_limit=64)  # reserves 64
+code_model = base.with_args(concurrency_limit=32)  # reserves 32
 
 # base uses remaining elastic capacity (128 - 64 - 32 = 32)
 ```

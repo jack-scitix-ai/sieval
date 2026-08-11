@@ -21,7 +21,10 @@ from sieval.tasks.t_eval_before_calling_0shot_gen import (
 
 def _task(**kwargs):
     """A real instance -- these tests exercise the scoring methods, not mocks."""
-    return TEvalBeforeCallingZeroShotGenTask(Mock(), Mock(spec=ChatModel), **kwargs)
+    model = Mock(spec=ChatModel)
+    model.dialect_id = "openai_chat"
+    model.runtime_plan = None
+    return TEvalBeforeCallingZeroShotGenTask(Mock(), model, **kwargs)
 
 
 def _call(thought="search it", name="search", args=None):

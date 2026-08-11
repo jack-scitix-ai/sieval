@@ -10,7 +10,6 @@ from datasets import DatasetDict as HFDatasetDict
 from sieval.community.openbookqa import OBQA_PROMPT_TEMPLATE
 from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.chat_model import ChatModel
-from sieval.core.models.transports import OpenAIChatTransport
 from sieval.core.tasks import TaskContext
 from sieval.datasets.openbookqa import OpenBookQADataset, OpenBookQADatasetSample
 from sieval.tasks.openbookqa_kshot_gen import (
@@ -26,7 +25,7 @@ class _CapturingChatModel(ChatModel):
         super().__init__(model="mock-chat", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
     async def _stub_arun(self, req: Request) -> Response:
         self.last_req = req
@@ -137,7 +136,7 @@ async def test_infer_does_not_forward_decoding_params():
     assert req is not None
     # No decoding params forwarded: default sampling (n=1, everything else unset).
     assert req.sampling == SamplingParams()
-    assert req.extra_wire_params is None
+    assert req.dialect_options is None
 
 
 def test_stop_sequences_pinned():

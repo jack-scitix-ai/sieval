@@ -5,13 +5,100 @@ AI-Generated Code - Claude Fable 5 (Anthropic)
 
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
-from typing import ClassVar, Literal
+from dataclasses import replace
+from typing import ClassVar, Literal, Protocol, cast
 
 from sieval.core.datasets import Dataset
-from sieval.core.models import Capability, Model
+from sieval.core.models import Model
+from sieval.core.models.requirements import (
+    InputKind,
+    RequirementContext,
+    TaskModelRequirement,
+    TaskRequirements,
+)
+from sieval.core.types import JSONValue
 
 from .context import TaskContext
+
+
+class _RuntimeBindingView(Protocol):
+    dialect_id: str
+    available_capabilities: frozenset[str]
+    capability_minimums: Mapping[str, Mapping[str, JSONValue]]
+
+
+class _RuntimeModelView(Protocol):
+    dialect_id: str
+    runtime_plan: _RuntimeBindingView | None
+
+
+_SGLANG_LEGACY_CAPABILITIES = frozenset(
+    {"input_scoring", "sampled_logprobs", "top_logprobs"}
+)
+
+
+def _dialect_input_shape(dialect_id: str) -> tuple[frozenset[str], frozenset[str]]:
+    if dialect_id == "sglang_legacy":
+        return frozenset({InputKind.COMPLETION.value}), frozenset({"text"})
+
+    from sieval.core.models.dialect_registry import get_dialect_spec
+
+    spec = get_dialect_spec(dialect_id)
+    return frozenset(spec.input_kinds), frozenset(spec.input_modalities)
+
+
+def _required_capabilities(requires: TaskRequirements) -> frozenset[str]:
+    capabilities: set[str] = set()
+    if requires.input_scoring:
+        capabilities.add("input_scoring")
+    if requires.sampled_logprobs:
+        capabilities.add("sampled_logprobs")
+    if requires.min_top_logprobs is not None:
+        capabilities.add("top_logprobs")
+    return frozenset(capabilities)
+
+
+def _validate_runtime_capabilities(
+    task_name: str,
+    requires: TaskRequirements,
+    runtime_plan: _RuntimeBindingView,
+) -> None:
+    missing = _required_capabilities(requires) - runtime_plan.available_capabilities
+    if missing:
+        raise ValueError(
+            f"{task_name} requires unavailable runtime capabilities: "
+            + ", ".join(sorted(missing))
+        )
+
+
+def _validate_descriptor_capabilities(
+    task_name: str,
+    requires: TaskRequirements,
+    dialect_id: str,
+) -> None:
+    required = _required_capabilities(requires)
+    if not required:
+        return
+    if dialect_id == "sglang_legacy":
+        available = _SGLANG_LEGACY_CAPABILITIES
+    else:
+        from sieval.core.models.capabilities import Supported
+        from sieval.core.models.dialect_registry import capability_decisions_for
+
+        decisions = capability_decisions_for(dialect_id)
+        available = frozenset(
+            key
+            for key, decision in decisions.items()
+            if isinstance(decision, Supported)
+        )
+    missing = required - available
+    if missing:
+        raise ValueError(
+            f"{task_name} requires unsupported dialect capabilities: "
+            + ", ".join(sorted(missing))
+        )
 
 
 class Task[
@@ -47,17 +134,14 @@ class Task[
             *cli/session*).
         tags: Free-form tag set describing the task (e.g. ``{"gen", "zero_shot"}``).
             Used by the anomaly-detection framework to decide which rules apply.
-        requires: IR :class:`~sieval.core.models.Capability` set the task needs
-            from its model's Transport. Checked at construction via
-            :meth:`~sieval.core.models.Model.assert_capability`, so a model that
-            cannot honour a required feature (e.g. a chat backend asked for
-            ``InputScoring``) fails loud at setup rather than silently producing
-            wrong results. Defaults to the empty set (no IR requirement).
+        requires: Provider-neutral input and scoring semantics required from the
+            candidate model. The decorator projects legacy ``model_type`` onto
+            its input kind while preserving schema-version-1 metadata.
     """
 
     model_type: ClassVar[Literal["chat", "gen"] | None] = None
     tags: ClassVar[AbstractSet[str]] = frozenset()  # override in subclasses
-    requires: ClassVar[frozenset[Capability]] = frozenset()  # override in subclasses
+    requires: ClassVar[TaskRequirements] = TaskRequirements()
 
     def __init__(
         self, dataset: Dataset[TRawSample], model: Model, name: str | None = None
@@ -66,33 +150,142 @@ class Task[
         self._model = model
         self._name = name
 
-        if self.model_type is not None:
-            self._validate_model_type()
-        if self.requires:
-            self._model.assert_capability(*self.requires)
+        self._validate_model_requirements()
 
-    def _validate_model_type(self) -> None:
-        """Raise ``TypeError`` if the model's kind does not match :attr:`model_type`."""
-        from sieval.core.models import ChatModel, GenModel, SglangGenModel
+    @classmethod
+    def model_requirements_for(
+        cls, context: RequirementContext
+    ) -> tuple[TaskModelRequirement, ...]:
+        """Attach this task's candidate requirements to its normalized binding."""
 
-        expected_type = self.model_type
-        if isinstance(self._model, ChatModel):
-            actual_type = "chat"
-        elif isinstance(self._model, (GenModel, SglangGenModel)):
-            actual_type = "gen"
+        return cls._bind_model_requirements(context, cls.requires)
+
+    @classmethod
+    def _bind_model_requirements(
+        cls,
+        context: RequirementContext,
+        requires: TaskRequirements,
+    ) -> tuple[TaskModelRequirement, ...]:
+        if not isinstance(context, RequirementContext):
+            raise TypeError("context must be a RequirementContext")
+        if not isinstance(requires, TaskRequirements):
+            raise TypeError("requires must be TaskRequirements")
+
+        bindings = context.model_bindings
+        if not bindings:
+            raise ValueError(f"{cls.__name__} requires one candidate model binding")
+        if len(bindings) == 1:
+            role = next(iter(bindings))
         else:
+            has_candidate = "candidate" in bindings
+            has_model_alias = "model" in bindings
+            if has_candidate and has_model_alias:
+                raise ValueError(
+                    "ambiguous candidate binding: both 'candidate' and legacy "
+                    "'model' roles are present"
+                )
+            if has_candidate:
+                role = "candidate"
+            elif has_model_alias:
+                role = "model"
+            else:
+                raise ValueError(
+                    "multiple model bindings require an explicit 'candidate' role"
+                )
+
+        return cls._bind_role_requirement(context, role, requires)
+
+    @classmethod
+    def _bind_role_requirement(
+        cls,
+        context: RequirementContext,
+        role: str,
+        requires: TaskRequirements,
+    ) -> tuple[TaskModelRequirement, ...]:
+        """Attach one explicit model role to a task requirement projection."""
+
+        if not isinstance(context, RequirementContext):
+            raise TypeError("context must be a RequirementContext")
+        if not isinstance(role, str) or not role:
+            raise TypeError("role must be a non-empty string")
+        if not isinstance(requires, TaskRequirements):
+            raise TypeError("requires must be TaskRequirements")
+        try:
+            binding = context.model_bindings[role]
+        except KeyError as exc:
+            raise ValueError(
+                f"{cls.__name__} requires a {role!r} model binding"
+            ) from exc
+        meta = cls.__dict__.get("_sieval_task_meta")
+        source_task = getattr(meta, "name", cls.__name__)
+        return (
+            TaskModelRequirement(
+                role=role,
+                binding=binding,
+                requires=requires,
+                source_task=source_task,
+            ),
+        )
+
+    @classmethod
+    def _bind_top_logprobs_requirements(
+        cls,
+        context: RequirementContext,
+        *,
+        default: int,
+        floor: int = 1,
+    ) -> tuple[TaskModelRequirement, ...]:
+        """Bind a CLP task's configured request breadth from normalized args."""
+
+        if not isinstance(context, RequirementContext):
+            raise TypeError("context must be a RequirementContext")
+        raw = context.task_args.get("logprobs", default)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise TypeError("task_args.logprobs must be an integer")
+        if raw < 1:
+            raise ValueError("task_args.logprobs must be >= 1")
+        minimum = max(raw, floor)
+        requires = replace(cls.requires, min_top_logprobs=minimum)
+        return cls._bind_model_requirements(context, requires)
+
+    def _validate_model_requirements(self) -> None:
+        """Validate this task against the model's bound dialect and runtime plan."""
+
+        requires = self.requires
+        if not isinstance(requires, TaskRequirements):
+            raise TypeError(f"{type(self).__name__}.requires must be TaskRequirements")
+
+        view = cast("_RuntimeModelView", self._model)
+        dialect_id = getattr(view, "dialect_id", None)
+        if not isinstance(dialect_id, str) or not dialect_id:
             raise TypeError(
-                f"{self.__class__.__name__} requires a ChatModel or GenModel, "
-                f"but got {type(self._model).__name__}. "
-                f"Please check your model configuration."
+                f"{type(self).__name__} requires a model with a bound dialect_id"
+            )
+        runtime_plan = getattr(view, "runtime_plan", None)
+        if runtime_plan is not None and runtime_plan.dialect_id != dialect_id:
+            raise ValueError(
+                "model runtime plan dialect does not match model.dialect_id: "
+                f"{runtime_plan.dialect_id!r} != {dialect_id!r}"
             )
 
-        if expected_type != actual_type:
+        input_kinds, modalities = _dialect_input_shape(dialect_id)
+        if requires.input is not None and requires.input.value not in input_kinds:
             raise TypeError(
-                f"{self.__class__.__name__} requires model_type='{expected_type}', "
-                f"but got '{actual_type}' model. "
-                f"Please check your model configuration."
+                f"{type(self).__name__} requires input={requires.input.value!r}, "
+                f"but dialect {dialect_id!r} accepts {sorted(input_kinds)}"
             )
+        requested_modalities = {item.value for item in requires.input_modalities}
+        unsupported_modalities = requested_modalities - modalities
+        if unsupported_modalities:
+            raise TypeError(
+                f"{type(self).__name__} requires unsupported input modalities "
+                f"{sorted(unsupported_modalities)} for dialect {dialect_id!r}"
+            )
+
+        if runtime_plan is not None:
+            _validate_runtime_capabilities(type(self).__name__, requires, runtime_plan)
+        else:
+            _validate_descriptor_capabilities(type(self).__name__, requires, dialect_id)
 
     @property
     def dataset(self) -> Dataset[TRawSample]:
@@ -141,7 +334,7 @@ class Task[
             and self._dataset.test_set
             and 0 <= sample_id < len(self._dataset.test_set)
         ):
-            raw = self._dataset.test_set[sample_id]  # type: ignore[invalid-assignment]
+            raw = cast(TRawSample, self._dataset.test_set[sample_id])
         return TaskContext(sample_id, raw)
 
     @abstractmethod

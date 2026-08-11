@@ -9,6 +9,8 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.core.models import (
+    CompletionInput,
+    InputScoringResult,
     ModelOutput,
     Request,
     Response,
@@ -16,7 +18,6 @@ from sieval.core.models import (
     UsageStats,
 )
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import EvalMode, TaskContext
 from sieval.core.tasks.meta import get_task_meta
 from sieval.datasets.arc_challenge import (
@@ -43,27 +44,29 @@ class _ScriptedGenModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
-        if not (req.return_logprobs or req.score_input):
+        if not (req.scoring.sampled_logprobs or req.scoring.input_scoring):
             return Response(texts=("",))
-        assert isinstance(req.input, str)
-        assert req.score_input is True
-        assert req.top_k == 0  # ppl requests no top-k (matches hellaswag sibling)
-        self.prompts.append(req.input)
-        option = req.input.split("Answer:")[-1].strip()
+        assert isinstance(req.input, CompletionInput)
+        prompt = req.input.text
+        assert req.scoring.input_scoring is True
+        # PPL requests no alternatives, matching the HellaSwag sibling.
+        assert req.scoring.top_logprobs == 0
+        self.prompts.append(prompt)
+        option = prompt.split("Answer:")[-1].strip()
         cond_lp, uncond_lp = self._scores[option]
-        value = uncond_lp if req.input.startswith(ARC_UNCOND_CONTEXT) else cond_lp
+        value = uncond_lp if prompt.startswith(ARC_UNCOND_CONTEXT) else cond_lp
         return Response(
             texts=("",),
-            logprobs=(
-                TokenLogprob(token="_ctx", logprob=None),
-                TokenLogprob(token="_opt", logprob=value),
-                TokenLogprob(token="_generated", logprob=-99.0),
+            input_scoring=InputScoringResult(
+                token_logprobs=(
+                    TokenLogprob(token="_ctx", logprob=None),
+                    TokenLogprob(token="_opt", logprob=value),
+                )
             ),
+            logprobs=(TokenLogprob(token="_generated", logprob=-99.0),),
             usage=UsageStats(input_tokens=2, output_tokens=1, total_tokens=3),
         )
 

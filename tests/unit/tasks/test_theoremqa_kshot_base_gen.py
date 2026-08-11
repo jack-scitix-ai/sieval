@@ -17,7 +17,6 @@ from datasets import DatasetDict as HFDatasetDict
 
 from sieval.core.models import Request, Response, SamplingParams
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     build_judgement_record,
     build_prediction_record,
@@ -77,12 +76,10 @@ class _MockGenModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
-        if req.return_logprobs or req.score_input:
+        if req.scoring.sampled_logprobs or req.scoring.input_scoring:
             raise NotImplementedError  # the gen task never requests logprobs
         self.last_req = req
         return Response(texts=("The answer is 4",))
@@ -168,7 +165,7 @@ async def test_infer_only_forwards_prompt_coupled_stop():
     assert req is not None
     # Only the prompt-coupled stop is forwarded — no other sampling params.
     assert req.sampling == SamplingParams(stop=tuple(task_module._STOP_TOKENS))
-    assert req.extra_wire_params is None
+    assert req.dialect_options is None
 
 
 @pytest.mark.anyio

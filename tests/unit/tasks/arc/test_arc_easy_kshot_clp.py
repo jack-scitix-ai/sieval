@@ -8,9 +8,8 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import Request, Response, TopKEntry
+from sieval.core.models import Request, Response, TokenLogprob, TopKEntry
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import EvalMode, TaskContext
 from sieval.core.tasks.meta import get_task_meta
 from sieval.datasets.arc_easy import ARCEasyDataset, ARCEasyDatasetSample
@@ -24,15 +23,14 @@ class _TopLogprobsGenModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
-        if not (req.return_logprobs or req.score_input):
+        if not (req.scoring.sampled_logprobs or req.scoring.input_scoring):
             return Response(texts=("",))
         return Response(
             texts=("B",),
+            logprobs=(TokenLogprob(token="B", logprob=-0.1),),
             top_logprobs=(
                 tuple(TopKEntry(token=t, logprob=lp) for t, lp in self._top.items()),
             ),

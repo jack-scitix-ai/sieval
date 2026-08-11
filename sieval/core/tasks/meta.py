@@ -30,12 +30,13 @@ import importlib
 import pkgutil
 import re
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 from sieval.core.datasets.meta import extract_sample_type
+from sieval.core.models.requirements import InputKind, TaskRequirements
 
 from .context import TaskRunIdentity
 from .task import Task
@@ -200,11 +201,11 @@ def sieval_task[T: type[Task]](
     inspecting the Task's first generic argument (its sample TypedDict)
     and looking up the corresponding `@sieval_dataset`-decorated class.
 
-    Also sets two runtime-facing class attrs: `cls.tags` (protocol set
-    synthesized from `eval_mode` + `n_shot`, consumed by anomaly routing —
-    distinct from the descriptive `tags` argument stored on
-    `_sieval_task_meta`) and `cls.model_type`. Raises ValueError at import
-    time for duplicate `name`.
+    Also sets runtime-facing class attrs: `cls.tags` (protocol set synthesized
+    from `eval_mode` + `n_shot`, consumed by anomaly routing — distinct from
+    the descriptive `tags` argument stored on `_sieval_task_meta`),
+    `cls.model_type`, and the provider-neutral input kind projected into
+    `cls.requires`. Raises ValueError at import time for duplicate `name`.
 
     `reference_kind` declares what form the task's ground truth takes. It is a
     task-level constant, so it lives here rather than on every judgement record
@@ -269,13 +270,26 @@ def sieval_task[T: type[Task]](
             reference_kind=reference_kind,
         )
         setattr(cls, _TASK_META_ATTR, meta)
-        cls.tags = protocol_tags
+        dynamic_cls = cast(Any, cls)
+        dynamic_cls.tags = protocol_tags
         # Seeds the declared count on the class. A task with a shot-count knob
         # shadows it per instance in __init__; a knobless one is already right,
         # which is why no task needs code to make `meta.json` correct.
-        cls.n_shot = n_shot
+        dynamic_cls.n_shot = n_shot
         if model_type is not None:
-            cls.model_type = model_type
+            dynamic_cls.model_type = model_type
+            declared = cls.requires
+            if not isinstance(declared, TaskRequirements):
+                raise TypeError(f"{cls.__qualname__}.requires must be TaskRequirements")
+            projected_input = (
+                InputKind.CHAT if model_type == "chat" else InputKind.COMPLETION
+            )
+            if declared.input is not None and declared.input is not projected_input:
+                raise ValueError(
+                    f"{cls.__qualname__}.requires.input={declared.input.value!r} "
+                    f"conflicts with model_type={model_type!r}"
+                )
+            dynamic_cls.requires = replace(declared, input=projected_input)
         TASK_REGISTRY[name] = meta
         _TASK_CLASSES[name] = cls
         return cls

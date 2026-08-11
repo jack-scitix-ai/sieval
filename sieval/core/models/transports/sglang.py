@@ -1,4 +1,8 @@
-"""SglangTransport: native sglang ``/generate`` frontend for the Model IR.
+"""Legacy native SGLang ``/generate`` executor retained until PR 5.
+
+This module deliberately does not implement the canonical split ``Dialect``
+contract and is not the reserved ``sglang_native`` dialect.  Only the explicit
+``SglangGenModel``/``sglang_legacy`` compatibility bypass calls it in PR 1.
 
 sglang's OpenAI ``/v1/completions`` endpoint rejects ``echo=True`` together
 with ``logprobs``, so PPL-style scoring cannot go through it. This transport
@@ -29,10 +33,9 @@ AI-Generated Code - Claude Fable 5 (Anthropic)
 
 from typing import Any, cast
 
-from sieval.core.types import JSONValue
-
-from ..capabilities import Capability
-from ..ir import (
+from sieval.core.models.capabilities import Capability
+from sieval.core.models.ir import (
+    CompletionInput,
     InputScoringResult,
     Request,
     Response,
@@ -40,6 +43,7 @@ from ..ir import (
     TopKEntry,
     UsageStats,
 )
+from sieval.core.types import JSONValue
 
 # OpenAI-style generation kwarg -> sglang sampling_params key. Only these are
 # forwarded to /generate; unrecognized kwargs (e.g. seed, stream, echo) are
@@ -98,7 +102,7 @@ def _normalize_token_text(text: str | None) -> str:
     return text.replace("Ġ", " ").replace("Ċ", "\n")
 
 
-def _finish_reason(meta: dict) -> str:
+def _finish_reason(meta: dict[str, Any]) -> str:
     """Extract a flat finish-reason string from sglang ``meta_info``."""
     fr = meta.get("finish_reason")
     if isinstance(fr, dict):
@@ -107,7 +111,7 @@ def _finish_reason(meta: dict) -> str:
 
 
 class SglangTransport:
-    """Transport for sglang native ``/generate``.
+    """Legacy executor for SGLang's native ``/generate`` endpoint.
 
     ``token_id`` is always populated (sglang returns ``[logprob, token_id,
     token_text]`` triples).
@@ -140,7 +144,9 @@ class SglangTransport:
         base = (self._api_base or "").rstrip("/").removesuffix("/v1").rstrip("/")
         return f"{base}/generate"
 
-    async def _post(self, body: dict[str, JSONValue]) -> dict | list:
+    async def _post(
+        self, body: dict[str, JSONValue]
+    ) -> dict[str, Any] | list[dict[str, Any]]:
         """POST ``body`` to ``/generate`` via the OpenAI client.
 
         Reuses the OpenAI SDK's low-level ``post`` to speak the native
@@ -150,61 +156,67 @@ class SglangTransport:
         JSON (a dict, or a list when ``sampling_params.n > 1``).
         """
         return cast(
-            "dict | list",
+            "dict[str, Any] | list[dict[str, Any]]",
             await self._client.post(self._generate_url(), cast_to=object, body=body),
         )
 
     # ── lower ─────────────────────────────────────────────────────────────────
 
     def _lower(self, req: Request) -> dict[str, JSONValue]:
-        if not isinstance(req.input, str):
-            raise TypeError("SglangTransport requires str input (Completion modality).")
+        if not isinstance(req.input, CompletionInput):
+            raise TypeError("SglangTransport requires CompletionInput.")
 
         sampling: dict[str, JSONValue] = {}
         sp = req.sampling
-        n = 1
-        if sp is not None:
-            if sp.max_tokens is not None:
-                sampling["max_new_tokens"] = sp.max_tokens
-            if sp.temperature is not None:
-                sampling["temperature"] = sp.temperature
-            if sp.top_p is not None:
-                sampling["top_p"] = sp.top_p
-            if sp.top_k_sampling is not None:
-                sampling["top_k"] = sp.top_k_sampling
-            if sp.stop is not None:
-                sampling["stop"] = list(sp.stop)
-            if sp.frequency_penalty is not None:
-                sampling["frequency_penalty"] = sp.frequency_penalty
-            if sp.presence_penalty is not None:
-                sampling["presence_penalty"] = sp.presence_penalty
-            n = sp.n
-            if n > 1:
-                sampling["n"] = n
+        n = sp.n
+        if sp.max_tokens is not None:
+            sampling["max_new_tokens"] = sp.max_tokens
+        if sp.temperature is not None:
+            sampling["temperature"] = sp.temperature
+        if sp.top_p is not None:
+            sampling["top_p"] = sp.top_p
+        if sp.top_k is not None:
+            sampling["top_k"] = sp.top_k
+        if sp.stop is not None:
+            sampling["stop"] = list(sp.stop)
+        if sp.frequency_penalty is not None:
+            sampling["frequency_penalty"] = sp.frequency_penalty
+        if sp.presence_penalty is not None:
+            sampling["presence_penalty"] = sp.presence_penalty
+        if n > 1:
+            sampling["n"] = n
 
         # sglang rejects max_new_tokens=0; scoring still needs at least one.
-        if req.score_input and not sampling.get("max_new_tokens"):
+        if req.scoring.input_scoring and not sampling.get("max_new_tokens"):
             sampling["max_new_tokens"] = 1
 
         # Prefill capability: sglang accepts a forced prefill on sampling_params.
-        if req.prefix is not None:
-            sampling["prefill"] = req.prefix
+        options = req.dialect_options
+        if options is not None:
+            prefill = options.values.get("prefill", options.values.get("prefix"))
+            if prefill is not None:
+                sampling["prefill"] = prefill
 
         # Legacy-parity passthrough: only kwargs with a known sglang
         # sampling-param equivalent are forwarded; the rest are dropped.
-        if req.extra_wire_params:
-            for k, v in req.extra_wire_params.items():
+        if options is not None:
+            for k, v in options.values.items():
+                if k in {"prefill", "prefix"}:
+                    continue
                 dst = _SAMPLING_PARAM_MAP.get(k)
                 if dst is not None and v is not None:
                     sampling.setdefault(dst, v)
 
-        body: dict[str, JSONValue] = {"text": req.input, "sampling_params": sampling}
+        body: dict[str, JSONValue] = {
+            "text": req.input.text,
+            "sampling_params": sampling,
+        }
 
-        if req.return_logprobs or req.score_input:
+        if req.scoring.sampled_logprobs or req.scoring.input_scoring:
             body["return_logprob"] = True
             # 0 → all echoed input token logprobs; -1 → output only.
-            body["logprob_start_len"] = 0 if req.score_input else -1
-            body["top_logprobs_num"] = req.top_k
+            body["logprob_start_len"] = 0 if req.scoring.input_scoring else -1
+            body["top_logprobs_num"] = req.scoring.top_logprobs
             body["return_text_in_logprobs"] = True
 
         return body
@@ -212,7 +224,7 @@ class SglangTransport:
     # ── lift ────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _triples_to_tokens(entries: list) -> tuple[TokenLogprob, ...]:
+    def _triples_to_tokens(entries: list[Any]) -> tuple[TokenLogprob, ...]:
         """Map sglang ``[logprob, token_id, token_text]`` triples to TokenLogprobs.
 
         Unlike the legacy parser, ``token_id`` is preserved.
@@ -228,7 +240,7 @@ class SglangTransport:
 
     @staticmethod
     def _triples_to_topk(
-        entries: list,
+        entries: list[Any],
     ) -> tuple[tuple[TopKEntry, ...], ...] | None:
         """Map per-token sglang top-k triple lists to tuples of TopKEntry.
 
@@ -255,7 +267,7 @@ class SglangTransport:
         return tuple(result)
 
     @staticmethod
-    def _parse_usage(metas: list[dict]) -> UsageStats | None:
+    def _parse_usage(metas: list[dict[str, Any]]) -> UsageStats | None:
         """Build usage from sglang ``meta_info`` token counts.
 
         Prompt tokens are shared across n samples; completions sum.
@@ -270,7 +282,7 @@ class SglangTransport:
             total_tokens=input_tokens + output_tokens,
         )
 
-    def _guard_radix_cache(self, meta: dict) -> None:
+    def _guard_radix_cache(self, meta: dict[str, Any]) -> None:
         """Reject partial echoed-input logprobs from the radix prefix cache.
 
         sglang's radix prefix cache does not recompute logprobs for cached
@@ -303,7 +315,7 @@ class SglangTransport:
 
     def _lift(
         self,
-        results: list[dict],
+        results: list[dict[str, Any]],
         body: dict[str, JSONValue],
         *,
         score_input: bool,
@@ -346,7 +358,7 @@ class SglangTransport:
             usage=usage,
             finish_reasons=finish_reasons,
             request_params=_request_params(body),
-            response_model=self._model,
+            response_model=None,
         )
 
     # ── arun ──────────────────────────────────────────────────────────────────
@@ -366,6 +378,6 @@ class SglangTransport:
         return self._lift(
             results,
             body,
-            score_input=req.score_input,
-            want_logprobs=req.return_logprobs,
+            score_input=req.scoring.input_scoring,
+            want_logprobs=req.scoring.sampled_logprobs,
         )

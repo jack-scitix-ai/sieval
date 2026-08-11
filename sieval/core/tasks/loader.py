@@ -58,6 +58,60 @@ used for deterministic latest-offset selection.
 where only iteration and file position matter."""
 
 
+def _hydrate_model_call_provenance(meta: Any, registry: dict[str, type]) -> Any:
+    """Rehydrate typed provenance without interpreting arbitrary stage metadata.
+
+    ``TaskStageMeta`` otherwise stays a JSON-shaped mapping after loading.  Walk
+    only its declared ``model_calls[*].model.provenance`` seam so a user-owned
+    ``extra`` mapping containing a coincidental ``__sieval_cls__`` key remains
+    untouched.
+    """
+
+    if not isinstance(meta, dict):
+        return meta
+    model_calls = meta.get("model_calls")
+    if not isinstance(model_calls, list):
+        return meta
+
+    hydrated_calls: list[Any] = []
+    changed = False
+    for call in model_calls:
+        if not isinstance(call, dict):
+            hydrated_calls.append(call)
+            continue
+        model = call.get("model")
+        if not isinstance(model, dict) or "provenance" not in model:
+            hydrated_calls.append(call)
+            continue
+        hydrated_model = dict(model)
+        hydrated_model["provenance"] = dict_to_obj(model["provenance"], registry)
+        hydrated_call = dict(call)
+        hydrated_call["model"] = hydrated_model
+        hydrated_calls.append(hydrated_call)
+        changed = True
+
+    if not changed:
+        return meta
+    hydrated_meta = dict(meta)
+    hydrated_meta["model_calls"] = hydrated_calls
+    return hydrated_meta
+
+
+def _hydrate_stage_meta_history(value: Any, registry: dict[str, type]) -> Any:
+    """Rehydrate provenance in a stage-name -> metadata-history mapping."""
+
+    if not isinstance(value, dict):
+        return value
+    return {
+        stage: (
+            [_hydrate_model_call_provenance(meta, registry) for meta in history]
+            if isinstance(history, list)
+            else history
+        )
+        for stage, history in value.items()
+    }
+
+
 class IdxRecord(TypedDict):
     """Parsed representation of a single line from a ``.idx`` shard index file.
 
@@ -479,7 +533,11 @@ class TaskLoader:
             stage_key = dep_stage.value
             if stage_key not in current_ctx.stage_meta:
                 existing_meta = dict(current_ctx.stage_meta)
-                existing_meta[stage_key] = [obj["meta_last"]]
+                existing_meta[stage_key] = [
+                    _hydrate_model_call_provenance(
+                        obj["meta_last"], self._type_registry
+                    )
+                ]
                 updates["stage_meta"] = existing_meta
 
         if updates:
@@ -535,9 +593,17 @@ class TaskLoader:
             updates["retry_count"] = obj.get("retry_count", 0)
 
         if "stage_meta" in obj:
-            updates["stage_meta"] = obj["stage_meta"]
+            updates["stage_meta"] = _hydrate_stage_meta_history(
+                obj["stage_meta"], self._type_registry
+            )
         elif "meta_last" in obj and "stage" in obj:
-            updates["stage_meta"] = {obj["stage"]: [obj["meta_last"]]}
+            updates["stage_meta"] = {
+                obj["stage"]: [
+                    _hydrate_model_call_provenance(
+                        obj["meta_last"], self._type_registry
+                    )
+                ]
+            }
 
         new_ctx = replace(ctx, **updates)
         contexts[ctx.sample_id] = new_ctx

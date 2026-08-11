@@ -7,9 +7,14 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput, Request, Response, SamplingParams
+from sieval.core.models import (
+    CompletionInput,
+    ModelOutput,
+    Request,
+    Response,
+    SamplingParams,
+)
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     TaskContext,
     build_judgement_record,
@@ -40,13 +45,11 @@ class _CapturingGenModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
         self.last_req = req
-        return Response(texts=("    return x + 1",))
+        return Response(texts=("    return x + 1",) * req.sampling.n)
 
 
 def _sample() -> HumanEvalDatasetSample:
@@ -84,11 +87,11 @@ async def test_preprocess_and_infer_use_base_completion_prompt():
         assert pre["prompt"] == raw["prompt"]
         req = model.last_req
         assert req is not None
-        assert req.input == raw["prompt"]
+        assert req.input == CompletionInput(raw["prompt"])
         # Decoding params (max_tokens, temperature, top_p) are owned by the
         # model config / infer_args, never injected by the task layer.
         assert req.sampling == SamplingParams(stop=("\nclass",), n=2)
-        assert req.extra_wire_params is None
+        assert req.dialect_options is None
     finally:
         await task.shutdown()
 

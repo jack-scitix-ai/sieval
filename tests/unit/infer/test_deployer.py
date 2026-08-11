@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import anyio
 import pytest
 
+from sieval.core.models import ServingFacts
 from sieval.infer.backends.translator import BackendCommand
 from sieval.infer.config import InferCondition, InferHandle, InferPhase
 from sieval.infer.deployer import (
@@ -35,9 +36,10 @@ def _make_handle(
     health_url: str = "http://localhost:8000/health",
     endpoint: str = "http://localhost:8000/v1",
     log_file: str = "/tmp/test.log",
+    backend: str = "sglang",
 ) -> InferHandle:
     return InferHandle(
-        backend=role,
+        backend=backend,
         handle_id=pid,
         endpoint=endpoint,
         metadata={
@@ -255,10 +257,10 @@ class TestDelete:
         await deployer.delete(handle)
 
 
-# ---------- build_capabilities ----------
+# ---------- build_deployment ----------
 
 
-class TestBuildCapabilities:
+class TestBuildDeployment:
     def test_single_full_role(self):
         deployer = LocalDeployer()
         plan = DeploymentPlan(
@@ -274,12 +276,35 @@ class TestBuildCapabilities:
         )
         handles = [_make_handle(role="full", endpoint="http://localhost:30000/v1")]
 
-        caps = deployer.build_capabilities(plan, handles)
-        assert caps.api_base == "http://localhost:30000/v1"
-        assert caps.is_disaggregated is False
-        assert caps.roles == ("full",)
-        assert caps.total_gpus == 8
-        assert caps.endpoints == {"full": "http://localhost:30000/v1"}
+        facts = ServingFacts(
+            engine_version="0.4.6",
+            tokenizer_available=True,
+            prefix_cache_enabled=False,
+            max_top_logprobs=20,
+        )
+        deployment = deployer.build_deployment(
+            plan,
+            handles,
+            deployment_id="managed-1",
+            metrics_url="http://localhost:30000/metrics",
+            facts=facts,
+        )
+
+        assert deployment.deployment_id == "managed-1"
+        assert deployment.api_base == "http://localhost:30000/v1"
+        assert deployment.endpoints == {"full": "http://localhost:30000/v1"}
+        assert deployment.engine.engine_id == "sglang"
+        assert deployment.engine_source == "deployment"
+        assert deployment.plan is not None
+        assert deployment.plan.engine_id == "sglang"
+        assert deployment.plan.fingerprint.startswith("sha256:")
+        assert deployment.topology is not None
+        assert deployment.topology.is_disaggregated is False
+        assert deployment.topology.roles == ("full",)
+        assert deployment.topology.total_gpus == 8
+        assert deployment.metrics_url == "http://localhost:30000/metrics"
+        assert deployment.facts is facts
+        assert deployment.fingerprint.startswith("sha256:")
 
     def test_pd_disaggregated(self):
         deployer = LocalDeployer()
@@ -304,11 +329,15 @@ class TestBuildCapabilities:
             _make_handle(role="decode", endpoint="http://localhost:30001/v1"),
         ]
 
-        caps = deployer.build_capabilities(plan, handles)
-        assert caps.is_disaggregated is True
-        assert caps.roles == ("prefill", "decode")
-        assert caps.total_gpus == 8
-        assert len(caps.endpoints) == 2
+        deployment = deployer.build_deployment(plan, handles)
+        assert deployment.deployment_id is not None
+        assert deployment.deployment_id.startswith("local:")
+        assert deployment.topology is not None
+        assert deployment.topology.is_disaggregated is True
+        assert deployment.topology.roles == ("prefill", "decode")
+        assert deployment.topology.total_gpus == 8
+        assert len(deployment.endpoints) == 2
+        assert deployment.facts == ServingFacts()
 
     def test_no_endpoint_handles(self):
         deployer = LocalDeployer()
@@ -325,9 +354,77 @@ class TestBuildCapabilities:
         )
         handles = [_make_handle(role="full", endpoint="")]
 
-        caps = deployer.build_capabilities(plan, handles)
-        assert caps.api_base == ""
-        assert caps.endpoints == {}
+        deployment = deployer.build_deployment(plan, handles)
+        assert deployment.api_base == ""
+        assert deployment.endpoints == {}
+
+    def test_local_identity_is_independent_of_handle_order(self):
+        deployer = LocalDeployer()
+        plan = DeploymentPlan(
+            checkpoint="/models/test",
+            backend="sglang",
+            assignments=(
+                RoleAssignment(
+                    role="prefill",
+                    devices=DeviceGroup(count=1),
+                    topology=ParallelTopology(),
+                ),
+                RoleAssignment(
+                    role="decode",
+                    devices=DeviceGroup(count=1),
+                    topology=ParallelTopology(),
+                ),
+            ),
+        )
+        handles = [
+            _make_handle(
+                pid="101",
+                role="prefill",
+                endpoint="http://localhost:30000/v1",
+            ),
+            _make_handle(
+                pid="102",
+                role="decode",
+                endpoint="http://localhost:30001/v1",
+            ),
+        ]
+
+        first = deployer.build_deployment(plan, handles)
+        second = deployer.build_deployment(plan, list(reversed(handles)))
+        assert first.deployment_id == second.deployment_id
+        assert first.api_base == second.api_base == "http://localhost:30001/v1"
+        assert first.fingerprint == second.fingerprint
+
+    def test_conflicting_endpoints_for_one_role_fail_loudly(self):
+        deployer = LocalDeployer()
+        plan = DeploymentPlan(
+            checkpoint="/models/test",
+            backend="vllm",
+            assignments=(
+                RoleAssignment(
+                    role="full",
+                    devices=DeviceGroup(count=1),
+                    topology=ParallelTopology(),
+                ),
+            ),
+        )
+        handles = [
+            _make_handle(
+                pid="101",
+                role="full",
+                endpoint="http://localhost:8000/v1",
+                backend="vllm",
+            ),
+            _make_handle(
+                pid="102",
+                role="full",
+                endpoint="http://localhost:8001/v1",
+                backend="vllm",
+            ),
+        ]
+
+        with pytest.raises(ValueError, match="different endpoints.*'full'"):
+            deployer.build_deployment(plan, handles)
 
 
 # ---------- logs ----------

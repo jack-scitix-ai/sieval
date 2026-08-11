@@ -44,6 +44,7 @@ from sieval.core.tasks import (
     PromptRecord,
     ReferenceImpl,
     Task,
+    TaskRequirements,
     sieval_task,
 )
 from sieval.datasets import ARCEasyDatasetSample
@@ -108,6 +109,8 @@ class ARCEasyFewShotPplTask(
         dict[str, float | str],
     ]
 ):
+    requires = TaskRequirements(input_scoring=True)
+
     def __init__(
         self,
         dataset,

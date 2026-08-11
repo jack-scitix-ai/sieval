@@ -8,9 +8,14 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import Request, Response, TopKEntry
+from sieval.core.models import (
+    CompletionInput,
+    Request,
+    Response,
+    TokenLogprob,
+    TopKEntry,
+)
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import EvalMode, TaskContext
 from sieval.core.tasks.meta import get_task_meta
 from sieval.datasets.arc_challenge import (
@@ -31,18 +36,17 @@ class _TopLogprobsGenModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
-        if not (req.return_logprobs or req.score_input):
+        if not (req.scoring.sampled_logprobs or req.scoring.input_scoring):
             return Response(texts=("",))
-        assert isinstance(req.input, str)
-        self.prompts.append(req.input)
-        self.echo_flags.append(req.score_input)
+        assert isinstance(req.input, CompletionInput)
+        self.prompts.append(req.input.text)
+        self.echo_flags.append(req.scoring.input_scoring)
         return Response(
             texts=("A",),
+            logprobs=(TokenLogprob(token="A", logprob=-0.1),),
             top_logprobs=(
                 tuple(TopKEntry(token=t, logprob=lp) for t, lp in self._top.items()),
             ),

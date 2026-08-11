@@ -16,7 +16,8 @@ from sieval.core.datasets.meta import (
     DatasetMeta,
     Level1Category,
 )
-from sieval.core.tasks import Task
+from sieval.core.models.requirements import NamedModelBinding, RequirementContext
+from sieval.core.tasks import InputKind, Task, TaskRequirements
 from sieval.core.tasks.meta import (
     TASK_REGISTRY,
     EvalMode,
@@ -867,6 +868,16 @@ def test_sieval_task_sets_class_model_type():
         pass
 
     assert TChat.model_type == "chat"
+    assert TChat.requires.input is InputKind.CHAT
+
+    @sieval_task(**_valid_kwargs(name="mt_gen", model_type="gen"))
+    class TGen(_StubTask):
+        requires = TaskRequirements(sampled_logprobs=True)
+
+    assert TGen.model_type == "gen"
+    assert TGen.requires == TaskRequirements(
+        input=InputKind.COMPLETION, sampled_logprobs=True
+    )
 
     @sieval_task(**_valid_kwargs(name="mt_none", model_type=None))
     class TNone(_StubTask):
@@ -875,6 +886,28 @@ def test_sieval_task_sets_class_model_type():
     # model_type=None means "don't touch the class attr" — decorator must not
     # write None onto the class, so subclasses can inherit from Task base.
     assert "model_type" not in TNone.__dict__
+    assert "requires" not in TNone.__dict__
+
+
+def test_sieval_task_rejects_conflicting_legacy_model_type_projection():
+    with pytest.raises(ValueError, match="conflicts with model_type"):
+
+        @sieval_task(**_valid_kwargs(name="mt_conflict", model_type="chat"))
+        class TConflict(_StubTask):
+            requires = TaskRequirements(input=InputKind.COMPLETION)
+
+
+def test_model_requirements_preserve_registered_task_name_as_source():
+    @sieval_task(**_valid_kwargs(name="source_name", model_type="chat"))
+    class T(_StubTask):
+        pass
+
+    binding = NamedModelBinding("id", "root", "model", "candidate")
+    (requirement,) = T.model_requirements_for(
+        RequirementContext(model_bindings={"candidate": binding})
+    )
+
+    assert requirement.source_task == "source_name"
 
 
 def test_sieval_task_descriptive_tags_do_not_leak_to_class_tags():

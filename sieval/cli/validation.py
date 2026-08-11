@@ -2,23 +2,37 @@
 Config pre-validation and dry-run for ``sieval eval --dry-run``
 and ``sieval run --dry-run``.
 
-Provides three validation layers:
+Provides four validation layers:
 - **Schema validation** (``validate_eval_config``): static structure checks
 - **Import validation** (``validate_eval_config_imports``): class import checks
+- **Capability reconciliation**: task/binding compatibility before clients or launch
 - **Dry-run orchestration** (``run_dry_run``): structured result for CLI consumption
 
 AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict, cast
 
 import yaml
 
 from sieval.cli.leaderboard.session import RootConfigDict
 from sieval.cli.resolution import resolve_dataset_class, resolve_task_class
+from sieval.core.models.capabilities import (
+    CAPABILITY_KEYS,
+    CapabilityConfigError,
+    DialectCapabilityStatus,
+    Supported,
+    normalize_capability_declarations,
+)
+from sieval.core.models.dialect_registry import (
+    DialectNotImplemented,
+    UnknownDialect,
+    capability_decisions_for,
+    get_dialect_spec,
+)
 from sieval.core.runners import TaskRunnerConfig
 from sieval.core.tasks.consts import TaskAction
 
@@ -93,7 +107,7 @@ def load_yaml_with_duplicate_check(content: str) -> tuple[dict, list[str]]:
     checker = _make_duplicate_key_checker(warnings)
     # Per-call subclass to avoid shared class-level state (thread-safe)
     loader_cls = type("_DuplicateKeyLoader", (yaml.SafeLoader,), {})
-    loader_cls.construct_mapping = checker  # type: ignore[assignment]
+    cast(Any, loader_cls).construct_mapping = checker
     data = yaml.load(content, Loader=loader_cls)
     if data is None:
         data = {}
@@ -155,6 +169,13 @@ def _validate_models(cfg: dict, result: ValidationResult) -> None:
             result.errors.append(
                 f"Model '{name}': type must be 'chat' or 'gen', got '{model_type}'"
             )
+
+        if "service_role" in mcfg:
+            service_role = mcfg.get("service_role")
+            if not isinstance(service_role, str) or not service_role:
+                result.errors.append(
+                    f"Model '{name}': 'service_role' must be a non-empty string"
+                )
 
         # `engine` selects the gen backend (mirrors _setup_models' guards; the
         # engine-on-non-gen check there uses the *inferred* type, so here we
@@ -232,6 +253,103 @@ def _validate_models(cfg: dict, result: ValidationResult) -> None:
     if pending:
         cycle_info = ", ".join(f"{n}->{pending[n]}" for n in sorted(pending))
         result.errors.append(f"Cyclic model dependencies: {cycle_info}")
+
+
+def _validate_capabilities(cfg: dict, result: ValidationResult) -> None:
+    """Validate canonical dialect and capability declarations for each model.
+
+    An explicit dialect selects its descriptor and executable PR-1 binder.  If
+    the dialect is omitted, only provider-neutral option shapes can be checked
+    here; task-derived default selection remains composition's job.  This layer
+    deliberately does not duplicate #59's model-kind resolver.
+    """
+    models = cfg.get("models", {})
+
+    for name, mcfg in models.items():
+        if not isinstance(mcfg, dict):
+            continue  # already reported by _validate_structure
+
+        has_dialect = "dialect" in mcfg
+        raw_dialect = mcfg.get("dialect")
+        dialect_id: str | None = None
+        decisions = None
+
+        if has_dialect:
+            if not isinstance(raw_dialect, str) or not raw_dialect:
+                result.errors.append(
+                    f"Model '{name}': 'dialect' must be a non-empty string"
+                )
+                continue
+            dialect_id = raw_dialect
+
+        # The one-cycle SGLang path intentionally has no RuntimeBindingPlan or
+        # capability binder.  Existing configs may keep using it, but new
+        # capability declarations must wait for the native adapter.
+        if (
+            not has_dialect
+            and "capabilities" in mcfg
+            and mcfg.get("engine") == "sglang"
+        ):
+            result.errors.append(
+                f"Model '{name}': 'capabilities' cannot be declared on the "
+                "legacy SGLang bypass; select an active canonical dialect"
+            )
+            continue
+
+        if dialect_id is not None:
+            try:
+                spec = get_dialect_spec(dialect_id)
+                decisions = capability_decisions_for(dialect_id)
+            except (UnknownDialect, DialectNotImplemented) as exc:
+                result.errors.append(f"Model '{name}': {exc}")
+                continue
+            outcomes = spec.capability_outcomes
+        else:
+            # A task-derived chat/completion default is not available during
+            # static schema validation.  An all-supported row invokes the same
+            # typed parser without claiming dialect support; reconcile() repeats
+            # the check against the selected dialect's real outcome row.
+            outcomes = dict.fromkeys(
+                CAPABILITY_KEYS,
+                DialectCapabilityStatus.SUPPORTED,
+            )
+            dialect_id = "task-derived"
+
+        if "capabilities" not in mcfg:
+            continue
+
+        try:
+            declarations = normalize_capability_declarations(
+                mcfg["capabilities"],
+                dialect_id=dialect_id,
+                outcomes=cast(Mapping[str, DialectCapabilityStatus | str], outcomes),
+            )
+        except CapabilityConfigError as exc:
+            result.errors.append(f"Model '{name}': {exc}")
+            continue
+
+        if decisions is None:
+            continue
+        for key, declaration in declarations.items():
+            if declaration is False:
+                continue
+            decision = decisions[key]
+            if not isinstance(decision, Supported):
+                # normalize_capability_declarations() already rejects enabled
+                # unsupported outcomes; retain a defensive fail-loud branch if
+                # registry metadata and executable decisions ever diverge.
+                result.errors.append(
+                    f"Model '{name}': dialect {dialect_id!r} has no executable "
+                    f"binding for capability {key!r}"
+                )
+                continue
+            try:
+                decision.binding.validate_config(declaration)
+            except (CapabilityConfigError, TypeError, ValueError) as exc:
+                result.errors.append(
+                    f"Model '{name}': invalid {key!r} configuration for "
+                    f"dialect {dialect_id!r}: {exc}"
+                )
 
 
 def _validate_datasets(cfg: dict, result: ValidationResult) -> None:
@@ -395,6 +513,7 @@ def validate_eval_config(cfg: dict) -> ValidationResult:
     if not _validate_structure(cfg, result):
         return result
     _validate_models(cfg, result)
+    _validate_capabilities(cfg, result)
     _validate_datasets(cfg, result)
     _validate_tasks(cfg, result)
     _validate_runner_config(cfg, result)
@@ -489,6 +608,7 @@ class DryRunCheck(TypedDict):
     ok: bool
     detail: NotRequired[str]
     warnings: NotRequired[list[str]]
+    plan: NotRequired[dict[str, Any]]
 
 
 class DryRunResult(TypedDict):
@@ -499,7 +619,73 @@ class DryRunResult(TypedDict):
     n_warnings: int
 
 
-def run_dry_run(config: Path) -> DryRunResult:
+def _capability_reconcile_check(
+    config: Path,
+    *,
+    model_override: str | None = None,
+    resume: bool = False,
+    result_dir_override: str | None = None,
+    deterministic_override: bool | None = None,
+    infer_plans: Mapping[str, dict[str, Any]] | None = None,
+    invocation: str | None = None,
+    self_managed_endpoints: frozenset[str] = frozenset(),
+) -> DryRunCheck:
+    """Run the same pure prelaunch reconcile used by normal execution."""
+
+    # Keep the composition-root import local: validation is imported by both
+    # eval/run entrypoints, while session imports CLI-adjacent definitions.
+    from sieval.cli.leaderboard.session import EvalSession
+
+    try:
+        result = EvalSession(
+            config,
+            model_override=model_override,
+            resume=resume,
+            result_dir_override=result_dir_override,
+            deterministic_override=deterministic_override,
+            infer_plans=infer_plans,
+            invocation=invocation,
+            self_managed_endpoints=self_managed_endpoints,
+        ).prepare_prelaunch()
+    except Exception as exc:
+        return {
+            "name": "capability_reconcile",
+            "ok": False,
+            # Preserve the normal prepare error verbatim so dry-run and run
+            # give users one diagnostic contract.
+            "detail": str(exc),
+        }
+
+    check: DryRunCheck = {
+        "name": "capability_reconcile",
+        "ok": True,
+        "detail": (
+            f"{len(result.binding_plans)} bindings, "
+            f"{len(result.deployment_plans)} deployment roots"
+        ),
+        "plan": result.to_json_value(),
+    }
+    warnings = [
+        f"{diagnostic.code}: {diagnostic.message}"
+        for diagnostic in result.diagnostics
+        if diagnostic.severity.value == "warning"
+    ]
+    if warnings:
+        check["warnings"] = warnings
+    return check
+
+
+def run_dry_run(
+    config: Path,
+    *,
+    model_override: str | None = None,
+    resume: bool = False,
+    result_dir_override: str | None = None,
+    deterministic_override: bool | None = None,
+    infer_plans: Mapping[str, dict[str, Any]] | None = None,
+    invocation: str | None = None,
+    self_managed_endpoints: frozenset[str] = frozenset(),
+) -> DryRunResult:
     """Run config validation and return structured result."""
     checks: list[DryRunCheck] = []
 
@@ -579,6 +765,23 @@ def run_dry_run(config: Path) -> DryRunResult:
         if import_warnings:
             imports_check["warnings"] = import_warnings
         checks.append(imports_check)
+
+        # 5. Task/binding capability reconciliation. Import warnings here are
+        # unresolved third-party classes, so composition cannot truthfully
+        # inspect their TaskRequirements and the check remains unavailable.
+        if import_ok and not import_warnings:
+            capability_check = _capability_reconcile_check(
+                config,
+                model_override=model_override,
+                resume=resume,
+                result_dir_override=result_dir_override,
+                deterministic_override=deterministic_override,
+                infer_plans=infer_plans,
+                invocation=invocation,
+                self_managed_endpoints=self_managed_endpoints,
+            )
+            checks.append(capability_check)
+            result.warnings.extend(capability_check.get("warnings", ()))
     else:
         schema_check: DryRunCheck = {"name": "schema", "ok": False}
         errors_detail = "; ".join(result.errors)

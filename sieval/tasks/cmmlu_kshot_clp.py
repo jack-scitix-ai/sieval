@@ -45,7 +45,7 @@ the official truncation never fires and the assembled prompts are identical.
 AI-Generated Code - GPT-5.5 (OpenAI)
 """
 
-from typing import Any, override
+from typing import override
 
 from sieval.core.datasets import Dataset
 from sieval.core.models import Model, ModelOutput
@@ -55,7 +55,10 @@ from sieval.core.tasks import (
     PredictionRecord,
     PromptRecord,
     ReferenceImpl,
+    RequirementContext,
     Task,
+    TaskModelRequirement,
+    TaskRequirements,
     build_judgement_record,
     build_prediction_record,
     build_prompt_record,
@@ -298,10 +301,23 @@ class CMMLUFewShotClpTask(
         dict[str, float | str],
     ]
 ):
+    requires = TaskRequirements(
+        sampled_logprobs=True, min_top_logprobs=DEFAULT_LOGPROBS
+    )
+
+    @classmethod
+    @override
+    def model_requirements_for(
+        cls, context: RequirementContext
+    ) -> tuple[TaskModelRequirement, ...]:
+        return cls._bind_top_logprobs_requirements(
+            context, default=DEFAULT_LOGPROBS, floor=len(CHOICES)
+        )
+
     def __init__(
         self,
         dataset: Dataset[CMMLUDatasetSample],
-        model: Model[Any],
+        model: Model,
         name: str | None = None,
         *,
         n_shot: int = DEFAULT_N_SHOT,

@@ -7,6 +7,9 @@ implementations) and launcher.py polling into a single LocalDeployer.
 AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
+import hashlib
+import importlib
+import json
 import os
 import platform
 import signal
@@ -21,10 +24,19 @@ import httpx
 from anyio.to_thread import run_sync
 from loguru import logger
 
+from sieval.core.models import (
+    Deployment,
+    DeploymentTopology,
+    Engine,
+    ServingFacts,
+)
 from sieval.infer.backends.process import kill_process_group, pid_alive
 from sieval.infer.backends.translator import BackendCommand
 from sieval.infer.config import InferCondition, InferEnv, InferHandle, InferPhase
-from sieval.infer.topology.models import DeploymentCapabilities, DeploymentPlan
+from sieval.infer.topology.models import (
+    DeploymentPlan,
+    deployment_plan_projection,
+)
 
 _HEALTH_CHECK_TIMEOUT = 2.0
 _GRACEFUL_SHUTDOWN_TIMEOUT = 10.0
@@ -368,29 +380,102 @@ class LocalDeployer:
         except Exception:
             return []
 
-    def build_capabilities(
+    def build_deployment(
         self,
         plan: DeploymentPlan,
         handles: list[InferHandle],
-    ) -> DeploymentCapabilities:
-        """Construct DeploymentCapabilities after all handles are ready."""
+        *,
+        deployment_id: str | None = None,
+        metrics_url: str | None = None,
+        facts: ServingFacts | None = None,
+    ) -> Deployment:
+        """Construct immutable realized state after every handle is ready.
+
+        ``deployment_id`` may be supplied by an external lifecycle manager.
+        Local subprocess deployments derive a stable identity from the desired
+        plan and the realized handles when it is omitted.  Facts are explicit
+        observations; this constructor never guesses them from an engine name.
+        """
+
         endpoints: dict[str, str] = {}
-        api_base = ""
 
         for handle in handles:
             role = str(handle.metadata.get("role", "full"))
             if handle.endpoint:
+                previous = endpoints.get(role)
+                if previous is not None and previous != handle.endpoint:
+                    raise ValueError(
+                        "Multiple deployment handles expose different endpoints "
+                        f"for role {role!r}: {previous!r} and {handle.endpoint!r}"
+                    )
                 endpoints[role] = handle.endpoint
-                if not api_base:
-                    api_base = handle.endpoint
 
-        return DeploymentCapabilities(
+        api_base = ""
+        for preferred_role in ("full", "decode", "prefill"):
+            if preferred_role in endpoints:
+                api_base = endpoints[preferred_role]
+                break
+        if not api_base and endpoints:
+            api_base = endpoints[sorted(endpoints)[0]]
+
+        projection = deployment_plan_projection(plan)
+        if deployment_id == "":
+            raise ValueError("deployment_id must not be empty")
+
+        return Deployment(
+            deployment_id=(
+                deployment_id
+                if deployment_id is not None
+                else _local_deployment_id(projection.fingerprint, handles)
+            ),
+            plan=projection,
+            engine=Engine(projection.engine_id),
+            engine_source="deployment",
             api_base=api_base,
-            is_disaggregated=plan.is_disaggregated,
-            roles=tuple(a.role for a in plan.assignments),
-            total_gpus=plan.total_gpus,
             endpoints=endpoints,
+            topology=DeploymentTopology(
+                is_disaggregated=plan.is_disaggregated,
+                roles=tuple(assignment.role for assignment in plan.assignments),
+                total_gpus=plan.total_gpus,
+            ),
+            metrics_url=metrics_url,
+            facts=ServingFacts() if facts is None else facts,
         )
+
+
+def _local_deployment_id(
+    plan_fingerprint: str,
+    handles: list[InferHandle],
+) -> str:
+    """Derive an order-independent identity for one local launch."""
+
+    handle_identities = sorted(
+        (
+            {
+                "backend": handle.backend,
+                "endpoint": handle.endpoint,
+                "handle_id": handle.handle_id,
+                "role": str(handle.metadata.get("role", "full")),
+            }
+            for handle in handles
+        ),
+        key=lambda value: (
+            value["role"],
+            value["handle_id"],
+            value["backend"],
+            value["endpoint"] or "",
+        ),
+    )
+    encoded = json.dumps(
+        {
+            "handles": handle_identities,
+            "plan_fingerprint": plan_fingerprint,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return f"local:{hashlib.sha256(encoded).hexdigest()}"
 
 
 # ---------------------------------------------------------------------------
@@ -402,22 +487,19 @@ def _detect_framework(backend: str) -> str:
     """Best-effort framework version detection for the given backend."""
     if backend == "sglang":
         try:
-            import sglang  # type: ignore[unresolved-import]
+            sglang = importlib.import_module("sglang")
 
             version = getattr(sglang, "__version__", "")
             if not version:
-                from sglang.version import (  # type: ignore[unresolved-import]
-                    __version__ as v,
-                )
-
-                version = v
+                version_module = importlib.import_module("sglang.version")
+                version = getattr(version_module, "__version__", "")
             return f"sglang=={version}" if version else "sglang"
         except Exception:  # noqa: BLE001
             return "sglang"
     if backend == "vllm":
         try:
-            from vllm.collect_env import get_env_info  # type: ignore[unresolved-import]
-
+            collect_env = importlib.import_module("vllm.collect_env")
+            get_env_info = collect_env.get_env_info
             info = get_env_info()
             version = getattr(info, "vllm_version", "")
             return f"vllm=={version}" if version else "vllm"

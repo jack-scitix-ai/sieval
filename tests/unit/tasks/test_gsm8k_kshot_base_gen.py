@@ -9,7 +9,6 @@ from datasets import DatasetDict as HFDatasetDict
 
 from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import TaskContext
 from sieval.datasets.gsm8k import GSM8KDataset, GSM8KDatasetSample
 from sieval.tasks.gsm8k_kshot_base_gen import (
@@ -27,9 +26,7 @@ class _CapturingGenModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
         self.last_req = req
@@ -75,7 +72,7 @@ async def test_infer_only_forwards_prompt_coupled_stop():
     # `n` rides along because it is the sampling budget rather than a decoding
     # param; `stop` is prompt-coupled and everything else stays the caller's.
     assert req.sampling == SamplingParams(n=1, stop=STOP_SEQUENCES)
-    assert req.extra_wire_params is None
+    assert req.dialect_options is None
 
 
 @pytest.mark.anyio

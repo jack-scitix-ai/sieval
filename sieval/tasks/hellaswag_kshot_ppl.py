@@ -67,6 +67,7 @@ from sieval.core.tasks import (
     PromptRecord,
     ReferenceImpl,
     Task,
+    TaskRequirements,
     build_judgement_record,
     build_prediction_record,
     build_prompt_record,
@@ -180,6 +181,8 @@ class HellaSwagFewShotPPLTask(
         dict[str, float | str],
     ]
 ):
+    requires = TaskRequirements(input_scoring=True)
+
     def __init__(
         self,
         dataset,

@@ -16,7 +16,6 @@ from sieval.community.livecodebench.prompts.code_generation import (
 )
 from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     TaskContext,
     build_judgement_record,
@@ -52,13 +51,14 @@ class _CapturingGenModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
         self.last_req = req
-        return Response(texts=tuple(self._texts))
+        texts = tuple(self._texts)
+        if len(texts) == 1:
+            texts *= req.sampling.n
+        return Response(texts=texts)
 
 
 def _raw(starter_code: str = "") -> dict:
@@ -189,7 +189,7 @@ async def test_infer_forwards_only_stop_and_n_not_decoding_params():
     assert req is not None
     # Exactly stop + n — no max_tokens / temperature injected by the task.
     assert req.sampling == SamplingParams(stop=("###",), n=4)
-    assert req.extra_wire_params is None
+    assert req.dialect_options is None
 
 
 @pytest.mark.anyio

@@ -7,6 +7,8 @@ AI-Generated Code - Claude Opus 4.6 (Anthropic)
 import contextlib
 import copy
 import dataclasses
+import hashlib
+import json
 import os
 import shlex
 import sys
@@ -31,7 +33,60 @@ from sieval.cli.resolution import (
     validate_named_config_map,
 )
 from sieval.core.datasets import Dataset
-from sieval.core.models import Capability, ChatModel, GenModel, Model, SglangGenModel
+from sieval.core.models import ChatModel, GenModel, Model, SglangGenModel
+from sieval.core.models.capabilities import (
+    CAPABILITY_KEYS,
+    CapabilityIntent,
+    CapabilityKey,
+    ModelCapabilityEntry,
+    ModelCapabilityProfile,
+    ModelCapabilityStatus,
+    aggregate_capability_intents,
+    legacy_capability_intents,
+    validate_no_legacy_capability_ambiguity,
+)
+from sieval.core.models.connection_factory import (
+    CONNECTION_FACTORY_REGISTRY,
+    ConnectionRequest,
+)
+from sieval.core.models.deployment import (
+    BINDING_RESOURCE_KEYS,
+    ConnectionPool,
+    Deployment,
+    DeploymentPlanProjection,
+    Engine,
+    RouteIntent,
+    ServingFacts,
+)
+from sieval.core.models.dialect_registry import dialect_is_bindable, get_dialect_spec
+from sieval.core.models.reconcile import (
+    BindingReconcileInput,
+    CannotVerify,
+    CheckStage,
+    Configured,
+    ConnectionScope,
+    DeferredCheck,
+    DeploymentReconcileInput,
+    ReconcileBatch,
+    ReconcileDiagnostic,
+    ReconcileResult,
+    RuntimeBindingPlan,
+    ServingOutcome,
+    ServingReconciler,
+    ServingRequirement,
+    reconcile,
+)
+from sieval.core.models.requirements import (
+    AggregatedTaskRequirements,
+    ExternalModelBinding,
+    InlineModelBinding,
+    InputKind,
+    NamedModelBinding,
+    NormalizedModelBinding,
+    RequirementContext,
+    TaskModelRequirement,
+    aggregate_task_requirements,
+)
 from sieval.core.runners import (
     MultiTaskRunner,
     ResumeAction,
@@ -41,12 +96,190 @@ from sieval.core.runners import (
 )
 from sieval.core.tasks.context import TaskAction
 from sieval.core.types import JSONValue
+from sieval.infer import deployment_plan_projection
+from sieval.infer.params import merge_params
 from sieval.infer.topology.models import DETERMINISTIC_DEFAULT_SEED
 
 # ── Narrow scalar types for YAML configuration ──
 # Mirrors sieval.infer.config.ParamValue but defined locally to keep core/
 # free of infer imports.
 _ParamValue = str | int | float | bool
+
+
+_PR1_REQUEST_VERIFIERS = {
+    "input_scoring": "validate_response_channel",
+    "sampled_logprobs": "validate_response_channel",
+    "top_logprobs": "validate_response_channel",
+}
+
+
+class _PR1CompatibilityServingReconciler:
+    """Keep existing scoring paths behind their named response guards.
+
+    PR #1 does not claim model support from a dialect descriptor.  In the
+    absence of an authoritative #27/#59 profile, the three scoring capabilities
+    that already have response validators remain UNKNOWN and are admitted only
+    with an immutable per-request check.  #47 replaces this compatibility row
+    with engine/fact-specific setup outcomes.
+    """
+
+    def __init__(
+        self,
+        external_runtime_plans: Callable[[str], tuple[RuntimeBindingPlan, ...]],
+    ) -> None:
+        self._external_runtime_plans = external_runtime_plans
+
+    def reconcile(
+        self,
+        requirements: tuple[ServingRequirement, ...],
+        deployment: DeploymentReconcileInput,
+    ) -> Mapping[CapabilityKey, ServingOutcome]:
+        outcomes: dict[CapabilityKey, ServingOutcome] = {}
+        for requirement in requirements:
+            if requirement.verifier == "external_runtime_plan":
+                baselines = self._external_runtime_plans(deployment.root_deployment_key)
+                if not baselines:
+                    outcomes[requirement.capability] = CannotVerify(
+                        CheckStage.SETUP,
+                        "external_runtime_plan",
+                        "the external model's RuntimeBindingPlan is unavailable",
+                    )
+                    continue
+                request_checks = _dedupe_deferred_checks(
+                    *(
+                        tuple(
+                            check
+                            for check in baseline.request_checks
+                            if check.capability == requirement.capability
+                        )
+                        for baseline in baselines
+                    )
+                )
+                verifier = _PR1_REQUEST_VERIFIERS.get(requirement.capability)
+                if not request_checks and verifier is not None:
+                    request_checks = (
+                        DeferredCheck(
+                            requirement.capability,
+                            CheckStage.REQUEST,
+                            verifier,
+                            "external runtime support remains guarded by the "
+                            "existing response contract",
+                        ),
+                    )
+                evidence: dict[str, JSONValue] = {
+                    "source": "external_runtime_plans",
+                    "plan_fingerprints": cast(
+                        JSONValue,
+                        sorted({baseline.fingerprint for baseline in baselines}),
+                    ),
+                }
+                outcomes[requirement.capability] = Configured(
+                    evidence=evidence,
+                    request_checks=request_checks,
+                )
+                continue
+            verifier = _PR1_REQUEST_VERIFIERS.get(requirement.capability)
+            if verifier is None or requirement.verifier not in (None, verifier):
+                continue
+            outcomes[requirement.capability] = CannotVerify(
+                CheckStage.REQUEST,
+                verifier,
+                requirement.reason
+                or "PR-1 compatibility requires response-time verification",
+            )
+        return outcomes
+
+
+def _dedupe_deferred_checks(
+    *groups: tuple[DeferredCheck, ...],
+) -> tuple[DeferredCheck, ...]:
+    """Return stable, exact de-duplication for serialized safety checks."""
+
+    result: list[DeferredCheck] = []
+    seen: set[DeferredCheck] = set()
+    for group in groups:
+        for check in group:
+            if check in seen:
+                continue
+            seen.add(check)
+            result.append(check)
+    return tuple(result)
+
+
+class _PR1CompositeServingReconciler:
+    """Preserve external baselines while allowing a stronger injected proof."""
+
+    def __init__(
+        self,
+        compatibility: _PR1CompatibilityServingReconciler,
+        injected: ServingReconciler,
+    ) -> None:
+        self._compatibility = compatibility
+        self._injected = injected
+
+    def reconcile(
+        self,
+        requirements: tuple[ServingRequirement, ...],
+        deployment: DeploymentReconcileInput,
+    ) -> Mapping[CapabilityKey, ServingOutcome]:
+        baseline_outcomes = self._compatibility.reconcile(requirements, deployment)
+        injected_outcomes = dict(self._injected.reconcile(requirements, deployment))
+        external_keys = {
+            requirement.capability
+            for requirement in requirements
+            if requirement.verifier == "external_runtime_plan"
+        }
+        for capability in external_keys:
+            baseline = baseline_outcomes.get(capability)
+            injected = injected_outcomes.get(capability)
+            if not isinstance(baseline, Configured):
+                # A custom reconciler must not hide a missing/stale external plan.
+                if baseline is not None:
+                    injected_outcomes[capability] = baseline
+                continue
+            if injected is None:
+                injected_outcomes[capability] = baseline
+                continue
+            if isinstance(injected, Configured):
+                evidence: dict[str, JSONValue] = dict(baseline.evidence)
+                if injected.evidence:
+                    evidence["injected_reconciler"] = dict(injected.evidence)
+                injected_outcomes[capability] = Configured(
+                    launch_patch=injected.launch_patch,
+                    request_checks=_dedupe_deferred_checks(
+                        baseline.request_checks,
+                        injected.request_checks,
+                    ),
+                    evidence=evidence,
+                )
+                continue
+            if (
+                isinstance(injected, CannotVerify)
+                and injected.stage is CheckStage.REQUEST
+            ):
+                evidence = dict(baseline.evidence)
+                evidence["injected_reconciler"] = {
+                    "outcome": "cannot_verify",
+                    "verifier": injected.verifier,
+                    "reason": injected.reason,
+                }
+                injected_outcomes[capability] = Configured(
+                    request_checks=_dedupe_deferred_checks(
+                        baseline.request_checks,
+                        (
+                            DeferredCheck(
+                                capability,
+                                CheckStage.REQUEST,
+                                injected.verifier,
+                                injected.reason,
+                            ),
+                        ),
+                    ),
+                    evidence=evidence,
+                )
+            # SETUP uncertainty and explicit unsupported outcomes remain stricter
+            # than the baseline and are therefore allowed to stop reconciliation.
+        return injected_outcomes
 
 
 # Type Definitions for YAML Configuration
@@ -72,10 +305,15 @@ class ModelConfigDict(TypedDict, total=False):
     name: str  # For base models
     type: Literal["chat", "gen"]  # "chat" or "gen" (default: "chat")
     engine: Literal["vllm", "sglang"]  # gen backend (default: "vllm")
+    dialect: str  # Canonical provider wire dialect (RFC #25)
+    service_role: str  # Explicit route when a deployment has multiple endpoints
+    capabilities: dict[str, object]  # Typed/normalized by cli.validation
     base: str  # For derived models
     args: dict[str, Any]
     api_key: str
     api_base: str
+    max_retries: int
+    concurrency_limit: int
     infer: _InferDict  # infer config for `sieval infer`
     infer_meta: _InferMetaDict  # infer metadata for audit
 
@@ -537,7 +775,11 @@ def _reify_cli_overrides(
 def _apply_endpoint_injection(
     cfg: dict[str, Any], endpoint_map: Mapping[str, str]
 ) -> dict[str, Any]:
-    """Inject api_base / api_key / auto-filled name for locally-served models.
+    """Adapt legacy endpoint-only callers into the YAML configuration shape.
+
+    This compatibility adapter is for external callers that do not have a
+    typed :class:`Deployment`. Internal auto-serve orchestration must hand the
+    complete realized deployment to :class:`EvalSession` instead.
 
     For each model in ``endpoint_map``:
         - Set ``api_base`` to the given endpoint (always overrides).
@@ -729,14 +971,54 @@ class EvalSession:
         infer_plans: Mapping[str, dict[str, Any]] | None = None,
         invocation: str | None = None,
         self_managed_endpoints: frozenset[str] | set[str] = frozenset(),
+        realized_deployments: Mapping[str, Deployment] | None = None,
+        model_capability_profiles: Mapping[str, ModelCapabilityProfile] | None = None,
+        serving_reconciler: ServingReconciler | None = None,
     ):
         self.config_path = Path(config_path)
         self.model_override = model_override
         self.resume_override = resume
         self.result_dir_override = result_dir_override
         self.deterministic_override = deterministic_override
-        self._endpoint_map: Mapping[str, str] = endpoint_map or {}
+        legacy_endpoint_map = dict(endpoint_map or {})
+        realized_deployment_map = dict(realized_deployments or {})
+        if legacy_endpoint_map and realized_deployment_map:
+            raise ValueError(
+                "endpoint_map is a legacy endpoint-only adapter and cannot be "
+                "combined with typed realized_deployments"
+            )
+        self._legacy_endpoint_map: Mapping[str, str] = legacy_endpoint_map
         self._infer_plans: Mapping[str, dict[str, Any]] | None = infer_plans
+        self._realized_deployments = realized_deployment_map
+        for root_name, deployment in self._realized_deployments.items():
+            if not isinstance(root_name, str) or not root_name:
+                raise TypeError("realized deployment keys must be non-empty strings")
+            if not isinstance(deployment, Deployment):
+                raise TypeError(
+                    f"realized deployment {root_name!r} must be a Deployment"
+                )
+        self._model_capability_profiles = dict(model_capability_profiles or {})
+        for profile_key, profile in self._model_capability_profiles.items():
+            if not isinstance(profile_key, str) or not profile_key:
+                raise TypeError(
+                    "model capability profile keys must be non-empty strings"
+                )
+            if not isinstance(profile, ModelCapabilityProfile):
+                raise TypeError(
+                    f"model capability profile {profile_key!r} must be a "
+                    "ModelCapabilityProfile"
+                )
+        compatibility_reconciler = _PR1CompatibilityServingReconciler(
+            self._external_runtime_plans_for_root
+        )
+        self._serving_reconciler: ServingReconciler = (
+            compatibility_reconciler
+            if serving_reconciler is None
+            else _PR1CompositeServingReconciler(
+                compatibility_reconciler,
+                serving_reconciler,
+            )
+        )
         # Snapshot at init time so every audit file this session writes
         # carries the same string. Library/test callers pass explicit; CLI
         # falls back to sys.argv.
@@ -787,9 +1069,10 @@ class EvalSession:
             alignment_card = load_card(card_path)
         self.alignment_card: AlignmentCard | None = alignment_card
 
-        # Raw + CLI reification, BEFORE endpoint injection — this is what
-        # gets persisted to effective_config.yaml, so rerun via `sieval run`
-        # re-launches services instead of connecting to a stale endpoint.
+        # Raw + CLI reification, BEFORE legacy endpoint injection — this is
+        # what gets persisted to effective_config.yaml, so rerun via
+        # `sieval run` re-launches services instead of connecting to a stale
+        # endpoint.
         reified = _reify_cli_overrides(
             # cast: ty rejects TypedDict → dict[str, Any] and its natural shims.
             cast(dict[str, Any], copy.deepcopy(loaded_config)),
@@ -799,10 +1082,12 @@ class EvalSession:
         )
         self._reified_config: dict[str, Any] = copy.deepcopy(reified)
 
-        # Runtime view = reified + endpoint injection (mutates ``reified``).
+        # Runtime view = reified + the legacy external adapter (mutates
+        # ``reified``). Typed deployments do not rewrite YAML state.
         # cast: helper is typed dict[str, Any] for mutation; narrow at the boundary.
         self.config: RootConfigDict = cast(
-            RootConfigDict, _apply_endpoint_injection(reified, self._endpoint_map)
+            RootConfigDict,
+            _apply_endpoint_injection(reified, self._legacy_endpoint_map),
         )
 
         self.deterministic: bool = resolve_deterministic(
@@ -815,6 +1100,24 @@ class EvalSession:
 
         self.models: dict[str, Model] = {}
         self.datasets: dict[str, Dataset] = {}
+        self.prelaunch_reconcile_result: ReconcileResult | None = None
+        self.postlaunch_reconcile_result: ReconcileResult | None = None
+        self._normalized_model_bindings: dict[str, NormalizedModelBinding] = {}
+        self._task_requirement_contexts: dict[str, RequirementContext] = {}
+        self._task_model_requirements: tuple[TaskModelRequirement, ...] = ()
+        self._aggregated_requirements: dict[str, AggregatedTaskRequirements] = {}
+        self._model_types_by_root: dict[str, Literal["chat", "gen"]] = {}
+        self._legacy_bypass_bindings: frozenset[str] = frozenset()
+        self._prelaunch_binding_inputs: tuple[BindingReconcileInput, ...] = ()
+        self._prelaunch_deployment_inputs: dict[str, DeploymentReconcileInput] = {}
+        self._realized_deployments_by_root: dict[str, Deployment] = {}
+        self._owned_pools: dict[str, ConnectionPool[Any]] = {}
+        self._root_shared_limiters: dict[str, anyio.CapacityLimiter | None] = {}
+        self._owned_legacy_models: dict[str, SglangGenModel] = {}
+        # Runtime-only sources for the post-launch ``models_by_role`` binding
+        # seam.  They are never serialized or fingerprinted by reconciliation.
+        self._task_role_model_sources: dict[str, dict[str, object]] = {}
+        self._bound_task_role_models: dict[str, dict[str, Model]] = {}
 
         # Resolved lazily in `_init_runner` at the start of `_prepare_execution`.
         self.result_dir: str | None = None
@@ -855,186 +1158,1804 @@ class EvalSession:
             raise ValueError(f"{field_name} must be a list")
         return value
 
-    def _infer_model_type(self, model_name: str, explicit_type: str | None) -> str:
-        """Infer this session's model type — see :func:`derive_model_type`."""
-        return derive_model_type(
-            model_name,
-            explicit_type,
-            self._get_named_config_map("tasks"),
+    def _model_config_chain(
+        self,
+        model_name: str,
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> tuple[tuple[str, dict[str, Any]], ...]:
+        """Return a root-to-leaf model config chain without constructing models."""
+
+        chain: list[tuple[str, dict[str, Any]]] = []
+        seen: set[str] = set()
+
+        def visit(current: str) -> None:
+            if current in seen:
+                names = [name for name, _ in chain]
+                names.append(current)
+                cycle = " -> ".join(names)
+                raise ValueError(f"Circular model inheritance detected: {cycle}")
+            seen.add(current)
+            try:
+                config = models_cfg[current]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Model '{model_name}' references unknown base model '{current}'"
+                ) from exc
+            chain.append((current, config))
+            base = config.get("base")
+            if base is None:
+                return
+            if not isinstance(base, str) or not base:
+                raise ValueError(
+                    f"Model '{current}' has invalid 'base' value: {base!r}"
+                )
+            visit(base)
+
+        visit(model_name)
+        chain.reverse()
+        return tuple(chain)
+
+    @staticmethod
+    def _merged_model_value(
+        chain: tuple[tuple[str, dict[str, Any]], ...], field: str
+    ) -> object | None:
+        value: object | None = None
+        for _, config in chain:
+            if field in config:
+                value = config[field]
+        return value
+
+    @staticmethod
+    def _merged_capability_declarations(
+        chain: tuple[tuple[str, dict[str, Any]], ...],
+    ) -> dict[str, JSONValue]:
+        declarations: dict[str, JSONValue] = {}
+        for config_name, config in chain:
+            raw = config.get("capabilities")
+            if raw is None:
+                continue
+            if not isinstance(raw, Mapping):
+                raise ValueError(
+                    f"Model '{config_name}' capabilities must be a dictionary"
+                )
+            for key, value in raw.items():
+                if not isinstance(key, str):
+                    raise TypeError("capability declaration keys must be strings")
+                declarations[key] = cast(JSONValue, copy.deepcopy(value))
+        return declarations
+
+    def _task_model_config_name(
+        self,
+        task_name: str,
+        task_cfg: Mapping[str, Any],
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> str:
+        model_ref = task_cfg.get("model")
+        if model_ref is not None and not isinstance(model_ref, str):
+            raise ValueError(f"Task '{task_name}': 'model' must be a string reference")
+        if model_ref:
+            if model_ref not in models_cfg:
+                raise ValueError(
+                    f"Task '{task_name}' references unknown model '{model_ref}'"
+                )
+            return model_ref
+        if len(models_cfg) == 1:
+            return next(iter(models_cfg))
+        if not models_cfg:
+            raise ValueError(f"Task '{task_name}': no models defined in config")
+        raise ValueError(
+            f"Task '{task_name}': 'model' required when multiple models are defined"
         )
 
-    def _setup_models(self) -> None:
-        """Initialize all models from config."""
-        models_cfg = self._get_named_config_map("models")
+    def _provisional_named_binding(
+        self,
+        model_name: str,
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> NamedModelBinding:
+        """Build the stable named identity used by task requirement hooks.
 
-        # First pass: create base models (those without 'base' key)
-        for name, cfg in models_cfg.items():
-            if "base" in cfg:
+        Dialect selection depends on normalized task input evidence, so it is
+        deliberately absent until every hook has run and the deployment root's
+        legacy kind has been derived exactly once.
+        """
+
+        chain = self._model_config_chain(model_name, models_cfg)
+        self._validate_named_resource_config(model_name, chain[-1][1])
+        root_name, root_config = chain[0]
+        requested_model_id = self.model_override or root_config.get("name")
+        if not requested_model_id:
+            infer_config = root_config.get("infer")
+            checkpoint = (
+                infer_config.get("checkpoint")
+                if isinstance(infer_config, Mapping)
+                else None
+            )
+            if not checkpoint:
+                checkpoint = root_config.get("path")
+            requested_model_id = Path(checkpoint).name if checkpoint else root_name
+        if not isinstance(requested_model_id, str) or not requested_model_id:
+            raise ValueError(f"Model '{root_name}' has no usable requested model id")
+
+        return NamedModelBinding(
+            binding_id=f"model:{model_name}",
+            root_deployment_key=f"model:{root_name}",
+            requested_model_id=requested_model_id,
+            config_name=model_name,
+        )
+
+    @staticmethod
+    def _explicit_model_type_for_root(
+        root_name: str,
+        bindings: tuple[NamedModelBinding, ...],
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> Literal["chat", "gen"] | None:
+        """Merge YAML ``type:`` assertions across one inheritance root."""
+
+        declarations: dict[str, object] = {
+            binding.config_name: models_cfg[binding.config_name]["type"]
+            for binding in bindings
+            if "type" in models_cfg[binding.config_name]
+        }
+        invalid = {
+            name: value
+            for name, value in declarations.items()
+            if value not in ("chat", "gen")
+        }
+        if invalid:
+            details = ", ".join(
+                f"{name}={value!r}" for name, value in sorted(invalid.items())
+            )
+            raise ValueError(
+                f"Model deployment root '{root_name}' has invalid type "
+                f"assertion(s): {details}; expected 'chat' or 'gen'"
+            )
+        values = set(declarations.values())
+        if len(values) > 1:
+            details = ", ".join(
+                f"{name}={value!r}" for name, value in sorted(declarations.items())
+            )
+            raise ValueError(
+                f"Models sharing deployment root '{root_name}' declare "
+                f"conflicting type assertions: {details}"
+            )
+        if not values:
+            return None
+        return cast(Literal["chat", "gen"], next(iter(values)))
+
+    def _finalize_named_binding(
+        self,
+        binding: NamedModelBinding,
+        model_type: Literal["chat", "gen"],
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> NamedModelBinding:
+        """Select a dialect after root model-kind derivation."""
+
+        chain = self._model_config_chain(binding.config_name, models_cfg)
+        _, root_config = chain[0]
+        explicit_dialect = self._merged_model_value(chain, "dialect")
+        if explicit_dialect is not None and (
+            not isinstance(explicit_dialect, str) or not explicit_dialect
+        ):
+            raise ValueError(
+                f"Model '{binding.config_name}' dialect must be a non-empty string"
+            )
+
+        root_engine = root_config.get("engine")
+        if root_engine is None:
+            infer_config = root_config.get("infer")
+            if isinstance(infer_config, Mapping):
+                root_engine = infer_config.get("backend")
+        if explicit_dialect is not None:
+            dialect_id = explicit_dialect
+        elif root_engine == "sglang" and model_type == "gen":
+            dialect_id = (
+                "sglang_native"
+                if dialect_is_bindable("sglang_native")
+                else "sglang_legacy"
+            )
+        else:
+            dialect_id = "openai_chat" if model_type == "chat" else "openai_completions"
+        return dataclasses.replace(binding, dialect_id=dialect_id)
+
+    @staticmethod
+    def _resource_argument_paths(
+        arguments: Mapping[str, object],
+        *,
+        allowed: frozenset[str] = frozenset(),
+    ) -> tuple[str, ...]:
+        """Return binding-resource names misplaced on a request surface."""
+
+        paths = {
+            str(key)
+            for key in arguments
+            if isinstance(key, str)
+            and key in BINDING_RESOURCE_KEYS
+            and key not in allowed
+        }
+        for container_name in ("extra_body", "extra_wire_params"):
+            nested = arguments.get(container_name)
+            if not isinstance(nested, Mapping):
                 continue
+            paths.update(
+                f"{container_name}.{key}"
+                for key in nested
+                if isinstance(key, str) and key in BINDING_RESOURCE_KEYS
+            )
+        return tuple(sorted(paths))
 
-            model_name = self.model_override or cfg.get("name")
-            if not model_name:
+    def _validate_named_resource_config(
+        self,
+        model_name: str,
+        config: Mapping[str, object],
+    ) -> None:
+        """Reject resource overrides before reconciliation, allocation, or I/O."""
+
+        is_root = config.get("base") is None
+        allowed_top_level = (
+            frozenset(
+                {
+                    "api_base",
+                    "api_key",
+                    "capabilities",
+                    "dialect",
+                    "engine",
+                    "max_retries",
+                    "service_role",
+                }
+            )
+            if is_root
+            else frozenset({"capabilities", "dialect", "service_role"})
+        )
+        misplaced = self._resource_argument_paths(
+            config,
+            allowed=allowed_top_level,
+        )
+        raw_args = config.get("args", {})
+        if not isinstance(raw_args, Mapping):
+            raise ValueError(f"Model '{model_name}' args must be a dictionary")
+        allowed_args = (
+            frozenset({"api_base", "api_key", "max_retries"})
+            if is_root
+            else frozenset()
+        )
+        nested = self._resource_argument_paths(
+            cast(Mapping[str, object], raw_args),
+            allowed=allowed_args,
+        )
+        paths = (*misplaced, *(f"args.{path}" for path in nested))
+        if paths:
+            kind = "Root" if is_root else "Derived"
+            raise ValueError(
+                f"{kind} model '{model_name}' places binding resource(s) on an "
+                f"unsupported surface: {', '.join(paths)}"
+            )
+
+    @staticmethod
+    def _safe_inline_config(config: Mapping[str, object]) -> dict[str, JSONValue]:
+        """Copy an inline binding without putting raw credentials in setup data."""
+
+        safe: dict[str, JSONValue] = {}
+        for key, value in config.items():
+            if not isinstance(key, str):
+                raise TypeError("inline model config keys must be strings")
+            if key in {"api_key", "authorization"}:
+                continue
+            if key == "args" and isinstance(value, Mapping):
+                value = {
+                    nested_key: nested_value
+                    for nested_key, nested_value in value.items()
+                    if nested_key not in {"api_key", "authorization"}
+                }
+            safe[key] = cast(JSONValue, copy.deepcopy(value))
+        return safe
+
+    def _normalized_inline_binding(
+        self,
+        task_name: str,
+        role: str,
+        raw_config: Mapping[str, object],
+    ) -> InlineModelBinding:
+        allowed_inline = frozenset(
+            {
+                "api_base",
+                "api_key",
+                "capabilities",
+                "dialect",
+                "engine",
+                "max_retries",
+                "model",
+                "service_role",
+            }
+        )
+        misplaced = self._resource_argument_paths(
+            raw_config,
+            allowed=allowed_inline,
+        )
+        raw_args = raw_config.get("args", {})
+        if not isinstance(raw_args, Mapping):
+            raise ValueError(f"Task '{task_name}' inline {role} args must be a mapping")
+        nested = self._resource_argument_paths(
+            cast(Mapping[str, object], raw_args),
+            allowed=frozenset({"api_base", "api_key", "max_retries"}),
+        )
+        paths = (*misplaced, *(f"args.{path}" for path in nested))
+        if paths:
+            raise ValueError(
+                f"Task '{task_name}' inline {role} places binding resource(s) "
+                f"on an unsupported surface: {', '.join(paths)}"
+            )
+        requested_model_id = raw_config.get("model")
+        if not isinstance(requested_model_id, str) or not requested_model_id:
+            raise ValueError(
+                f"Task '{task_name}' inline {role} model requires a non-empty 'model'"
+            )
+        safe_config = self._safe_inline_config(raw_config)
+        encoded = json.dumps(
+            safe_config,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        digest = hashlib.sha256(encoded).hexdigest()[:16]
+        binding_id = f"inline:{task_name}:{role}:{digest}"
+        dialect = raw_config.get("dialect", "openai_chat")
+        if not isinstance(dialect, str) or not dialect:
+            raise ValueError(
+                f"Task '{task_name}' inline {role} dialect must be a non-empty string"
+            )
+        return InlineModelBinding(
+            binding_id=binding_id,
+            root_deployment_key=f"deployment:{binding_id}",
+            requested_model_id=requested_model_id,
+            config=safe_config,
+            dialect_id=dialect,
+        )
+
+    def _normalized_external_binding(
+        self,
+        task_name: str,
+        role: str,
+        model: Model,
+    ) -> ExternalModelBinding:
+        runtime_plan = getattr(model, "runtime_plan", None)
+        if runtime_plan is None:
+            raise ValueError(
+                f"Task '{task_name}' external {role} model has no RuntimeBindingPlan"
+            )
+        return ExternalModelBinding(
+            binding_id=runtime_plan.binding_id,
+            root_deployment_key=runtime_plan.root_deployment_key,
+            requested_model_id=runtime_plan.requested_model_id,
+            runtime_plan_fingerprint=runtime_plan.fingerprint,
+            dialect_id=runtime_plan.dialect_id,
+        )
+
+    def _requirement_dataset_config(
+        self, task_name: str, task_cfg: Mapping[str, Any]
+    ) -> Mapping[str, JSONValue]:
+        dataset_ref = task_cfg.get("dataset")
+        if isinstance(dataset_ref, str):
+            datasets_cfg = self._get_named_config_map("datasets")
+            if dataset_ref not in datasets_cfg:
                 raise ValueError(
-                    f"Model '{name}' requires 'name' or use --model CLI arg"
+                    f"Task '{task_name}' references unknown dataset '{dataset_ref}'"
+                )
+            return cast(
+                Mapping[str, JSONValue], copy.deepcopy(datasets_cfg[dataset_ref])
+            )
+        if isinstance(dataset_ref, Mapping):
+            return cast(Mapping[str, JSONValue], copy.deepcopy(dataset_ref))
+        raise ValueError(
+            f"Task '{task_name}': 'dataset' must be a string reference or "
+            "inline definition"
+        )
+
+    def _requirement_context_for_task(
+        self,
+        task_name: str,
+        task_cfg: Mapping[str, Any],
+        candidate: NamedModelBinding,
+    ) -> RequirementContext:
+        raw_task_args = self._normalize_dict(
+            task_cfg.get("args"), f"Task '{task_name}' args"
+        )
+        json_task_args = dict(raw_task_args)
+        bindings: dict[str, NormalizedModelBinding] = {"candidate": candidate}
+        sources: dict[str, object] = {"candidate": candidate.config_name}
+
+        grader = json_task_args.pop("grader", None)
+        if grader is not None:
+            if isinstance(grader, Model):
+                grader_binding = self._normalized_external_binding(
+                    task_name, "grader", grader
+                )
+            elif isinstance(grader, Mapping):
+                grader_binding = self._normalized_inline_binding(
+                    task_name, "grader", grader
+                )
+            else:
+                raise ValueError(
+                    f"Task '{task_name}' grader must be an inline mapping or Model"
+                )
+            bindings["grader"] = grader_binding
+            sources["grader"] = grader
+            self._normalized_model_bindings.setdefault(
+                grader_binding.binding_id, grader_binding
+            )
+
+        for key, value in tuple(json_task_args.items()):
+            if isinstance(value, Model):
+                json_task_args.pop(key)
+
+        infer_args = self._normalize_dict(
+            task_cfg.get("infer_args"), f"Task '{task_name}' infer_args"
+        )
+        misplaced_resources = self._resource_argument_paths(infer_args)
+        if misplaced_resources:
+            raise ValueError(
+                f"Task '{task_name}' infer_args cannot change binding resources: "
+                + ", ".join(misplaced_resources)
+            )
+        context = RequirementContext(
+            model_bindings=bindings,
+            task_args=cast(Mapping[str, JSONValue], json_task_args),
+            dataset_config=self._requirement_dataset_config(task_name, task_cfg),
+            infer_args=cast(Mapping[str, JSONValue], infer_args),
+        )
+        self._task_role_model_sources[task_name] = sources
+        return context
+
+    @staticmethod
+    def _format_reconcile_diagnostic(diagnostic: ReconcileDiagnostic) -> str:
+        location = diagnostic.binding_id or diagnostic.root_deployment_key or "batch"
+        capability = (
+            f" [{diagnostic.capability}]" if diagnostic.capability is not None else ""
+        )
+        sources = (
+            f" (sources: {', '.join(diagnostic.sources)})" if diagnostic.sources else ""
+        )
+        return (
+            f"- {diagnostic.code} at {location}{capability}: "
+            f"{diagnostic.message}{sources}"
+        )
+
+    def _external_model_for_binding(self, binding_id: str) -> Model | None:
+        for sources in self._task_role_model_sources.values():
+            for source in sources.values():
+                if not isinstance(source, Model):
+                    continue
+                plan = getattr(source, "runtime_plan", None)
+                if plan is not None and plan.binding_id == binding_id:
+                    return source
+        return None
+
+    def _external_runtime_plans_for_root(
+        self, root_deployment_key: str
+    ) -> tuple[RuntimeBindingPlan, ...]:
+        """Return every distinct external binding plan for one deployment root."""
+
+        found: dict[str, RuntimeBindingPlan] = {}
+        for sources in self._task_role_model_sources.values():
+            for source in sources.values():
+                if not isinstance(source, Model) or source.runtime_plan is None:
+                    continue
+                plan = source.runtime_plan
+                if plan.root_deployment_key != root_deployment_key:
+                    continue
+                previous = found.get(plan.binding_id)
+                if previous is not None and previous != plan:
+                    raise ValueError(
+                        f"external binding {plan.binding_id!r} resolves to different "
+                        "runtime plans within deployment root "
+                        f"{root_deployment_key!r}"
+                    )
+                found[plan.binding_id] = plan
+        return tuple(found[key] for key in sorted(found))
+
+    def _validate_external_runtime_obligations(self, result: ReconcileResult) -> None:
+        """Reject a rebound external plan that weakens its existing guarantees."""
+
+        for binding in self._normalized_model_bindings.values():
+            if not isinstance(binding, ExternalModelBinding):
+                continue
+            model = self._external_model_for_binding(binding.binding_id)
+            if model is None or model.runtime_plan is None:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' lost its runtime plan"
+                )
+            baseline = model.runtime_plan
+            if baseline.fingerprint != binding.runtime_plan_fingerprint:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' runtime plan changed "
+                    "after requirement normalization"
+                )
+            rebound = result.runtime_plans.get(binding.binding_id)
+            if rebound is None:
+                continue
+            identity_fields = (
+                "binding_id",
+                "root_deployment_key",
+                "requested_model_id",
+                "dialect_id",
+                "deployment_fingerprint",
+                "resolved_route",
+                "connection_identity",
+            )
+            changed = [
+                field
+                for field in identity_fields
+                if getattr(rebound, field) != getattr(baseline, field)
+            ]
+            if changed:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' changed immutable "
+                    "runtime identity fields: " + ", ".join(changed)
                 )
 
-            args = self._normalize_dict(cfg.get("args"), f"Model '{name}' args")
+            newly_claimed = (
+                rebound.available_capabilities - baseline.available_capabilities
+            )
+            if newly_claimed:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' cannot add runtime "
+                    "capabilities absent from its existing plan: "
+                    + ", ".join(sorted(newly_claimed))
+                )
 
+            rebound_checks = set(rebound.request_checks)
+            missing_checks = [
+                check
+                for check in baseline.request_checks
+                if check.capability in rebound.available_capabilities
+                and check not in rebound_checks
+            ]
+            if missing_checks:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' dropped existing "
+                    "request-time safety checks: "
+                    + ", ".join(
+                        f"{check.capability}:{check.verifier}"
+                        for check in missing_checks
+                    )
+                )
+
+            for capability, minimums in rebound.capability_minimums.items():
+                requested = minimums.get("minimum")
+                previous = baseline.capability_minimums.get(capability, {}).get(
+                    "minimum"
+                )
+                stronger = (
+                    isinstance(requested, int)
+                    and not isinstance(requested, bool)
+                    and (
+                        not isinstance(previous, int)
+                        or isinstance(previous, bool)
+                        or requested > previous
+                    )
+                )
+                required_verifier = _PR1_REQUEST_VERIFIERS.get(
+                    cast(CapabilityKey, capability)
+                )
+                if stronger and not any(
+                    check.capability == capability
+                    and required_verifier is not None
+                    and check.verifier == required_verifier
+                    for check in rebound.request_checks
+                ):
+                    raise ValueError(
+                        f"External binding '{binding.binding_id}' requires a "
+                        f"stronger {capability!r} minimum without a preserved "
+                        "registered request-time check"
+                    )
+
+    def _model_profile_for(
+        self, binding: NormalizedModelBinding
+    ) -> ModelCapabilityProfile:
+        lookup_keys = [binding.binding_id, binding.requested_model_id]
+        if isinstance(binding, NamedModelBinding):
+            lookup_keys.insert(0, binding.config_name)
+        for key in lookup_keys:
+            profile = self._model_capability_profiles.get(key)
+            if profile is not None:
+                return profile
+
+        if isinstance(binding, ExternalModelBinding):
+            model = self._external_model_for_binding(binding.binding_id)
+            if model is None:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' lost its live "
+                    "model source"
+                )
+            runtime_plan = model.runtime_plan
+            if runtime_plan is None:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' has no runtime plan"
+                )
+            entries = {
+                key: ModelCapabilityEntry(
+                    (
+                        ModelCapabilityStatus.SUPPORTED
+                        if key in runtime_plan.available_capabilities
+                        else ModelCapabilityStatus.UNSUPPORTED
+                    ),
+                    source="external-runtime-plan",
+                    reason=(
+                        None
+                        if key in runtime_plan.available_capabilities
+                        else (
+                            "external runtime plan does not make this capability "
+                            "available"
+                        )
+                    ),
+                    verifier=(
+                        "external_runtime_plan"
+                        if key in runtime_plan.available_capabilities
+                        else None
+                    ),
+                )
+                for key in CAPABILITY_KEYS
+            }
+            return ModelCapabilityProfile(entries, authoritative=True)
+
+        entries = {
+            cast(CapabilityKey, capability): ModelCapabilityEntry(
+                ModelCapabilityStatus.UNKNOWN,
+                source="pr1-existing-response-contract",
+                reason=(
+                    "no authoritative model profile is available; the existing "
+                    "response guard must verify this capability on every call"
+                ),
+                verifier=verifier,
+            )
+            for capability, verifier in _PR1_REQUEST_VERIFIERS.items()
+        }
+        return ModelCapabilityProfile(entries, authoritative=False)
+
+    def _declarations_for_binding(
+        self,
+        binding: NormalizedModelBinding,
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> Mapping[str, JSONValue]:
+        if isinstance(binding, NamedModelBinding):
+            chain = self._model_config_chain(binding.config_name, models_cfg)
+            return self._merged_capability_declarations(chain)
+        if isinstance(binding, InlineModelBinding):
+            declarations = binding.config.get("capabilities", {})
+            if not isinstance(declarations, Mapping):
+                raise ValueError(
+                    f"Inline binding '{binding.binding_id}' capabilities must "
+                    "be a mapping"
+                )
+            return cast(Mapping[str, JSONValue], declarations)
+        model = self._external_model_for_binding(binding.binding_id)
+        assert model is not None
+        runtime_plan = model.runtime_plan
+        if runtime_plan is None:
+            raise ValueError(
+                f"External binding '{binding.binding_id}' has no runtime plan"
+            )
+        return runtime_plan.declared_capabilities
+
+    def _validate_legacy_capability_surfaces(
+        self,
+        binding: NormalizedModelBinding,
+        declarations: Mapping[str, JSONValue],
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> None:
+        """Reject two config owners for one canonical capability semantic."""
+
+        if not declarations or isinstance(binding, ExternalModelBinding):
+            return
+
+        canonical_source: str
+        if isinstance(binding, NamedModelBinding):
+            canonical_source = f"models.{binding.config_name}.capabilities"
+            for config_name, config in self._model_config_chain(
+                binding.config_name, models_cfg
+            ):
+                raw_args = config.get("args")
+                if raw_args is None:
+                    continue
+                if not isinstance(raw_args, Mapping):
+                    raise ValueError(f"Model '{config_name}' args must be a dictionary")
+                validate_no_legacy_capability_ambiguity(
+                    declarations,
+                    raw_args,
+                    canonical_source=canonical_source,
+                    legacy_source=f"models.{config_name}.args",
+                )
+        else:
+            canonical_source = f"{binding.binding_id}.capabilities"
+            # Inline model configs accept legacy request defaults both at the
+            # top level and in an optional nested args mapping.
+            validate_no_legacy_capability_ambiguity(
+                declarations,
+                binding.config,
+                canonical_source=canonical_source,
+                legacy_source=f"{binding.binding_id} inline config",
+            )
+            raw_args = binding.config.get("args")
+            if raw_args is not None:
+                if not isinstance(raw_args, Mapping):
+                    raise ValueError(
+                        f"Inline binding '{binding.binding_id}' args must be a mapping"
+                    )
+                validate_no_legacy_capability_ambiguity(
+                    declarations,
+                    cast(Mapping[str, object], raw_args),
+                    canonical_source=canonical_source,
+                    legacy_source=f"{binding.binding_id}.args",
+                )
+
+        for task_name, context in sorted(self._task_requirement_contexts.items()):
+            candidate = context.model_bindings.get("candidate")
+            if candidate is None or candidate.binding_id != binding.binding_id:
+                continue
+            validate_no_legacy_capability_ambiguity(
+                declarations,
+                context.infer_args,
+                canonical_source=canonical_source,
+                legacy_source=f"tasks.{task_name}.infer_args",
+            )
+
+    def _legacy_request_intents_for(
+        self,
+        binding: NormalizedModelBinding,
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> Mapping[CapabilityKey, CapabilityIntent]:
+        """Project active migration-era request defaults into reconciliation."""
+
+        intents: list[CapabilityIntent] = []
+
+        def extend(arguments: Mapping[str, object], source: str) -> None:
+            intents.extend(legacy_capability_intents(arguments, source=source).values())
+
+        if isinstance(binding, NamedModelBinding):
+            # Match ``with_args`` inheritance: each child replaces a same-name
+            # builder default from its parent.  Preserve the winning config as
+            # diagnostic evidence rather than OR-ing overridden values.
+            effective: dict[str, tuple[object, str]] = {}
+            for config_name, config in self._model_config_chain(
+                binding.config_name, models_cfg
+            ):
+                raw_args = config.get("args")
+                if raw_args is None:
+                    continue
+                if not isinstance(raw_args, Mapping):
+                    raise ValueError(f"Model '{config_name}' args must be a dictionary")
+                for name, value in raw_args.items():
+                    if isinstance(name, str):
+                        effective[name] = (value, f"models.{config_name}.args")
+            by_source: dict[str, dict[str, object]] = {}
+            for name, (value, source) in effective.items():
+                by_source.setdefault(source, {})[name] = value
+            for source, arguments in sorted(by_source.items()):
+                extend(arguments, source)
+        elif isinstance(binding, InlineModelBinding):
+            # Inline task models apply nested ``args`` after direct fields.
+            effective = {
+                name: (value, f"{binding.binding_id} inline config")
+                for name, value in binding.config.items()
+                if name != "args"
+            }
+            raw_args = binding.config.get("args")
+            if raw_args is not None:
+                if not isinstance(raw_args, Mapping):
+                    raise ValueError(
+                        f"Inline binding '{binding.binding_id}' args must be a mapping"
+                    )
+                for name, value in raw_args.items():
+                    if isinstance(name, str):
+                        effective[name] = (value, f"{binding.binding_id}.args")
+            by_source = {}
+            for name, (value, source) in effective.items():
+                by_source.setdefault(source, {})[name] = value
+            for source, arguments in sorted(by_source.items()):
+                extend(arguments, source)
+
+        for task_name, context in sorted(self._task_requirement_contexts.items()):
+            candidate = context.model_bindings.get("candidate")
+            if candidate is None or candidate.binding_id != binding.binding_id:
+                continue
+            extend(context.infer_args, f"tasks.{task_name}.infer_args")
+
+        return aggregate_capability_intents(intents)
+
+    def _connection_scope_for(
+        self,
+        binding: NormalizedModelBinding,
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> ConnectionScope:
+        if binding.dialect_id is None:
+            raise ValueError(f"Model binding '{binding.binding_id}' has no dialect")
+        connection_family = get_dialect_spec(binding.dialect_id).connection_family
+        factory = CONNECTION_FACTORY_REGISTRY.get(connection_family)
+
+        if isinstance(binding, ExternalModelBinding):
+            model = self._external_model_for_binding(binding.binding_id)
+            assert model is not None
+            runtime_plan = model.runtime_plan
+            if runtime_plan is None:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' has no runtime plan"
+                )
+            identity = runtime_plan.connection_identity
+            if identity.connection_family != connection_family:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' uses connection family "
+                    f"{identity.connection_family!r}, but dialect "
+                    f"{binding.dialect_id!r} requires {connection_family!r}"
+                )
+            factory.parse_retry_policy(identity.retry_policy)
+            return ConnectionScope(
+                identity.credential_scope,
+                identity.retry_policy,
+                identity.quota_scope,
+            )
+        if isinstance(binding, InlineModelBinding):
+            source = self._source_for_binding(binding.binding_id)
+            if not isinstance(source, Mapping):
+                raise ValueError(
+                    f"Inline binding '{binding.binding_id}' lost its config source"
+                )
+            typed_source = cast(Mapping[str, object], source)
+            _, max_retries, _ = self._connection_options(
+                typed_source,
+                nested_args=True,
+            )
+            raw_args = typed_source.get("args")
+            nested: Mapping[str, object] = (
+                cast(Mapping[str, object], raw_args)
+                if isinstance(raw_args, Mapping)
+                else {}
+            )
+            credential_kind = (
+                "explicit"
+                if "api_key" in typed_source or "api_key" in nested
+                else "environment"
+            )
+            return ConnectionScope(
+                f"inline:{binding.binding_id}:{credential_kind}-credential",
+                factory.retry_policy(max_retries),
+                binding.root_deployment_key,
+            )
+
+        chain = self._model_config_chain(binding.config_name, models_cfg)
+        root_name, root_config = chain[0]
+        args = root_config.get("args")
+        args = args if isinstance(args, Mapping) else {}
+        has_explicit_credential = "api_key" in root_config or "api_key" in args
+        _, max_retries, _ = self._connection_options(
+            root_config,
+            nested_args=True,
+        )
+        return ConnectionScope(
+            (
+                f"model:{root_name}:managed-local-credential"
+                if root_name in (self._infer_plans or {})
+                else (
+                    f"model:{root_name}:explicit-credential"
+                    if has_explicit_credential
+                    else f"model:{root_name}:environment-credential"
+                )
+            ),
+            factory.retry_policy(max_retries),
+            binding.root_deployment_key,
+        )
+
+    def _route_intent_for(
+        self,
+        binding: NormalizedModelBinding,
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> RouteIntent:
+        """Normalize a service-role route before launch/reconciliation."""
+
+        if isinstance(binding, ExternalModelBinding):
+            model = self._external_model_for_binding(binding.binding_id)
+            if model is None or model.runtime_plan is None:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' has no runtime plan"
+                )
+            service_role: object | None = model.runtime_plan.resolved_route.service_role
+        elif isinstance(binding, InlineModelBinding):
+            service_role = binding.config.get("service_role")
+        else:
+            chain = self._model_config_chain(binding.config_name, models_cfg)
+            service_role = self._merged_model_value(chain, "service_role")
+        if service_role is None:
+            return RouteIntent()
+        if not isinstance(service_role, str) or not service_role:
+            raise ValueError("model service_role must be a non-empty string")
+        return RouteIntent(service_role)
+
+    @staticmethod
+    def _plan_projection(raw_plan: Mapping[str, object]) -> DeploymentPlanProjection:
+        return deployment_plan_projection(raw_plan)
+
+    @staticmethod
+    def _explicit_engine_parameters(
+        root_name: str,
+        root_config: Mapping[str, object],
+    ) -> Mapping[str, JSONValue]:
+        """Project only engine parameters with a provable explicit user source.
+
+        Effective ``DeploymentPlan`` engine params already merge recipe defaults
+        with user overrides, so reverse-engineering recipe ownership from that
+        value would be guesswork.  The explicit ``infer.overrides`` subtree is a
+        stable source boundary and uses the infer layer's canonical key spelling.
+        """
+
+        raw_infer = root_config.get("infer")
+        if raw_infer is None:
+            return {}
+        if not isinstance(raw_infer, Mapping):
+            raise ValueError(f"Model '{root_name}' infer must be a dictionary")
+        typed_infer = cast(Mapping[str, object], raw_infer)
+        raw_overrides = typed_infer.get("overrides")
+        if raw_overrides is None:
+            return {}
+        if not isinstance(raw_overrides, Mapping):
+            raise ValueError(
+                f"Model '{root_name}' infer.overrides must be a dictionary"
+            )
+        validated: dict[str, _ParamValue] = {}
+        for key, value in raw_overrides.items():
+            if not isinstance(key, str) or not key:
+                raise TypeError(
+                    f"Model '{root_name}' infer.overrides keys must be strings"
+                )
+            if not isinstance(value, str | int | float | bool):
+                raise TypeError(
+                    f"Model '{root_name}' infer.overrides.{key} must be a scalar"
+                )
+            validated[key] = value
+        return cast(Mapping[str, JSONValue], merge_params(validated))
+
+    def _deployment_input_for(
+        self,
+        binding: NormalizedModelBinding,
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> DeploymentReconcileInput:
+        if isinstance(binding, ExternalModelBinding):
+            model = self._external_model_for_binding(binding.binding_id)
+            assert model is not None
+            deployment = model.deployment
+            return DeploymentReconcileInput(
+                root_deployment_key=binding.root_deployment_key,
+                engine_id=deployment.engine.engine_id,
+                deployment=deployment,
+            )
+
+        if isinstance(binding, InlineModelBinding):
+            raw_engine = binding.config.get("engine")
+            if raw_engine is not None and (
+                not isinstance(raw_engine, str) or not raw_engine
+            ):
+                raise TypeError(
+                    f"Inline binding '{binding.binding_id}' engine must be a "
+                    "non-empty string"
+                )
+            engine_id = raw_engine or "unknown"
+            return DeploymentReconcileInput(
+                root_deployment_key=binding.root_deployment_key,
+                engine_id=engine_id or "unknown",
+            )
+
+        chain = self._model_config_chain(binding.config_name, models_cfg)
+        root_name, root_config = chain[0]
+        raw_plan = (self._infer_plans or {}).get(root_name)
+        projection = self._plan_projection(raw_plan) if raw_plan is not None else None
+        if projection is not None:
+            engine_id = projection.engine_id
+        else:
+            raw_engine = root_config.get("engine")
+            infer_config = root_config.get("infer")
+            if raw_engine is None and isinstance(infer_config, Mapping):
+                raw_engine = infer_config.get("backend")
+            if raw_engine is not None and (
+                not isinstance(raw_engine, str) or not raw_engine
+            ):
+                raise TypeError(
+                    f"Model '{root_name}' engine/backend must be a non-empty string"
+                )
+            engine_id = raw_engine or "unknown"
+        return DeploymentReconcileInput(
+            root_deployment_key=binding.root_deployment_key,
+            engine_id=engine_id,
+            plan=projection,
+            # Recipe/profile ownership is not recoverable from the already
+            # merged DeploymentPlan.  Keep that column empty until #27/#59
+            # supplies a typed projection; never mislabel effective values.
+            recipe_parameters={},
+            explicit_parameters=self._explicit_engine_parameters(
+                root_name, root_config
+            ),
+        )
+
+    def _setup_prelaunch_reconciliation(self) -> None:
+        """Resolve and reconcile every task/model binding before client creation."""
+
+        models_cfg = self._get_named_config_map("models")
+        tasks_cfg = self._get_named_config_map("tasks")
+
+        self._normalized_model_bindings = {}
+        self._task_requirement_contexts = {}
+        self._task_role_model_sources = {}
+        named_by_config: dict[str, NamedModelBinding] = {}
+        for model_name in models_cfg:
+            binding = self._provisional_named_binding(model_name, models_cfg)
+            named_by_config[model_name] = binding
+            self._normalized_model_bindings[binding.binding_id] = binding
+
+        records: list[TaskModelRequirement] = []
+        for task_name, task_cfg in tasks_cfg.items():
+            task_spec = task_cfg.get("class")
+            if not isinstance(task_spec, str) or not task_spec:
+                raise ValueError(f"Task '{task_name}' requires 'class' field")
+            task_class = resolve_task_class(task_spec)
+            model_name = self._task_model_config_name(task_name, task_cfg, models_cfg)
+            context = self._requirement_context_for_task(
+                task_name, task_cfg, named_by_config[model_name]
+            )
+            self._task_requirement_contexts[task_name] = context
+            requirement_hook = getattr(task_class, "model_requirements_for", None)
+            if not callable(requirement_hook):
+                raise TypeError(
+                    f"{task_class.__name__} has no model_requirements_for() hook"
+                )
+            task_records = requirement_hook(context)
+            if not isinstance(task_records, tuple):
+                raise TypeError(
+                    f"{task_class.__name__}.model_requirements_for() must "
+                    "return a tuple"
+                )
+            for record in task_records:
+                if not isinstance(record, TaskModelRequirement):
+                    raise TypeError(
+                        f"{task_class.__name__}.model_requirements_for() returned "
+                        "a non-TaskModelRequirement value"
+                    )
+                expected_binding = context.model_bindings.get(record.role)
+                if expected_binding is None:
+                    raise ValueError(
+                        f"{task_class.__name__}.model_requirements_for() declared "
+                        f"unknown model role {record.role!r}"
+                    )
+                if record.binding != expected_binding:
+                    raise ValueError(
+                        f"{task_class.__name__}.model_requirements_for() changed "
+                        f"the normalized binding for role {record.role!r}"
+                    )
+                existing = self._normalized_model_bindings.get(
+                    record.binding.binding_id
+                )
+                if existing is not None and existing != record.binding:
+                    raise ValueError(
+                        f"binding id '{record.binding.binding_id}' resolves to "
+                        "different normalized bindings"
+                    )
+                self._normalized_model_bindings[record.binding.binding_id] = (
+                    record.binding
+                )
+                records.append(record)
+
+        # Task hooks intentionally receive dialect-free named bindings.  Their
+        # normalized input evidence is then aggregated across the complete
+        # inheritance root, and the public resolver is called exactly once for
+        # that root.  A derived model cannot independently choose a kind that
+        # would disagree with its shared deployment/recipe selection.
+        named_by_root: dict[str, list[NamedModelBinding]] = {}
+        for binding in named_by_config.values():
+            named_by_root.setdefault(binding.root_deployment_key, []).append(binding)
+
+        finalized_named: dict[str, NamedModelBinding] = {}
+        model_types_by_root: dict[str, Literal["chat", "gen"]] = {}
+        for root_key, root_bindings_list in named_by_root.items():
+            root_bindings = tuple(root_bindings_list)
+            root_name = self._model_config_chain(
+                root_bindings[0].config_name, models_cfg
+            )[0][0]
+            root_records = (
+                record
+                for record in records
+                if isinstance(record.binding, NamedModelBinding)
+                and record.binding.root_deployment_key == root_key
+            )
+            root_requirements = aggregate_task_requirements(root_records)
+            explicit_type = self._explicit_model_type_for_root(
+                root_name, root_bindings, models_cfg
+            )
+            model_type = derive_model_type(root_name, explicit_type, root_requirements)
+            model_types_by_root[root_key] = model_type
+            for binding in root_bindings:
+                finalized_named[binding.binding_id] = self._finalize_named_binding(
+                    binding, model_type, models_cfg
+                )
+
+        def finalized_binding(
+            binding: NormalizedModelBinding,
+        ) -> NormalizedModelBinding:
+            return finalized_named.get(binding.binding_id, binding)
+
+        records = [
+            dataclasses.replace(record, binding=finalized_binding(record.binding))
+            for record in records
+        ]
+        self._task_requirement_contexts = {
+            task_name: dataclasses.replace(
+                context,
+                model_bindings={
+                    role: finalized_binding(binding)
+                    for role, binding in context.model_bindings.items()
+                },
+            )
+            for task_name, context in self._task_requirement_contexts.items()
+        }
+        self._normalized_model_bindings = {
+            binding_id: finalized_binding(binding)
+            for binding_id, binding in self._normalized_model_bindings.items()
+        }
+        self._model_types_by_root = model_types_by_root
+
+        grouped: dict[str, list[TaskModelRequirement]] = {
+            binding_id: [] for binding_id in self._normalized_model_bindings
+        }
+        for record in records:
+            grouped.setdefault(record.binding.binding_id, []).append(record)
+        aggregated = {
+            binding_id: aggregate_task_requirements(group)
+            for binding_id, group in grouped.items()
+        }
+
+        legacy_bypass: set[str] = set()
+        binding_inputs: list[BindingReconcileInput] = []
+        deployment_inputs: dict[str, DeploymentReconcileInput] = {}
+        for binding_id, binding in self._normalized_model_bindings.items():
+            requirements = aggregated[binding_id]
+            if binding.dialect_id == "sglang_legacy":
+                declarations = self._declarations_for_binding(binding, models_cfg)
+                if declarations:
+                    raise ValueError(
+                        f"Model binding '{binding_id}' uses the temporary "
+                        "sglang_legacy bypass and cannot declare canonical "
+                        "capabilities before the sglang_native PR-5 binder"
+                    )
+                legacy_bypass.add(binding_id)
+                continue
+            if binding.dialect_id is None:
+                raise ValueError(f"Model binding '{binding_id}' has no dialect")
+
+            declarations = self._declarations_for_binding(binding, models_cfg)
+            self._validate_legacy_capability_surfaces(binding, declarations, models_cfg)
+
+            binding_inputs.append(
+                BindingReconcileInput(
+                    binding_id=binding.binding_id,
+                    root_deployment_key=binding.root_deployment_key,
+                    requested_model_id=binding.requested_model_id,
+                    dialect_id=binding.dialect_id,
+                    requirements=requirements,
+                    model_profile=self._model_profile_for(binding),
+                    connection_scope=self._connection_scope_for(binding, models_cfg),
+                    declarations=declarations,
+                    request_intents=self._legacy_request_intents_for(
+                        binding, models_cfg
+                    ),
+                    route_intent=self._route_intent_for(binding, models_cfg),
+                )
+            )
+            deployment = self._deployment_input_for(binding, models_cfg)
+            previous = deployment_inputs.get(deployment.root_deployment_key)
+            if previous is not None and previous != deployment:
+                raise ValueError(
+                    f"bindings sharing root '{deployment.root_deployment_key}' "
+                    "produced different deployment inputs"
+                )
+            deployment_inputs[deployment.root_deployment_key] = deployment
+
+        result = reconcile(
+            ReconcileBatch(tuple(binding_inputs), deployment_inputs),
+            self._serving_reconciler,
+        )
+        if result.errors:
+            details = "\n".join(
+                self._format_reconcile_diagnostic(item) for item in result.errors
+            )
+            raise ValueError(f"Model capability reconciliation failed:\n{details}")
+        self._validate_external_runtime_obligations(result)
+        for diagnostic in result.diagnostics:
+            logger.warning(self._format_reconcile_diagnostic(diagnostic))
+
+        self._task_model_requirements = tuple(records)
+        self._aggregated_requirements = aggregated
+        self._legacy_bypass_bindings = frozenset(legacy_bypass)
+        self._prelaunch_binding_inputs = tuple(binding_inputs)
+        self._prelaunch_deployment_inputs = dict(deployment_inputs)
+        self.prelaunch_reconcile_result = result
+
+    def prepare_prelaunch(self) -> ReconcileResult:
+        """Public pure setup seam for launch-before-I/O capability validation."""
+
+        self._setup_prelaunch_reconciliation()
+        result = self.prelaunch_reconcile_result
+        if result is None:  # defensive: the setup method assigns on success
+            raise RuntimeError("pre-launch reconciliation produced no result")
+        return result
+
+    def _source_for_binding(self, binding_id: str) -> object | None:
+        """Return the runtime-only config/model source for a role binding."""
+
+        for task_name, context in self._task_requirement_contexts.items():
+            sources = self._task_role_model_sources.get(task_name, {})
+            for role, binding in context.model_bindings.items():
+                if binding.binding_id == binding_id:
+                    return sources.get(role)
+        return None
+
+    @staticmethod
+    def _external_endpoint(config: Mapping[str, object]) -> str:
+        """Resolve the endpoint the legacy OpenAI constructor would use."""
+
+        endpoint = config.get("api_base")
+        args = config.get("args")
+        if endpoint is None and isinstance(args, Mapping):
+            endpoint = cast(Mapping[str, object], args).get("api_base")
+        if endpoint is None:
+            endpoint = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        if not isinstance(endpoint, str) or not endpoint:
+            raise ValueError("OpenAI api_base must be a non-empty string")
+        return endpoint.rstrip("/")
+
+    @staticmethod
+    def _connection_options(
+        config: Mapping[str, object],
+        *,
+        nested_args: bool,
+    ) -> tuple[str | None, int, int | None]:
+        """Extract client/pool options without treating them as request defaults."""
+
+        args = config.get("args")
+        nested: Mapping[str, object] = (
+            cast(Mapping[str, object], args)
+            if nested_args and isinstance(args, Mapping)
+            else {}
+        )
+        api_key = config.get("api_key", nested.get("api_key"))
+        max_retries = config.get("max_retries", nested.get("max_retries", 3))
+        concurrency_limit = config.get(
+            "concurrency_limit", nested.get("concurrency_limit")
+        )
+        if api_key is not None and not isinstance(api_key, str):
+            raise TypeError("OpenAI api_key must be a string")
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+            raise TypeError("OpenAI max_retries must be an integer")
+        if isinstance(concurrency_limit, bool) or (
+            concurrency_limit is not None
+            and (not isinstance(concurrency_limit, int) or concurrency_limit < 1)
+        ):
+            raise ValueError("concurrency_limit must be a positive integer")
+        return api_key, max_retries, concurrency_limit
+
+    def _configured_deployment_for(
+        self,
+        binding: NormalizedModelBinding,
+        template: DeploymentReconcileInput,
+        models_cfg: Mapping[str, dict[str, Any]],
+    ) -> Deployment:
+        """Build an immutable external deployment when no realized one was supplied."""
+
+        if isinstance(binding, ExternalModelBinding):
+            model = self._external_model_for_binding(binding.binding_id)
+            if model is None:
+                raise ValueError(
+                    f"External binding '{binding.binding_id}' lost its live model"
+                )
+            return model.deployment
+
+        if isinstance(binding, NamedModelBinding):
+            chain = self._model_config_chain(binding.config_name, models_cfg)
+            root_name, root_config = chain[0]
+            realized = self._realized_deployments.get(root_name)
+            if realized is not None:
+                return realized
+            if template.plan is not None:
+                raise ValueError(
+                    f"Managed model '{root_name}' has a desired deployment plan "
+                    "but no realized Deployment handoff"
+                )
+            config: Mapping[str, object] = root_config
+        else:
+            source = self._source_for_binding(binding.binding_id)
+            if not isinstance(source, Mapping):
+                raise ValueError(
+                    f"Inline binding '{binding.binding_id}' lost its config source"
+                )
+            config = cast(Mapping[str, object], source)
+
+        endpoint = self._external_endpoint(config)
+        engine_source = "config" if template.engine_id != "unknown" else "unknown"
+        return Deployment(
+            deployment_id=None,
+            plan=None,
+            engine=Engine(template.engine_id),
+            engine_source=engine_source,
+            api_base=endpoint,
+            endpoints={},
+            topology=None,
+            metrics_url=None,
+            facts=ServingFacts(),
+        )
+
+    def _setup_postlaunch_reconciliation(self) -> None:
+        """Re-run the same batch against realized/configured deployments."""
+
+        prelaunch = self.prelaunch_reconcile_result
+        if prelaunch is None:
+            raise RuntimeError("post-launch reconciliation requires a pre-launch plan")
+
+        models_cfg = self._get_named_config_map("models")
+        configured_roots = {
+            self._model_config_chain(name, models_cfg)[0][0] for name in models_cfg
+        }
+        unknown_realized = set(self._realized_deployments) - configured_roots
+        if unknown_realized:
+            raise ValueError(
+                "realized deployments reference unknown root model configs: "
+                + ", ".join(sorted(unknown_realized))
+            )
+
+        realized_by_root: dict[str, Deployment] = {}
+        postlaunch_inputs: dict[str, DeploymentReconcileInput] = {}
+        for binding in self._normalized_model_bindings.values():
+            if binding.binding_id in self._legacy_bypass_bindings:
+                continue
+            template = self._prelaunch_deployment_inputs[binding.root_deployment_key]
+            deployment = self._configured_deployment_for(binding, template, models_cfg)
+            previous = realized_by_root.get(binding.root_deployment_key)
+            if previous is not None and previous != deployment:
+                raise ValueError(
+                    f"bindings sharing root '{binding.root_deployment_key}' "
+                    "resolved to different deployments"
+                )
+            realized_by_root[binding.root_deployment_key] = deployment
+
+        for root_key, deployment in realized_by_root.items():
+            template = self._prelaunch_deployment_inputs[root_key]
+            prelaunch_plan = prelaunch.deployment_plans.get(root_key)
+            if prelaunch_plan is None:
+                raise RuntimeError(
+                    f"pre-launch plan missing deployment root {root_key!r}"
+                )
+            desired_plan = template.effective_plan
+            if desired_plan is not None and deployment.plan != desired_plan:
+                raise ValueError(
+                    f"Realized deployment for root '{root_key}' does not match "
+                    "the pre-launch desired plan"
+                )
+            postlaunch_inputs[root_key] = DeploymentReconcileInput(
+                root_deployment_key=root_key,
+                # A typed realized deployment may refine an engine that was
+                # deliberately unknown before launch.  Known pre-launch
+                # identities remain strict in DeploymentReconcileInput.
+                engine_id=deployment.engine.engine_id,
+                deployment=deployment,
+                plan=desired_plan,
+                recipe_parameters=template.recipe_parameters,
+                explicit_parameters=template.explicit_parameters,
+                prelaunch_plan=prelaunch_plan,
+            )
+
+        result = reconcile(
+            ReconcileBatch(self._prelaunch_binding_inputs, postlaunch_inputs),
+            self._serving_reconciler,
+        )
+        if result.errors:
+            details = "\n".join(
+                self._format_reconcile_diagnostic(item) for item in result.errors
+            )
+            raise ValueError(
+                f"Post-launch model capability reconciliation failed:\n{details}"
+            )
+        drifted_bindings = sorted(
+            binding_id
+            for binding_id, prelaunch_binding in prelaunch.binding_plans.items()
+            if (
+                (postlaunch_binding := result.binding_plans.get(binding_id)) is None
+                or postlaunch_binding.fingerprint != prelaunch_binding.fingerprint
+            )
+        )
+        if drifted_bindings:
+            raise RuntimeError(
+                "post-launch verification changed pre-launch binding plan(s): "
+                + ", ".join(drifted_bindings)
+            )
+        expected = {
+            binding.binding_id
+            for binding in self._normalized_model_bindings.values()
+            if binding.binding_id not in self._legacy_bypass_bindings
+        }
+        missing = expected - set(result.runtime_plans)
+        if missing:
+            raise RuntimeError(
+                "post-launch reconciliation produced no RuntimeBindingPlan for: "
+                + ", ".join(sorted(missing))
+            )
+
+        external_bindings = tuple(
+            binding
+            for binding in self._normalized_model_bindings.values()
+            if isinstance(binding, ExternalModelBinding)
+        )
+        external_roots = {binding.root_deployment_key for binding in external_bindings}
+        drifted_external_roots = sorted(
+            root_key
+            for root_key in external_roots
+            if (
+                (before := prelaunch.deployment_plans.get(root_key)) is None
+                or (after := result.deployment_plans.get(root_key)) is None
+                or before.fingerprint != after.fingerprint
+            )
+        )
+        if drifted_external_roots:
+            raise RuntimeError(
+                "post-launch reconciliation changed serving evidence or checks "
+                "for unchanged external deployment root(s): "
+                + ", ".join(drifted_external_roots)
+            )
+        drifted_external_bindings = sorted(
+            binding.binding_id
+            for binding in external_bindings
+            if (
+                (before := prelaunch.runtime_plans.get(binding.binding_id)) is None
+                or (after := result.runtime_plans.get(binding.binding_id)) is None
+                or before.fingerprint != after.fingerprint
+            )
+        )
+        if drifted_external_bindings:
+            raise RuntimeError(
+                "post-launch reconciliation changed runtime verification for "
+                "unchanged external binding(s): " + ", ".join(drifted_external_bindings)
+            )
+        self._validate_external_runtime_obligations(result)
+        for diagnostic in result.diagnostics:
+            logger.warning(self._format_reconcile_diagnostic(diagnostic))
+
+        self._realized_deployments_by_root = realized_by_root
+        self.postlaunch_reconcile_result = result
+
+    @staticmethod
+    def _request_builder_args(
+        config: Mapping[str, object],
+    ) -> tuple[dict[str, Any], Any]:
+        raw = config.get("args", {})
+        if not isinstance(raw, Mapping):
+            raise ValueError("model args must be a dictionary")
+        args = dict(raw)
+        for key in ("api_base", "api_key", "max_retries", "concurrency_limit"):
+            args.pop(key, None)
+        extra = args.pop("extra", None)
+        return args, extra
+
+    def _create_owned_pool(
+        self,
+        root_key: str,
+        deployment: Deployment,
+        runtime_plan: RuntimeBindingPlan,
+        config: Mapping[str, object],
+        *,
+        nested_args: bool,
+    ) -> ConnectionPool[Any]:
+        """Create or reuse one owned pool for one complete connection identity."""
+
+        plan = runtime_plan
+        identity = plan.connection_identity
+        connection_family = get_dialect_spec(plan.dialect_id).connection_family
+        factory = CONNECTION_FACTORY_REGISTRY.get(connection_family)
+        if plan.resolved_route.connection_family != connection_family:
+            raise ValueError(
+                f"runtime route for root '{root_key}' uses connection family "
+                f"{plan.resolved_route.connection_family!r}, but dialect "
+                f"{plan.dialect_id!r} requires {connection_family!r}"
+            )
+        if identity.connection_family != connection_family:
+            raise ValueError(
+                f"runtime identity for root '{root_key}' uses connection family "
+                f"{identity.connection_family!r}, but dialect {plan.dialect_id!r} "
+                f"requires {connection_family!r}"
+            )
+        for pool in self._owned_pools.values():
+            if pool.identity == identity:
+                return pool
+
+        api_key, max_retries, concurrency_limit = self._connection_options(
+            config, nested_args=nested_args
+        )
+        retry_policy = factory.retry_policy(max_retries)
+        if identity.retry_policy != retry_policy:
+            raise ValueError(
+                f"runtime connection identity for root '{root_key}' records "
+                f"{identity.retry_policy!r}, but client configuration resolves "
+                f"to {retry_policy!r}"
+            )
+        root_limiters = getattr(self, "_root_shared_limiters", None)
+        if root_limiters is None:
+            root_limiters = {}
+            self._root_shared_limiters = root_limiters
+        if root_key not in root_limiters:
+            root_limiters[root_key] = (
+                anyio.CapacityLimiter(concurrency_limit)
+                if concurrency_limit is not None
+                else None
+            )
+        connection = CONNECTION_FACTORY_REGISTRY.create(
+            connection_family,
+            ConnectionRequest(
+                endpoint=identity.endpoint,
+                credential=api_key,
+                max_retries=max_retries,
+            ),
+        )
+        pool = ConnectionPool(connection, identity, root_limiters[root_key])
+        identity_payload = {
+            "endpoint": identity.endpoint,
+            "connection_family": identity.connection_family,
+            "credential_scope": identity.credential_scope,
+            "retry_policy": identity.retry_policy,
+            "quota_scope": identity.quota_scope,
+        }
+        encoded = json.dumps(
+            identity_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        pool_key = f"{root_key}:{hashlib.sha256(encoded).hexdigest()[:16]}"
+        self._owned_pools[pool_key] = pool
+        self._realized_deployments_by_root[root_key] = deployment
+        return pool
+
+    def _as_legacy_wrapper(
+        self,
+        model: Model,
+        requirements: AggregatedTaskRequirements,
+    ) -> Model:
+        """Use the public wrapper factory without guessing from runtime type."""
+
+        if len(requirements.input) == 1:
+            input_kind = next(iter(requirements.input))
+        elif model.dialect_id == "openai_chat":
+            input_kind = InputKind.CHAT
+        elif model.dialect_id == "openai_completions":
+            input_kind = InputKind.COMPLETION
+        else:
+            runtime_plan = model.runtime_plan
+            binding_id = runtime_plan.binding_id if runtime_plan is not None else "?"
+            raise ValueError(f"binding '{binding_id}' has no legacy input kind")
+        wrapper_type: type[Model] = (
+            ChatModel if input_kind is InputKind.CHAT else GenModel
+        )
+        compat_factory = getattr(model, "as_compat_type", None)
+        if not callable(compat_factory):
+            raise RuntimeError(
+                "core Model.as_compat_type() is required for truthful legacy "
+                "agenerate/alogprobs input coercion"
+            )
+        return cast(Model, compat_factory(wrapper_type))
+
+    def _setup_bound_models(self) -> None:
+        """Bind canonical runtime plans while preserving compatibility wrappers."""
+
+        result = self.postlaunch_reconcile_result
+        if result is None:
+            raise RuntimeError("bound model setup requires post-launch reconciliation")
+        models_cfg = self._get_named_config_map("models")
+
+        by_root: dict[str, list[NormalizedModelBinding]] = {}
+        for binding in self._normalized_model_bindings.values():
+            by_root.setdefault(binding.root_deployment_key, []).append(binding)
+        for root_key, bindings in by_root.items():
+            has_legacy = any(
+                binding.binding_id in self._legacy_bypass_bindings
+                for binding in bindings
+            )
+            has_canonical = any(
+                binding.binding_id not in self._legacy_bypass_bindings
+                for binding in bindings
+            )
+            if has_legacy and has_canonical:
+                raise ValueError(
+                    f"deployment root '{root_key}' mixes sglang_legacy and canonical "
+                    "dialects; split them into separate root model configs"
+                )
+
+        bound_by_binding: dict[str, Model] = {}
+        pending_named = {
+            binding.config_name: binding
+            for binding in self._normalized_model_bindings.values()
+            if isinstance(binding, NamedModelBinding)
+        }
+
+        # Legacy SGLang stays on its explicit bypass until the PR-5 binder.
+        for name, binding in tuple(pending_named.items()):
+            if binding.binding_id not in self._legacy_bypass_bindings:
+                continue
+            chain = self._model_config_chain(name, models_cfg)
+            if len(chain) != 1:
+                continue
+            cfg = chain[0][1]
+            args = self._normalize_dict(cfg.get("args"), f"Model '{name}' args")
             if self.deterministic:
                 args.setdefault("seed", DETERMINISTIC_DEFAULT_SEED)
-
-            # Support top-level api_key and api_base in YAML
             if "api_key" in cfg:
                 args["api_key"] = cfg["api_key"]
             if "api_base" in cfg:
                 args["api_base"] = cfg["api_base"]
+            model = SglangGenModel(model=binding.requested_model_id, **args)
+            self.models[name] = model
+            bound_by_binding[binding.binding_id] = model
+            self._owned_legacy_models[binding.root_deployment_key] = model
+            del pending_named[name]
 
-            # Infer model type with priority: explicit > inferred from tasks > default
-            explicit_type = cfg.get("type")
-            model_type = self._infer_model_type(name, explicit_type)
-
-            # `engine` selects the gen backend; it is meaningless for chat.
-            if "engine" in cfg and model_type != "gen":
-                raise ValueError(
-                    f"Model '{name}': 'engine' is only valid for type: gen, "
-                    f"but this model is '{model_type}'."
-                )
-
-            if model_type == "gen":
-                engine = cfg.get("engine", "vllm")
-                if engine == "sglang":
-                    self.models[name] = SglangGenModel(model=model_name, **args)
-                elif engine == "vllm":
-                    self.models[name] = GenModel(model=model_name, **args)
-                else:
-                    raise ValueError(
-                        f"Model '{name}' has invalid engine '{engine}'. "
-                        "Expected 'vllm' or 'sglang'"
-                    )
-            elif model_type == "chat":
-                self.models[name] = ChatModel(model=model_name, **args)
-            else:
-                raise ValueError(
-                    f"Model '{name}' has invalid type '{model_type}'. "
-                    "Expected 'chat' or 'gen'"
-                )
-            logger.info(
-                "Created model '{}' with type='{}' name='{}'",
-                name,
-                model_type,
-                model_name,
-            )
-
-        # Second pass: create derived models (those with 'base' key)
-        pending_derived = {
-            name: cfg for name, cfg in models_cfg.items() if "base" in cfg
-        }
-        while pending_derived:
+        while pending_named:
             resolved_any = False
-
-            for name in list(pending_derived):
-                cfg = pending_derived[name]
+            for name, binding in tuple(pending_named.items()):
+                cfg = models_cfg[name]
                 base_name = cfg.get("base")
-                if not isinstance(base_name, str) or not base_name:
-                    raise ValueError(
-                        f"Model '{name}' has invalid 'base' value: {base_name!r}"
-                    )
-                if base_name not in self.models:
+                is_root = base_name is None
+                if not is_root and base_name not in self.models:
                     continue
 
-                base_model = self.models[base_name]
-                args = self._normalize_dict(cfg.get("args"), f"Model '{name}' args")
-
-                derived_api_key = cfg.get("api_key")
-                derived_api_base = cfg.get("api_base")
-
-                if derived_api_key is not None or derived_api_base is not None:
-                    raise ValueError(
-                        f"Derived model '{name}' cannot override api_key/api_base from "
-                        f"base model '{base_name}'. Create a new base model instead."
-                    )
-
-                if "engine" in cfg:
-                    raise ValueError(
-                        f"Derived model '{name}' cannot set 'engine'; it is inherited "
-                        f"from base model '{base_name}'. Set it on the base instead."
-                    )
-
-                # Extract concurrency_limit separately for with_args
-                concurrency_limit = args.pop("concurrency_limit", None)
-
-                # RFC #25 dropped cross-kind model conversion (as_type): a
-                # derived model always inherits its base's kind. `type:` on a
-                # derived model is accepted only when it matches the base.
-                target_type = cfg.get("type")
-                if target_type:
-                    if target_type not in ("chat", "gen"):
-                        raise ValueError(
-                            f"Model '{name}' has invalid type '{target_type}'. "
-                            "Expected 'chat' or 'gen'"
-                        )
-                    base_kind = (
-                        "chat" if Capability.Chat in base_model.capabilities else "gen"
-                    )
-                    if target_type != base_kind:
-                        raise ValueError(
-                            f"Derived model '{name}' cannot convert base "
-                            f"'{base_name}' from '{base_kind}' to "
-                            f"'{target_type}': cross-kind conversion was "
-                            "removed (RFC #25). Define a separate base model "
-                            "with the desired type instead."
-                        )
-                new_model = base_model
-
-                # Apply additional args (including concurrency_limit)
-                if concurrency_limit is not None or args:
-                    new_model = new_model.with_args(
-                        concurrency_limit=concurrency_limit, **args
-                    )
-                    if concurrency_limit is not None:
-                        logger.info(
-                            "Derived model '{}' reserves {} from '{}'",
-                            name,
-                            concurrency_limit,
-                            base_name,
-                        )
-                    else:
-                        logger.info(
-                            "Created derived model '{}' from '{}'",
-                            name,
-                            base_name,
-                        )
+                if binding.binding_id in self._legacy_bypass_bindings:
+                    assert isinstance(base_name, str)
+                    model = self.models[base_name]
+                    args = self._normalize_dict(cfg.get("args"), f"Model '{name}' args")
+                    concurrency_limit = args.pop("concurrency_limit", None)
+                    model = model.with_args(concurrency_limit=concurrency_limit, **args)
                 else:
-                    logger.info("Created derived model '{}' from '{}'", name, base_name)
+                    runtime_plan = result.runtime_plans[binding.binding_id]
+                    deployment = self._realized_deployments_by_root[
+                        binding.root_deployment_key
+                    ]
+                    root_config = self._model_config_chain(name, models_cfg)[0][1]
+                    pool = self._create_owned_pool(
+                        binding.root_deployment_key,
+                        deployment,
+                        runtime_plan,
+                        root_config,
+                        nested_args=True,
+                    )
+                    if is_root:
+                        model = Model.bind(deployment, pool, runtime_plan)
+                    else:
+                        assert isinstance(base_name, str)
+                        base_model = self.models[base_name]
+                        if base_model.pool.identity == runtime_plan.connection_identity:
+                            model = base_model.with_dialect(
+                                runtime_plan.dialect_id, runtime_plan
+                            )
+                        else:
+                            inherited_local_limiter = (
+                                base_model._limiter
+                                if base_model._parent_limiter is not None
+                                else None
+                            )
+                            model = Model.bind(
+                                deployment,
+                                pool,
+                                runtime_plan,
+                                local_limiter=inherited_local_limiter,
+                            )
+                            if base_model._kwargs or base_model.extra:
+                                inherited_defaults = cast(
+                                    dict[str, Any], base_model._kwargs
+                                )
+                                model = model.with_args(
+                                    extra=base_model.extra or None,
+                                    **inherited_defaults,
+                                )
 
-                self.models[name] = new_model
-                del pending_derived[name]
+                    args, extra = self._request_builder_args(cfg)
+                    if is_root and self.deterministic:
+                        args.setdefault("seed", DETERMINISTIC_DEFAULT_SEED)
+                    concurrency_limit = None
+                    if not is_root:
+                        raw_args = cfg.get("args", {})
+                        assert isinstance(raw_args, Mapping)
+                        concurrency_limit = raw_args.get("concurrency_limit")
+                    if args or extra is not None or concurrency_limit is not None:
+                        model = model.with_args(
+                            concurrency_limit=cast(int | None, concurrency_limit),
+                            extra=cast(dict[str, JSONValue] | None, extra),
+                            **args,
+                        )
+                    model = self._as_legacy_wrapper(
+                        model, self._aggregated_requirements[binding.binding_id]
+                    )
+
+                self.models[name] = model
+                bound_by_binding[binding.binding_id] = model
+                del pending_named[name]
                 resolved_any = True
 
-            if resolved_any:
+            if not resolved_any:
+                unresolved = ", ".join(sorted(pending_named))
+                raise ValueError(f"Unable to bind derived models: {unresolved}")
+
+        for binding in self._normalized_model_bindings.values():
+            if isinstance(binding, NamedModelBinding | ExternalModelBinding):
                 continue
-
-            for name, cfg in pending_derived.items():
-                base_name = cfg.get("base")
-                if not isinstance(base_name, str) or not base_name:
-                    raise ValueError(
-                        f"Model '{name}' has invalid 'base' value: {base_name!r}"
-                    )
-                if base_name not in models_cfg:
-                    raise ValueError(
-                        f"Model '{name}' references unknown base model '{base_name}'"
-                    )
-
-            cycle_info = ", ".join(
-                sorted(
-                    f"{name}->{cfg.get('base')}"
-                    for name, cfg in pending_derived.items()
+            runtime_plan = result.runtime_plans[binding.binding_id]
+            deployment = self._realized_deployments_by_root[binding.root_deployment_key]
+            source = self._source_for_binding(binding.binding_id)
+            if not isinstance(source, Mapping):
+                raise ValueError(
+                    f"Inline binding '{binding.binding_id}' lost its config source"
                 )
+            typed_source = cast(Mapping[str, object], source)
+            pool = self._create_owned_pool(
+                binding.root_deployment_key,
+                deployment,
+                runtime_plan,
+                typed_source,
+                nested_args=True,
             )
-            raise ValueError(
-                "Unable to resolve derived models due to cyclic dependencies: "
-                f"{cycle_info}"
+            model = Model.bind(deployment, pool, runtime_plan)
+            direct_config: dict[str, Any] = dict(typed_source)
+            nested = direct_config.pop("args", None)
+            if isinstance(nested, Mapping):
+                direct_config.update(cast(Mapping[str, Any], nested))
+            for key in (
+                "model",
+                "api_base",
+                "api_key",
+                "max_retries",
+                "concurrency_limit",
+                "dialect",
+                "service_role",
+                "capabilities",
+                "engine",
+            ):
+                direct_config.pop(key, None)
+            extra = direct_config.pop("extra", None)
+            if direct_config or extra is not None:
+                model = model.with_args(
+                    extra=cast(dict[str, JSONValue] | None, extra), **direct_config
+                )
+            bound_by_binding[binding.binding_id] = self._as_legacy_wrapper(
+                model, self._aggregated_requirements[binding.binding_id]
             )
+
+        role_models: dict[str, dict[str, Model]] = {}
+        for task_name, context in self._task_requirement_contexts.items():
+            for role, binding in context.model_bindings.items():
+                if role in {"candidate", "model"}:
+                    continue
+                if isinstance(binding, ExternalModelBinding):
+                    live_model = self._external_model_for_binding(binding.binding_id)
+                    if live_model is None:
+                        raise ValueError(
+                            f"External binding '{binding.binding_id}' lost its model"
+                        )
+                    runtime_plan = result.runtime_plans[binding.binding_id]
+                    rebound = live_model.with_dialect(
+                        runtime_plan.dialect_id, runtime_plan
+                    )
+                    role_model = self._as_legacy_wrapper(
+                        rebound, self._aggregated_requirements[binding.binding_id]
+                    )
+                else:
+                    role_model = bound_by_binding[binding.binding_id]
+                role_models.setdefault(task_name, {})[role] = role_model
+        self._bound_task_role_models = role_models
+
+    def _setup_models(self) -> None:
+        """Bind models from the already-reconciled post-launch plan."""
+
+        if getattr(self, "postlaunch_reconcile_result", None) is None:
+            raise RuntimeError(
+                "model setup requires post-launch capability reconciliation"
+            )
+        self._setup_bound_models()
 
     def _check_over_subscription(self) -> None:
         """Check for over-subscription and warn if detected."""
@@ -1302,7 +3223,8 @@ class EvalSession:
             raise ValueError("'runner_config' configuration must be a dictionary")
         runner_defaults = runner_defaults_raw
 
-        for task_name, task_cfg in tasks_cfg.items():
+        for task_name, raw_task_cfg in tasks_cfg.items():
+            task_cfg = cast(TaskConfigDict, raw_task_cfg)
             # Resolve task class
             task_spec = task_cfg.get("class")
             if not task_spec:
@@ -1334,6 +3256,14 @@ class EvalSession:
                 task_cfg.get("args", {}),
                 f"Task '{task_name}' args",
             )
+            models_by_role = getattr(self, "_bound_task_role_models", {}).get(task_name)
+            if models_by_role is not None:
+                # Judge tasks reject two competing sources.  Post-launch
+                # composition supplies the reconciled role models here and the
+                # legacy inline config is no longer allowed to construct a
+                # hidden ChatModel inside Task.__init__.
+                task_args.pop("grader", None)
+                task_args["models_by_role"] = models_by_role
 
             task = task_class(
                 name=task_name,
@@ -1450,8 +3380,14 @@ class EvalSession:
 
         self._init_runner()
 
-        # Wrap in to_thread: dataset download / heavy model init can block
-        # the event loop otherwise.
+        # Resolve task-side requirements and fail before any model/client is
+        # constructed.  This is pure setup work; managed runs re-run the same
+        # reconciliation after launch with realized Deployment/ServingFacts.
+        await run_sync(self.prepare_prelaunch)
+        await run_sync(self._setup_postlaunch_reconciliation)
+
+        # Wrap in to_thread: dataset download / heavy model init can block the
+        # event loop otherwise.
         await run_sync(self._setup_models)
         await run_sync(self._check_over_subscription)
         await run_sync(self._setup_datasets)
@@ -1608,10 +3544,10 @@ class EvalSession:
         """Write effective_config.yaml to result_dir at session start.
 
         Dumps ``self._reified_config`` (raw YAML + CLI reification, minus
-        endpoint injections). User-supplied ``api_base`` / ``api_key`` in
-        the source YAML ARE preserved — only ``endpoint_map``-driven
-        auto-injection is excluded, so ``sieval run <this file>`` can
-        re-launch services from the preserved ``path`` / ``infer`` fields.
+        legacy endpoint-adapter injection). User-supplied ``api_base`` /
+        ``api_key`` in the source YAML ARE preserved. Runtime endpoints are
+        excluded, so ``sieval run <this file>`` can re-launch services from
+        the preserved ``path`` / ``infer`` fields.
         """
         body = yaml.safe_dump(
             self._reified_config,
@@ -1679,15 +3615,47 @@ class EvalSession:
 
     async def arun(self) -> dict[str, Any]:
         """Run all configured tasks asynchronously."""
-        # Persist BEFORE _prepare_execution so a resume-mismatch abort
-        # fails fast — avoid paying the model/dataset load cost just to
-        # discover the config doesn't match the persisted one.
-        await self._persist_effective_config()
-        await self._persist_infer_plans()
-        await self._prepare_execution()
-        if self.runner is None:
-            raise RuntimeError("Runner not initialized")
-        return await self.runner.arun()
+        try:
+            # Persist BEFORE _prepare_execution so a resume-mismatch abort
+            # fails fast — avoid paying the model/dataset load cost just to
+            # discover the config doesn't match the persisted one.
+            await self._persist_effective_config()
+            await self._persist_infer_plans()
+            await self._prepare_execution()
+            if self.runner is None:
+                raise RuntimeError("Runner not initialized")
+            return await self.runner.arun()
+        finally:
+            await self._close_owned_model_resources()
+
+    async def _close_owned_model_resources(self) -> None:
+        """Drain and close every session-owned root once; never close externals."""
+
+        owned_pools = getattr(self, "_owned_pools", {})
+        owned_legacy_models = getattr(self, "_owned_legacy_models", {})
+        root_shared_limiters = getattr(self, "_root_shared_limiters", {})
+        pools = tuple({id(pool): pool for pool in owned_pools.values()}.values())
+        legacy_models = tuple(
+            {id(model): model for model in owned_legacy_models.values()}.values()
+        )
+        owned_pools.clear()
+        owned_legacy_models.clear()
+        root_shared_limiters.clear()
+        first_error: BaseException | None = None
+        for pool in pools:
+            try:
+                await pool.aclose()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        for model in legacy_models:
+            try:
+                await model.aclose()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def run(self) -> dict[str, Any]:
         """Run all configured tasks synchronously (blocking)."""
@@ -1704,6 +3672,7 @@ async def arun_session(
     infer_plans: Mapping[str, dict[str, Any]] | None = None,
     invocation: str | None = None,
     self_managed_endpoints: frozenset[str] | set[str] = frozenset(),
+    realized_deployments: Mapping[str, Deployment] | None = None,
 ) -> dict[str, Any]:
     """Run tasks defined in a YAML configuration file asynchronously.
 
@@ -1714,8 +3683,11 @@ async def arun_session(
         result_dir: Override result directory.
         deterministic: Monotone override. ``None`` defers to YAML, ``True``
             forces on, ``False`` is a no-op (cannot downgrade YAML).
-        endpoint_map: ``{model_name: endpoint_url}`` injected at runtime.
-            Not persisted to effective_config.yaml.
+        endpoint_map: Legacy external adapter for callers that only have a
+            ``{model_name: endpoint_url}`` mapping. It is injected at runtime,
+            is not persisted to effective_config.yaml, and cannot be combined
+            with ``realized_deployments``. Internal orchestration must pass a
+            typed deployment instead.
         infer_plans: ``{model_name: DeploymentPlan-dict}`` for audit-level
             persistence to infer_plans.yaml.
         invocation: Provenance string for audit headers. ``None`` falls back
@@ -1723,6 +3695,8 @@ async def arun_session(
         self_managed_endpoints: Names of models whose ``api_base`` points at
             a sieval-launched engine — scopes the best-effort deterministic
             warning to genuinely external endpoints.
+        realized_deployments: Typed realized deployments keyed by root model
+            config name.
 
     Returns:
         A dictionary mapping task names to their reports.
@@ -1737,6 +3711,7 @@ async def arun_session(
         infer_plans=infer_plans,
         invocation=invocation,
         self_managed_endpoints=self_managed_endpoints,
+        realized_deployments=realized_deployments,
     )
 
     return await runner.arun()
@@ -1752,6 +3727,7 @@ def run_session(
     infer_plans: Mapping[str, dict[str, Any]] | None = None,
     invocation: str | None = None,
     self_managed_endpoints: frozenset[str] | set[str] = frozenset(),
+    realized_deployments: Mapping[str, Deployment] | None = None,
 ) -> dict[str, Any]:
     return anyio.run(
         arun_session,
@@ -1764,4 +3740,5 @@ def run_session(
         infer_plans,
         invocation,
         self_managed_endpoints,
+        realized_deployments,
     )

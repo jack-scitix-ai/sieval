@@ -6,14 +6,21 @@ AI-Generated Code - Claude Opus 4.6 (Anthropic)
 import json
 from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 from typer.testing import CliRunner
 
 from sieval.cli import app
+from sieval.core.models import (
+    Deployment,
+    DeploymentTopology,
+    Engine,
+    ServingFacts,
+)
 from sieval.infer.backends.translator import BackendCommand
+from sieval.infer.config import InferHandle
 from sieval.infer.topology.models import (
     DETERMINISTIC_DEFAULT_SEED,
     DeploymentPlan,
@@ -22,6 +29,7 @@ from sieval.infer.topology.models import (
     ResolveResult,
     RoleAssignment,
     WellKnownRole,
+    deployment_plan_projection,
 )
 
 runner = CliRunner()
@@ -40,6 +48,20 @@ def _fake_plan(deterministic: bool = False) -> DeploymentPlan:
             ),
         ),
         deterministic=deterministic,
+    )
+
+
+def _fake_handle(
+    *,
+    endpoint: str = "http://localhost:8000/v1",
+    handle_id: str = "12345",
+    role: str = "full",
+) -> InferHandle:
+    return InferHandle(
+        backend="vllm",
+        endpoint=endpoint,
+        handle_id=handle_id,
+        metadata={"role": role},
     )
 
 
@@ -113,6 +135,174 @@ class TestRunCommand:
         assert "--no-deterministic" not in result.output
 
 
+class TestPrelaunchSequencing:
+    @pytest.mark.anyio
+    async def test_dry_run_reuses_managed_plan_batch_and_cli_overrides(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.cli.run import _run_dry_run
+
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "models": {"model_a": {"path": "/tmp/a"}},
+                    "tasks": {},
+                }
+            )
+        )
+        plan_dicts = {"model_a": {"backend": "vllm", "assignments": []}}
+        prepared = {"model_a": (_fake_plan(), [])}
+        dry_result = {"checks": [], "n_errors": 0, "n_warnings": 0}
+
+        with (
+            patch(
+                "sieval.cli.run._prepare_launch_batch",
+                new=AsyncMock(return_value=(plan_dicts, prepared)),
+            ) as prepare,
+            patch(
+                "sieval.cli.validation.run_dry_run",
+                return_value=dry_result,
+            ) as validate,
+        ):
+            result = await _run_dry_run(
+                config_path,
+                resume=True,
+                model="override/model",
+                result_dir="result-override",
+                deterministic=True,
+            )
+
+        assert result == dry_result
+        prepare.assert_awaited_once()
+        assert prepare.call_args.kwargs["effective_deterministic"] is True
+        assert validate.call_args.kwargs["infer_plans"] == plan_dicts
+        assert validate.call_args.kwargs["model_override"] == "override/model"
+        assert validate.call_args.kwargs["resume"] is True
+        assert validate.call_args.kwargs["result_dir_override"] == "result-override"
+        assert validate.call_args.kwargs["deterministic_override"] is True
+        assert validate.call_args.kwargs["self_managed_endpoints"] == {"model_a"}
+
+    @pytest.mark.anyio
+    async def test_binding_error_prevents_every_managed_launch(self, tmp_path: Path):
+        from sieval.cli.run import _run_all
+
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "models": {
+                        "model_a": {
+                            "path": "/tmp/a",
+                            "infer": {"backend": "vllm", "recipe": "test"},
+                        },
+                        "model_b": {
+                            "path": "/tmp/b",
+                            "infer": {"backend": "vllm", "recipe": "test"},
+                        },
+                    },
+                    "tasks": {},
+                }
+            )
+        )
+
+        async def resolve(
+            _config_path: Path,
+            model_name: str,
+            *,
+            model_type_resolution=None,
+        ):
+            assert model_type_resolution is not None
+            return model_name, _fake_plan(), {}
+
+        translator = MagicMock()
+        translator.translate.return_value = [
+            BackendCommand(
+                cli_args=["vllm", "serve"],
+                backend="vllm",
+                role="full",
+                health_url="http://localhost:8000/health",
+            )
+        ]
+        prelaunch_session = MagicMock()
+        prelaunch_session.prepare_prelaunch.side_effect = ValueError(
+            "binding capability mismatch"
+        )
+        session_type = MagicMock(return_value=prelaunch_session)
+        launch = AsyncMock()
+        cleanup = AsyncMock()
+
+        with (
+            patch(
+                "sieval.cli.run.resolve_infer_config",
+                new=AsyncMock(side_effect=resolve),
+            ) as resolve_mock,
+            patch("sieval.cli.run.get_translator", return_value=translator),
+            patch("sieval.cli.run.launch_model", new=launch),
+            patch("sieval.cli.run.cleanup_model", new=cleanup),
+            patch("sieval.cli.leaderboard.session.EvalSession", new=session_type),
+            pytest.raises(ValueError, match="binding capability mismatch"),
+        ):
+            await _run_all(config_path)
+
+        assert resolve_mock.await_count == 2
+        assert translator.translate.call_count == 2
+        launch.assert_not_awaited()
+        cleanup.assert_not_awaited()
+        prelaunch_session.prepare_prelaunch.assert_called_once_with()
+        assert set(session_type.call_args.kwargs["infer_plans"]) == {
+            "model_a",
+            "model_b",
+        }
+
+    @pytest.mark.anyio
+    async def test_unhandled_launch_patch_fails_before_launch(self, tmp_path: Path):
+        from sieval.cli.run import _run_all
+
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "models": {
+                        "model_a": {
+                            "path": "/tmp/a",
+                            "infer": {"backend": "vllm", "recipe": "test"},
+                        }
+                    },
+                    "tasks": {},
+                }
+            )
+        )
+
+        translator = MagicMock()
+        translator.translate.return_value = []
+        deployment_plan = MagicMock()
+        deployment_plan.launch_patch = {"disable_prefix_cache": True}
+        prelaunch_result = MagicMock()
+        prelaunch_result.deployment_plans = {"model:model_a": deployment_plan}
+        prelaunch_session = MagicMock()
+        prelaunch_session.prepare_prelaunch.return_value = prelaunch_result
+        launch = AsyncMock()
+
+        with (
+            patch(
+                "sieval.cli.run.resolve_infer_config",
+                new=AsyncMock(return_value=("model_a", _fake_plan(), {})),
+            ),
+            patch("sieval.cli.run.get_translator", return_value=translator),
+            patch("sieval.cli.run.launch_model", new=launch),
+            patch("sieval.cli.run.cleanup_model", new=AsyncMock()),
+            patch(
+                "sieval.cli.leaderboard.session.EvalSession",
+                return_value=prelaunch_session,
+            ),
+            pytest.raises(RuntimeError, match="#47 launch-patch translator"),
+        ):
+            await _run_all(config_path)
+
+        launch.assert_not_awaited()
+
+
 class TestDeterministicPlanPropagation:
     """Verify --deterministic CLI flag reaches DeploymentPlan.deterministic."""
 
@@ -137,8 +327,7 @@ class TestDeterministicPlanPropagation:
         translated_plans, capture_translate = _make_translate_capture()
         mock_translator = MagicMock()
         mock_translator.translate.side_effect = capture_translate
-        mock_handle = MagicMock()
-        mock_handle.endpoint = "http://localhost:8000/v1"
+        mock_handle = _fake_handle()
 
         with (
             patch(
@@ -209,8 +398,7 @@ class TestDeterministicPlanPropagation:
         translated_plans, capture_translate = _make_translate_capture()
         mock_translator = MagicMock()
         mock_translator.translate.side_effect = capture_translate
-        mock_handle = MagicMock()
-        mock_handle.endpoint = "http://localhost:8000/v1"
+        mock_handle = _fake_handle()
 
         # Simulate real resolve_infer_config behavior for this YAML: it
         # reads `deterministic: true` and stamps it onto the plan.
@@ -272,8 +460,7 @@ class TestDeterministicPlanPropagation:
         translated_plans, capture_translate = _make_translate_capture()
         mock_translator = MagicMock()
         mock_translator.translate.side_effect = capture_translate
-        mock_handle = MagicMock()
-        mock_handle.endpoint = "http://localhost:8000/v1"
+        mock_handle = _fake_handle()
 
         with (
             patch(
@@ -329,8 +516,7 @@ class TestDeterministicPlanPropagation:
         translated_plans, capture_translate = _make_translate_capture()
         mock_translator = MagicMock()
         mock_translator.translate.side_effect = capture_translate
-        mock_handle = MagicMock()
-        mock_handle.endpoint = "http://localhost:8000/v1"
+        mock_handle = _fake_handle()
 
         # auto_resolve_plan doesn't read YAML; it returns a plain non-
         # deterministic plan. The fix in `_run_all` must stamp the YAML
@@ -389,8 +575,7 @@ class TestPathOnlyCapabilityLayer:
         resolve = AsyncMock(return_value=ResolveResult(plan=_fake_plan(), steps=()))
         mock_translator = MagicMock()
         mock_translator.translate.side_effect = _make_translate_capture()[1]
-        mock_handle = MagicMock()
-        mock_handle.endpoint = "http://localhost:8000/v1"
+        mock_handle = _fake_handle()
 
         with (
             patch("sieval.cli.run.auto_resolve_plan", new=resolve),
@@ -449,6 +634,7 @@ class TestPathOnlyCapabilityLayer:
                     "arc_ppl": {
                         "model": "model_a",
                         "class": "ARCEasyFewShotPplTask",
+                        "dataset": {"class": "fake.Dataset"},
                     },
                 },
             },
@@ -480,8 +666,7 @@ class TestDeterministicPassedToSession:
         config_path = tmp_path / "user-facing.yaml"
         config_path.write_text(yaml.safe_dump(config))
 
-        mock_handle = MagicMock()
-        mock_handle.endpoint = "http://localhost:8000/v1"
+        mock_handle = _fake_handle()
         mock_translator = MagicMock()
         mock_translator.translate.return_value = [
             BackendCommand(
@@ -530,19 +715,37 @@ class TestDeterministicPassedToSession:
         assert kwargs["deterministic"] is None
 
 
-class TestEndpointMapPropagation:
-    """`_run_all` passes endpoint_map + infer_plans to arun_session instead
-    of patching a tempfile YAML."""
+class TestDeploymentPropagation:
+    """Auto-serve hands off complete typed state without endpoint projection."""
 
     @pytest.mark.anyio
-    async def test_endpoint_map_and_plans_reach_arun_session(self, tmp_path: Path):
+    async def test_multi_endpoint_deployment_reaches_arun_session_unchanged(
+        self, tmp_path: Path
+    ):
         from sieval.cli.run import _run_all
 
+        plan = DeploymentPlan(
+            checkpoint="/tmp/ckpt",
+            backend="sglang",
+            assignments=(
+                RoleAssignment(
+                    role=WellKnownRole.PREFILL,
+                    devices=DeviceGroup(count=4, gpu_model="H100"),
+                    topology=ParallelTopology(tp=4),
+                ),
+                RoleAssignment(
+                    role=WellKnownRole.DECODE,
+                    devices=DeviceGroup(count=4, gpu_model="H100"),
+                    topology=ParallelTopology(tp=2, dp=2),
+                ),
+            ),
+        )
         config = {
             "models": {
                 "model_a": {
                     "path": "/tmp/ckpt",
-                    "infer": {"backend": "vllm", "recipe": "test"},
+                    "infer": {"backend": "sglang", "recipe": "test"},
+                    "service_role": WellKnownRole.DECODE,
                 }
             },
             "result_dir": str(tmp_path / "out"),
@@ -551,16 +754,50 @@ class TestEndpointMapPropagation:
         config_path = tmp_path / "cfg.yaml"
         config_path.write_text(yaml.safe_dump(config))
 
-        mock_handle = MagicMock()
-        mock_handle.endpoint = "http://localhost:8000/v1"
+        handles = [
+            _fake_handle(
+                endpoint="http://localhost:30000/v1",
+                handle_id="prefill-handle",
+                role=WellKnownRole.PREFILL,
+            ),
+            _fake_handle(
+                endpoint="http://localhost:30001/v1",
+                handle_id="decode-handle",
+                role=WellKnownRole.DECODE,
+            ),
+        ]
+        facts = ServingFacts(
+            engine_version="0.4.6",
+            tokenizer_available=True,
+            prefix_cache_enabled=False,
+            max_top_logprobs=20,
+        )
+        realized = Deployment(
+            deployment_id="served-model-a",
+            plan=deployment_plan_projection(plan),
+            engine=Engine("sglang"),
+            engine_source="deployment",
+            api_base="http://localhost:30001/v1",
+            endpoints={
+                WellKnownRole.PREFILL: "http://localhost:30000/v1",
+                WellKnownRole.DECODE: "http://localhost:30001/v1",
+            },
+            topology=DeploymentTopology(
+                is_disaggregated=True,
+                roles=(WellKnownRole.PREFILL, WellKnownRole.DECODE),
+                total_gpus=8,
+            ),
+            metrics_url="http://localhost:30001/metrics",
+            facts=facts,
+        )
         mock_translator = MagicMock()
         mock_translator.translate.return_value = [
             BackendCommand(
-                cli_args=["vllm", "serve"],
-                backend="vllm",
+                cli_args=["sglang", "serve"],
+                backend="sglang",
                 host="localhost",
-                role="full",
-                health_url="http://localhost:8000/health",
+                role="decode",
+                health_url="http://localhost:30001/health",
             )
         ]
         arun_session_mock = AsyncMock(return_value={})
@@ -568,13 +805,17 @@ class TestEndpointMapPropagation:
         with (
             patch(
                 "sieval.cli.run.resolve_infer_config",
-                new=AsyncMock(return_value=("model_a", _fake_plan(), {})),
+                new=AsyncMock(return_value=("model_a", plan, {})),
             ),
             patch("sieval.cli.run.get_translator", return_value=mock_translator),
             patch(
                 "sieval.cli.run.launch_model",
-                new=AsyncMock(return_value=([mock_handle], None)),
+                new=AsyncMock(return_value=(handles, None)),
             ),
+            patch(
+                "sieval.cli.run.LocalDeployer.build_deployment",
+                return_value=realized,
+            ) as build_deployment,
             patch("sieval.cli.run.cleanup_model", new=AsyncMock()),
             patch(
                 "sieval.infer.topology.validator.validate_plan",
@@ -592,10 +833,72 @@ class TestEndpointMapPropagation:
         args = arun_session_mock.call_args.args
         # First positional is config_path — the ORIGINAL (no tempfile)
         assert args[0] == str(config_path) or args[0] == config_path
-        # endpoint_map and infer_plans are passed through
-        assert kwargs["endpoint_map"] == {"model_a": "http://localhost:8000/v1"}
+        assert "endpoint_map" not in kwargs
         assert "model_a" in kwargs["infer_plans"]
-        assert kwargs["infer_plans"]["model_a"]["backend"] == "vllm"
+        assert kwargs["infer_plans"]["model_a"]["backend"] == "sglang"
+        deployment = kwargs["realized_deployments"]["model_a"]
+        assert deployment is realized
+        assert deployment.endpoints == {
+            "prefill": "http://localhost:30000/v1",
+            "decode": "http://localhost:30001/v1",
+        }
+        assert deployment.topology is realized.topology
+        assert deployment.engine is realized.engine
+        assert deployment.facts is facts
+        build_deployment.assert_called_once_with(plan, handles)
+
+    @pytest.mark.anyio
+    async def test_session_failure_still_cleans_realized_deployment(
+        self, tmp_path: Path
+    ):
+        from sieval.cli.run import _run_all
+
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "models": {
+                        "model_a": {
+                            "path": "/tmp/ckpt",
+                            "infer": {"backend": "vllm", "recipe": "test"},
+                        }
+                    },
+                    "tasks": {},
+                }
+            )
+        )
+        handle = _fake_handle()
+        translator = MagicMock()
+        translator.translate.return_value = [
+            BackendCommand(
+                cli_args=["vllm", "serve"],
+                backend="vllm",
+                role="full",
+                health_url="http://localhost:8000/health",
+            )
+        ]
+        cleanup = AsyncMock()
+
+        with (
+            patch(
+                "sieval.cli.run.resolve_infer_config",
+                new=AsyncMock(return_value=("model_a", _fake_plan(), {})),
+            ),
+            patch("sieval.cli.run.get_translator", return_value=translator),
+            patch(
+                "sieval.cli.run.launch_model",
+                new=AsyncMock(return_value=([handle], None)),
+            ),
+            patch("sieval.cli.run.cleanup_model", new=cleanup),
+            patch(
+                "sieval.cli.leaderboard.session.arun_session",
+                new=AsyncMock(side_effect=RuntimeError("evaluation failed")),
+            ),
+            pytest.raises(RuntimeError, match="evaluation failed"),
+        ):
+            await _run_all(config_path)
+
+        cleanup.assert_awaited_once_with("model_a", [handle], deployer=ANY)
 
     def test_run_module_does_not_import_tempfile(self):
         """Regression guard: the tempfile-YAML-patch path is gone — `tempfile`
@@ -634,8 +937,7 @@ class TestEffectiveConfigRerunSafety:
         config_path = tmp_path / "cfg.yaml"
         config_path.write_text(yaml.safe_dump(config))
 
-        mock_handle = MagicMock()
-        mock_handle.endpoint = "http://localhost:8000/v1"
+        mock_handle = _fake_handle()
         mock_translator = MagicMock()
         mock_translator.translate.return_value = [
             BackendCommand(
@@ -705,8 +1007,7 @@ class TestEffectiveConfigRerunSafety:
         config_path = tmp_path / "cfg.yaml"
         config_path.write_text(yaml.safe_dump(config))
 
-        mock_handle = MagicMock()
-        mock_handle.endpoint = "http://localhost:8000/v1"
+        mock_handle = _fake_handle()
         mock_translator = MagicMock()
         mock_translator.translate.return_value = [
             BackendCommand(

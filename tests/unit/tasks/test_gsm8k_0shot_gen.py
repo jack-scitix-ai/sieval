@@ -10,7 +10,6 @@ from datasets import DatasetDict as HFDatasetDict
 from sieval.community.deepseek_math import is_correct
 from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.chat_model import ChatModel
-from sieval.core.models.transports import OpenAIChatTransport
 from sieval.core.tasks import (
     TaskContext,
     build_judgement_record,
@@ -34,7 +33,7 @@ class _CapturingChatModel(ChatModel):
         super().__init__(model="mock-chat", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
     async def _stub_arun(self, req: Request) -> Response:
         self.last_req = req
@@ -277,4 +276,4 @@ async def test_infer_injects_no_decode_params():
     # or `k` is validated against a budget nothing requested. No decode params
     # are injected; everything else stays the caller's to configure.
     assert req.sampling == SamplingParams(n=1)
-    assert req.extra_wire_params is None
+    assert req.dialect_options is None

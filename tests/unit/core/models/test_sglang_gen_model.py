@@ -12,11 +12,35 @@ with that transport, which supplies the model's capabilities.
 AI-Generated Code - Claude Fable 5 (Anthropic)
 """
 
-from sieval.core.models import Capability, SglangGenModel
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, patch
+
+import anyio
+import pytest
+
+from sieval.core.models import (
+    Capability,
+    CompletionInput,
+    Request,
+    Response,
+    SglangGenModel,
+)
 from sieval.core.models.transports.sglang import SglangTransport
 
 
 class TestDefaultTransport:
+    def test_active_binder_can_replace_facade_without_editing_facade(self):
+        sentinel = object()
+
+        with patch(
+            "sieval.core.models.sglang_gen_model.compatibility_factory_for",
+            return_value=lambda *args, **kwargs: sentinel,
+        ):
+            result = SglangGenModel(model="m", api_key="local")
+
+        assert result is sentinel
+
     def test_builds_sglang_transport(self):
         m = SglangGenModel(model="m", api_base="http://host:8000/v1", api_key="local")
         assert isinstance(m._transport, SglangTransport)
@@ -28,3 +52,153 @@ class TestDefaultTransport:
         assert m._transport._client is m._client
         assert m._transport._model == "m"
         assert m._transport._api_base == "http://host:8000/v1"
+
+    def test_subclass_does_not_use_registered_compatibility_factory(self):
+        class DerivedSglangGenModel(SglangGenModel):
+            pass
+
+        with patch(
+            "sieval.core.models.sglang_gen_model.compatibility_factory_for"
+        ) as factory:
+            model = DerivedSglangGenModel(model="m", api_key="local")
+
+        factory.assert_not_called()
+        assert type(model) is DerivedSglangGenModel
+
+    def test_legacy_identity_and_input_coercion_are_explicit(self):
+        model = SglangGenModel(model="m", api_key="local")
+        prompt = CompletionInput("prompt")
+
+        assert model.dialect_id == "sglang_legacy"
+        assert model.runtime_plan is None
+        assert model._coerce_input(prompt) is prompt
+        assert model._coerce_input("prompt") == prompt
+        with pytest.raises(TypeError, match="text or CompletionInput"):
+            model._coerce_input(3)
+
+    def test_private_pool_identity_is_unique_and_secret_free(self):
+        first = SglangGenModel(model="m", api_key="first-secret")
+        second = SglangGenModel(model="m", api_key="second-secret")
+
+        assert first.pool.identity != second.pool.identity
+        assert (
+            first.pool.identity.credential_scope
+            != second.pool.identity.credential_scope
+        )
+        assert first.pool.identity.quota_scope != second.pool.identity.quota_scope
+        assert "first-secret" not in repr(first.pool.identity)
+        assert "second-secret" not in repr(second.pool.identity)
+
+    def test_legacy_facade_cannot_rebind_or_lose_its_owner(self):
+        model = SglangGenModel(model="m", api_key="local")
+
+        with pytest.raises(RuntimeError, match="cannot rebind"):
+            model.with_dialect("sglang_native", object())
+        model._lifecycle_owner = None
+        with pytest.raises(RuntimeError, match="no lifecycle owner"):
+            model._legacy_lifecycle_owner()
+
+
+class _StubTransport:
+    capabilities = frozenset()
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = anyio.Event()
+        self.release = anyio.Event()
+
+    async def arun(self, req: Request) -> Response:
+        del req
+        self.calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return Response(texts=("ok",))
+
+
+class TestLegacyLifecycle:
+    @pytest.mark.anyio
+    async def test_context_manager_returns_self_and_closes_pool(self):
+        client = SimpleNamespace(
+            base_url="http://host:8000/v1/",
+            close=AsyncMock(),
+        )
+        with patch(
+            "sieval.core.models.sglang_gen_model.AsyncOpenAI",
+            return_value=client,
+        ):
+            model = SglangGenModel(model="m", api_key="local")
+
+        async with model as entered:
+            assert entered is model
+
+        assert model.pool.is_closed
+        client.close.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_close_via_child_invalidates_all_siblings_and_closes_once(self):
+        client = SimpleNamespace(
+            base_url="http://host:8000/v1/",
+            close=AsyncMock(),
+        )
+        with patch(
+            "sieval.core.models.sglang_gen_model.AsyncOpenAI",
+            return_value=client,
+        ):
+            root = SglangGenModel(model="m", api_key="local")
+            child = root.with_args(temperature=0.5)
+            sibling = root.with_args(top_p=0.9)
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(child.aclose)
+            task_group.start_soon(root.aclose)
+            task_group.start_soon(sibling.aclose)
+
+        assert root.pool.is_closing is True
+        assert root.pool.is_closed is True
+        client.close.assert_awaited_once()
+
+        for model in (root, child, sibling):
+            with pytest.raises(RuntimeError, match="ConnectionPool is closing"):
+                await model.__aenter__()
+            with pytest.raises(RuntimeError, match="ConnectionPool is closing"):
+                await model.arun(Request(input=CompletionInput("prompt")))
+
+    @pytest.mark.anyio
+    async def test_close_drains_admitted_request_before_closing_client(self):
+        transport = _StubTransport()
+        client = SimpleNamespace(
+            base_url="http://host:8000/v1/",
+            close=AsyncMock(),
+        )
+        with patch(
+            "sieval.core.models.sglang_gen_model.AsyncOpenAI",
+            return_value=client,
+        ):
+            root = SglangGenModel(
+                model="m",
+                api_key="local",
+                transport=transport,  # type: ignore[arg-type]
+            )
+        child = root.with_args(temperature=0.5)
+
+        async def close_and_observe() -> None:
+            await child.aclose()
+            client.close.assert_awaited_once()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(
+                root.arun,
+                Request(input=CompletionInput("prompt")),
+            )
+            await transport.entered.wait()
+            task_group.start_soon(close_and_observe)
+            while not root.pool.is_closing:
+                await cast(Any, anyio.lowlevel).checkpoint()
+
+            client.close.assert_not_awaited()
+            with pytest.raises(RuntimeError, match="ConnectionPool is closing"):
+                await child.arun(Request(input=CompletionInput("new")))
+            transport.release.set()
+
+        assert transport.calls == 1
+        assert root.pool.is_closed is True

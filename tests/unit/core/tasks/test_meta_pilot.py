@@ -6,9 +6,16 @@ AI-Generated Code - Claude Opus 4.6 (Anthropic)
 import json
 from pathlib import Path
 
+from sieval.core.models.requirements import (
+    InputKind,
+    InputModality,
+    NamedModelBinding,
+    RequirementContext,
+)
 from sieval.core.tasks.meta import (
     TASK_REGISTRY,
     import_all_tasks,
+    iter_task_entries,
     task_meta_to_dict,
 )
 
@@ -26,12 +33,111 @@ PILOT_NAMES = {
     "t_eval_before_calling_0shot_gen",
 }
 
+JUDGE_TASK_NAMES = {
+    "aa_lcr_0shot_gen",
+    "browsecomp_0shot_gen",
+    "hle_0shot_gen",
+    "simpleqa_verified_0shot_gen",
+}
+
 
 def test_all_pilot_tasks_registered():
     import_all_tasks()
     registered = set(TASK_REGISTRY.keys())
     missing = PILOT_NAMES - registered
     assert not missing, f"pilot tasks missing from registry: {missing}"
+
+
+def test_registered_model_tasks_have_composed_input_and_modality_requirements():
+    """Golden: every model-calling catalog entry has an executable input shape."""
+
+    import_all_tasks()
+    missing: list[str] = []
+    mismatched: list[str] = []
+    for task_cls, meta in iter_task_entries():
+        requires = task_cls.requires
+        if requires.input is None or not requires.input_modalities:
+            missing.append(meta.name)
+            continue
+        expected = InputKind.CHAT if meta.model_type == "chat" else InputKind.COMPLETION
+        if requires.input is not expected:
+            mismatched.append(meta.name)
+
+    assert not missing, f"tasks missing composed modality requirements: {missing}"
+    assert not mismatched, f"tasks with mismatched input requirements: {mismatched}"
+
+
+def test_registered_ppl_and_clp_tasks_declare_scoring_semantics():
+    import_all_tasks()
+    for task_cls, meta in iter_task_entries():
+        if meta.eval_mode.value == "ppl":
+            assert task_cls.requires.input_scoring, meta.name
+            assert not task_cls.requires.sampled_logprobs, meta.name
+        elif meta.eval_mode.value == "clp":
+            assert task_cls.requires.sampled_logprobs, meta.name
+            assert task_cls.requires.min_top_logprobs is not None, meta.name
+
+
+def test_registered_clp_hooks_use_normalized_logprobs_task_arg():
+    import_all_tasks()
+    binding = NamedModelBinding("candidate", "root", "model", "config")
+    context = RequirementContext(
+        model_bindings={"candidate": binding}, task_args={"logprobs": 37}
+    )
+
+    for task_cls, meta in iter_task_entries():
+        if meta.eval_mode.value != "clp":
+            continue
+        (requirement,) = task_cls.model_requirements_for(context)
+        assert requirement.requires.min_top_logprobs == 37, meta.name
+        assert requirement.source_task == meta.name
+
+
+def test_llm_judge_tasks_expose_grader_binding_before_construction():
+    import_all_tasks()
+    candidate = NamedModelBinding("candidate", "candidate-root", "model", "model")
+    grader = NamedModelBinding("grader", "grader-root", "judge", "judge")
+    context = RequirementContext(
+        model_bindings={"candidate": candidate, "grader": grader}
+    )
+
+    seen: set[str] = set()
+    for task_cls, meta in iter_task_entries():
+        if meta.name not in JUDGE_TASK_NAMES:
+            continue
+        seen.add(meta.name)
+        requirements = task_cls.model_requirements_for(context)
+        assert {item.role for item in requirements} == {"candidate", "grader"}
+        grader_requirement = next(
+            item for item in requirements if item.role == "grader"
+        )
+        assert grader_requirement.requires.input is InputKind.CHAT
+        assert grader_requirement.binding is grader
+
+    assert seen == JUDGE_TASK_NAMES
+
+
+def test_hle_full_dataset_adds_candidate_image_modality_requirement():
+    import_all_tasks()
+    task_cls = next(
+        cls for cls, meta in iter_task_entries() if meta.name == "hle_0shot_gen"
+    )
+    context = RequirementContext(
+        model_bindings={
+            "candidate": NamedModelBinding(
+                "candidate", "candidate-root", "model", "model"
+            ),
+            "grader": NamedModelBinding("grader", "grader-root", "judge", "judge"),
+        },
+        dataset_config={"text_only": False},
+    )
+
+    requirements = task_cls.model_requirements_for(context)
+    candidate = next(item for item in requirements if item.role == "candidate")
+    assert candidate.requires.input_modalities == {
+        InputModality.TEXT,
+        InputModality.IMAGE,
+    }
 
 
 def test_index_json_matches_current_registry():

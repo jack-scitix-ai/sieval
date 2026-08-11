@@ -35,18 +35,28 @@ from loguru import logger as _loguru_logger
 
 from sieval.core.datasets import Dataset
 from sieval.core.models import (
-    Capability,
+    InputScoringResult,
     ModelOutput,
     Request,
     Response,
     TokenLogprob,
+    TopKEntry,
     UsageStats,
 )
 from sieval.core.models.chat_model import ChatModel
+from sieval.core.models.dialect import (
+    Guarantee,
+    OutputContract,
+    OutputRule,
+    PreparedRequest,
+    RequestAudit,
+)
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import (
-    OpenAIChatTransport,
-    OpenAICompletionsTransport,
+from sieval.core.models.ir import (
+    ChatInput,
+    CompletionInput,
+    TextPart,
+    response_field_contract,
 )
 from sieval.core.runners.runner import TaskRunnerConfig
 from sieval.core.tasks.context import TaskContext, TaskStage
@@ -283,7 +293,7 @@ class MockDataset(Dataset):
 # ===================================================================
 # Mock Models
 #
-# RFC #25: mocks stub at the Transport seam. Each mock model overrides
+# RFC #25: mocks stub at the Dialect seam. Each mock model overrides
 # ``_build_default_transport`` to return a ``HandlerTransport`` bound to
 # its ``_stub_arun(Request) -> Response`` handler, so ``agenerate`` /
 # ``alogprobs`` exercise the real request builders and Response bridge
@@ -291,36 +301,68 @@ class MockDataset(Dataset):
 # ``_stub_arun`` and chain via ``super()``.
 # ===================================================================
 class HandlerTransport:
-    """Transport double: forwards ``arun`` to a handler coroutine.
+    """Dialect double: forwards ``execute`` to a handler coroutine.
 
     Records every Request in ``self.requests`` so tests can assert on the
-    lowered IR instead of legacy kwargs.
+    canonical IR while still exercising Model's real audit and pool path.
     """
 
-    def __init__(self, handler, capabilities: frozenset[Capability]):
+    def __init__(self, handler, dialect_id: str):
+        if dialect_id not in {"openai_chat", "openai_completions"}:
+            raise ValueError(f"unsupported test dialect: {dialect_id!r}")
         self._handler = handler
-        self._capabilities = frozenset(capabilities)
+        self.dialect_id = dialect_id
+        self.connection_family = "openai_sdk"
+        self.output_contract = OutputContract(
+            {
+                name: OutputRule(Guarantee.PRESENT_OR_ERROR)
+                for name, (role, _) in response_field_contract().items()
+                if role == "channel"
+            }
+        )
         self.requests: list[Request] = []
 
-    @property
-    def capabilities(self) -> frozenset[Capability]:
-        return self._capabilities
+    def validate_request(self, req, audit: RequestAudit, plan) -> None:
+        del req, audit, plan
 
-    async def arun(self, req: Request) -> Response:
+    def prepare(self, req: Request, audit: RequestAudit) -> PreparedRequest:
+        consumed = frozenset(
+            path for path in audit.active if path not in audit.decisions
+        )
+        for path in consumed:
+            audit.consumed(path)
+        return PreparedRequest(
+            operation="handler",
+            body={},
+            consumed_paths=consumed,
+            passthrough={},
+            context=req,
+        )
+
+    async def execute(self, prepared: PreparedRequest) -> Response:
+        req = prepared.context
+        assert isinstance(req, Request)
         self.requests.append(req)
         return await self._handler(req)
 
 
 def prompt_of(req: Request) -> str:
-    """Extract the flat question text from a Request input (str or messages)."""
-    if isinstance(req.input, str):
-        return req.input
-    return req.input[-1]["content"] if req.input else ""
+    """Extract the flat question text from canonical completion/chat input."""
+    if isinstance(req.input, CompletionInput):
+        return req.input.text
+    assert isinstance(req.input, ChatInput)
+    if not req.input.messages:
+        return ""
+    return "".join(
+        part.text
+        for part in req.input.messages[-1].content
+        if isinstance(part, TextPart)
+    )
 
 
 def n_of(req: Request) -> int:
     """Number of samples requested."""
-    return req.sampling.n if req.sampling is not None else 1
+    return req.sampling.n
 
 
 class MockChatModel(ChatModel):
@@ -337,7 +379,7 @@ class MockChatModel(ChatModel):
         super().__init__(model="mock-chat", api_key="fake", **kwargs)
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
     async def _stub_arun(self, req: Request) -> Response:
         q = prompt_of(req)
@@ -371,12 +413,10 @@ class MockGenModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake", **kwargs)
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
-        if not (req.return_logprobs or req.score_input):
+        if not (req.scoring.sampled_logprobs or req.scoring.input_scoring):
             return Response(
                 texts=(self._default_answer,),
                 finish_reasons=("stop",),
@@ -387,13 +427,29 @@ class MockGenModel(GenModel):
         prompt = prompt_of(req)
         option_label = prompt.rstrip()[-1] if prompt.strip() else "A"
         score = self._logprob_scores.get(option_label, -10.0)
-        max_tokens = req.sampling.max_tokens if req.sampling is not None else None
+        max_tokens = req.sampling.max_tokens
+
+        input_scoring = None
+        if req.scoring.input_scoring:
+            input_scoring = InputScoringResult(
+                (TokenLogprob(token=f" {option_label}", logprob=score),)
+            )
 
         return Response(
             texts=("",),
             finish_reasons=("stop",),
-            logprobs=(TokenLogprob(token=f" {option_label}", logprob=score),),
-            usage=UsageStats(input_tokens=10, output_tokens=1, total_tokens=11),
+            logprobs=(
+                (TokenLogprob(token=f" {option_label}", logprob=score),)
+                if req.scoring.sampled_logprobs
+                else None
+            ),
+            top_logprobs=(
+                ((TopKEntry(token=f" {option_label}", logprob=score),),)
+                if req.scoring.top_logprobs > 0
+                else None
+            ),
+            input_scoring=input_scoring,
+            usage=UsageStats(input_tokens=1, output_tokens=1, total_tokens=2),
             request_params={"max_tokens": max_tokens},
         )
 
@@ -406,7 +462,7 @@ class MockJudgeModel(ChatModel):
         super().__init__(model="mock-judge", api_key="fake", **kwargs)
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
     async def _stub_arun(self, req: Request) -> Response:
         return Response(
@@ -427,7 +483,7 @@ class MockFailingChatModel(ChatModel):
         super().__init__(model="mock-failing", api_key="fake", **kwargs)
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
     async def _stub_arun(self, req: Request) -> Response:
         self._call_count += 1
@@ -448,7 +504,7 @@ class MockAlwaysFailModel(ChatModel):
         super().__init__(model="mock-always-fail", api_key="fake", **kwargs)
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
     async def _stub_arun(self, req: Request) -> Response:
         raise self._error("Always fails")
@@ -483,7 +539,7 @@ class MockSelectiveFailModel(ChatModel):
         super().__init__(model="mock-selective", api_key="fake", **kwargs)
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
     async def _stub_arun(self, req: Request) -> Response:
         q = prompt_of(req)
@@ -623,7 +679,7 @@ class LatencyMockChatModel(ChatModel):
         self._output_text = default_answer or ("x" * max(1, output_size))
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(self._stub_arun, OpenAIChatTransport.CAPABILITIES)
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
     async def _stub_arun(self, req: Request) -> Response:
         jitter = random.uniform(-self._latency_jitter, self._latency_jitter)

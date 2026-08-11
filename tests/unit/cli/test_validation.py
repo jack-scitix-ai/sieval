@@ -5,7 +5,7 @@ AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
@@ -281,6 +281,26 @@ class TestValidateModels:
         result = validate_eval_config(cfg)
         assert result.ok, result.errors
 
+    def test_service_role_accepts_explicit_nonempty_route(self):
+        cfg = {
+            "models": {"m": {"name": "x", "service_role": "decode"}},
+            "datasets": {},
+            "tasks": {},
+        }
+        result = validate_eval_config(cfg)
+        assert result.ok, result.errors
+
+    @pytest.mark.parametrize("service_role", [None, "", 7, ["decode"]])
+    def test_service_role_rejects_malformed_route(self, service_role):
+        cfg = {
+            "models": {"m": {"name": "x", "service_role": service_role}},
+            "datasets": {},
+            "tasks": {},
+        }
+        result = validate_eval_config(cfg)
+        assert not result.ok
+        assert any("service_role" in error for error in result.errors)
+
     def test_name_and_base_coexist(self):
         cfg = {
             "models": {"m": {"name": "gpt-4", "base": "other"}},
@@ -384,6 +404,151 @@ class TestValidateModels:
         }
         result = validate_eval_config(cfg)
         assert not any("auto-serve" in w for w in result.warnings)
+
+
+class TestValidateModelCapabilities:
+    @staticmethod
+    def _config(**model_config):
+        return {
+            "models": {"m": {"name": "model", **model_config}},
+            "datasets": {},
+            "tasks": {},
+        }
+
+    def test_active_canonical_dialects_and_typed_options_are_accepted(self):
+        chat = validate_eval_config(
+            self._config(
+                dialect="openai_chat",
+                capabilities={
+                    "reasoning": {"effort": "high", "summary": "none"},
+                    "structured_output": {"formats": ["json_schema"]},
+                    "input_scoring": False,
+                },
+            )
+        )
+        completions = validate_eval_config(
+            self._config(
+                dialect="openai_completions",
+                capabilities={"input_scoring": True, "fim": {}},
+            )
+        )
+
+        assert chat.ok, chat.errors
+        assert completions.ok, completions.errors
+
+    @pytest.mark.parametrize("dialect", [None, "", 7, ["openai_chat"]])
+    def test_explicit_malformed_dialect_is_rejected(self, dialect):
+        result = validate_eval_config(self._config(dialect=dialect))
+
+        assert not result.ok
+        assert any(
+            "dialect" in error and "non-empty string" in error
+            for error in result.errors
+        )
+
+    def test_unknown_dialect_is_rejected_without_guessing(self):
+        result = validate_eval_config(self._config(dialect="chat"))
+
+        assert not result.ok
+        assert any("unknown dialect 'chat'" in error for error in result.errors)
+
+    @pytest.mark.parametrize(
+        ("dialect", "message"),
+        [
+            ("openai_responses", "reserved for a later"),
+            ("sglang_native", "legacy bypass"),
+            ("vllm_native", "explicitly deferred"),
+        ],
+    )
+    def test_registered_but_inactive_dialect_is_rejected(self, dialect, message):
+        result = validate_eval_config(self._config(dialect=dialect))
+
+        assert not result.ok
+        assert any(message in error for error in result.errors)
+
+    @pytest.mark.parametrize(
+        ("capabilities", "message"),
+        [
+            (None, "capabilities must be a mapping"),
+            (["reasoning"], "capabilities must be a mapping"),
+            ({"not_a_capability": True}, "unknown capability key"),
+            ({"reasoning": None}, "cannot be null"),
+            ({"reasoning": {"unknown": True}}, "unknown option"),
+            ({"top_logprobs": {"minimum": 0}}, "minimum must be >= 1"),
+        ],
+    )
+    def test_malformed_capability_subtree_is_rejected(self, capabilities, message):
+        result = validate_eval_config(
+            self._config(dialect="openai_chat", capabilities=capabilities)
+        )
+
+        assert not result.ok
+        assert any(message in error for error in result.errors)
+
+    def test_dialect_unsupported_capability_can_only_be_explicitly_disabled(self):
+        enabled = validate_eval_config(
+            self._config(
+                dialect="openai_chat",
+                capabilities={"input_scoring": True},
+            )
+        )
+        disabled = validate_eval_config(
+            self._config(
+                dialect="openai_chat",
+                capabilities={"input_scoring": False},
+            )
+        )
+
+        assert not enabled.ok
+        assert any("does not support" in error for error in enabled.errors)
+        assert disabled.ok, disabled.errors
+
+    def test_dialect_specific_option_validator_is_used(self):
+        result = validate_eval_config(
+            self._config(
+                dialect="openai_chat",
+                capabilities={"reasoning": {"budget_tokens": 512}},
+            )
+        )
+
+        assert not result.ok
+        assert any(
+            "does not support reasoning budget_tokens" in e for e in result.errors
+        )
+
+    def test_legacy_type_is_not_a_second_default_dialect_resolver(self):
+        result = validate_eval_config(
+            self._config(
+                type="gen",
+                capabilities={"reasoning": True},
+            )
+        )
+
+        assert result.ok, result.errors
+
+    def test_task_derived_default_still_gets_provider_neutral_schema_validation(self):
+        valid = validate_eval_config(
+            self._config(capabilities={"top_logprobs": {"minimum": 8}})
+        )
+        invalid = validate_eval_config(
+            self._config(capabilities={"top_logprobs": {"minimum": "many"}})
+        )
+
+        assert valid.ok, valid.errors
+        assert not invalid.ok
+        assert any("minimum must be an integer" in error for error in invalid.errors)
+
+    def test_legacy_sglang_bypass_rejects_new_capability_declarations(self):
+        result = validate_eval_config(
+            self._config(
+                type="gen",
+                engine="sglang",
+                capabilities={"input_scoring": True},
+            )
+        )
+
+        assert not result.ok
+        assert any("legacy SGLang bypass" in error for error in result.errors)
 
 
 # ---------------------------------------------------------------------------
@@ -957,6 +1122,10 @@ class TestEvalDryRunCli:
         with (
             patch("sieval.cli.validation.resolve_task_class"),
             patch("sieval.cli.validation.resolve_dataset_class"),
+            patch(
+                "sieval.cli.validation._capability_reconcile_check",
+                return_value={"name": "capability_reconcile", "ok": True},
+            ),
         ):
             result = cli_runner.invoke(app, ["eval", "--dry-run", str(config)])
         assert result.exit_code == 0
@@ -1014,6 +1183,10 @@ class TestRunDryRunCli:
         with (
             patch("sieval.cli.validation.resolve_task_class"),
             patch("sieval.cli.validation.resolve_dataset_class"),
+            patch(
+                "sieval.cli.validation._capability_reconcile_check",
+                return_value={"name": "capability_reconcile", "ok": True},
+            ),
         ):
             result = cli_runner.invoke(app, ["run", "--dry-run", str(config)])
         assert result.exit_code == 0
@@ -1043,6 +1216,32 @@ class TestRunDryRunCli:
 
 
 class TestRunDryRun:
+    @staticmethod
+    def _capability_config(
+        tmp_path: Path,
+        *,
+        dialect: str = "openai_chat",
+    ) -> Path:
+        config = tmp_path / f"capability-{dialect}.yaml"
+        config.write_text(
+            "models:\n"
+            "  m:\n"
+            "    infer:\n"
+            "      backend: vllm\n"
+            "      checkpoint: /models/example-model\n"
+            f"    dialect: {dialect}\n"
+            "datasets:\n"
+            "  d:\n"
+            "    class: sieval.datasets.aime_2024.AIME2024Dataset\n"
+            "tasks:\n"
+            "  t:\n"
+            "    class: sieval.tasks.aime_2024_0shot_gen.AIME2024ZeroShotGenTask\n"
+            "    dataset: d\n"
+            "    model: m\n",
+            encoding="utf-8",
+        )
+        return config
+
     def test_returns_dict_on_valid_config(self, tmp_path):
         from sieval.cli.validation import run_dry_run
 
@@ -1075,6 +1274,42 @@ class TestRunDryRun:
         result = run_dry_run(config)
         yaml_check = next(c for c in result["checks"] if c["name"] == "yaml_syntax")
         assert yaml_check["ok"] is False
+
+    @pytest.mark.parametrize(
+        "model_yaml",
+        [
+            "    dialect: chat\n",
+            "    dialect: null\n",
+            "    dialect: openai_responses\n",
+            "    dialect: openai_chat\n    capabilities: null\n",
+            (
+                "    dialect: openai_chat\n"
+                "    capabilities:\n"
+                "      not_a_capability: true\n"
+            ),
+        ],
+    )
+    def test_capability_schema_diagnostics_match_direct_validation(
+        self, tmp_path, model_yaml
+    ):
+        """Ordinary validation and dry-run share one capability schema path."""
+        from sieval.cli.validation import run_dry_run
+
+        content = (
+            f"models:\n  m:\n    name: model\n{model_yaml}datasets: {{}}\ntasks: {{}}\n"
+        )
+        config = tmp_path / "capability-schema.yaml"
+        config.write_text(content, encoding="utf-8")
+        direct = validate_eval_config(yaml.safe_load(content))
+
+        dry_run = run_dry_run(config)
+        schema_check = next(
+            check for check in dry_run["checks"] if check["name"] == "schema"
+        )
+
+        assert not direct.ok
+        assert schema_check["ok"] is False
+        assert schema_check["detail"] == "; ".join(direct.errors)
 
     def test_schema_validation_failure(self, tmp_path):
         """Config with bad schema returns schema check failure."""
@@ -1183,3 +1418,97 @@ class TestRunDryRun:
         # Third-party imports produce warnings (not errors)
         warnings = imports_check.get("warnings", [])
         assert len(warnings) > 0
+
+    def test_capability_reconcile_good_config_is_pure_and_passes(self, tmp_path):
+        from sieval.cli.leaderboard.session import EvalSession
+        from sieval.cli.validation import run_dry_run
+        from sieval.core.models import Engine
+
+        config = self._capability_config(tmp_path)
+        with (
+            patch("sieval.core.models.connection_factory.AsyncOpenAI") as client,
+            patch.object(
+                EvalSession,
+                "_setup_postlaunch_reconciliation",
+                side_effect=AssertionError("postlaunch must not run"),
+            ) as postlaunch,
+            patch.object(
+                EvalSession,
+                "_setup_models",
+                side_effect=AssertionError("model setup must not run"),
+            ) as model_setup,
+            patch.object(
+                EvalSession,
+                "_persist_effective_config",
+                new_callable=AsyncMock,
+            ) as persist,
+            patch.object(
+                EvalSession,
+                "_persist_infer_plans",
+                new_callable=AsyncMock,
+            ) as persist_plans,
+            patch.object(
+                Engine,
+                "verify_deployment",
+                new_callable=AsyncMock,
+            ) as probe,
+            patch.object(
+                Path,
+                "write_text",
+                side_effect=AssertionError("dry-run must not write files"),
+            ) as write_text,
+        ):
+            result = run_dry_run(config)
+
+        check = next(
+            item for item in result["checks"] if item["name"] == "capability_reconcile"
+        )
+        assert check["ok"] is True
+        assert check["detail"] == "1 bindings, 1 deployment roots"
+        assert set(check["plan"]) == {
+            "binding_plans",
+            "deployment_plans",
+            "runtime_plans",
+            "diagnostics",
+        }
+        assert not check["plan"]["runtime_plans"]
+        assert result["n_errors"] == 0
+        client.assert_not_called()
+        postlaunch.assert_not_called()
+        model_setup.assert_not_called()
+        persist.assert_not_awaited()
+        persist_plans.assert_not_awaited()
+        probe.assert_not_awaited()
+        write_text.assert_not_called()
+
+    def test_dry_run_serializes_the_exact_normal_prelaunch_plan(self, tmp_path):
+        from sieval.cli.leaderboard.session import EvalSession
+        from sieval.cli.validation import run_dry_run
+
+        config = self._capability_config(tmp_path)
+        normal_plan = EvalSession(config).prepare_prelaunch().to_json_value()
+
+        dry_run = run_dry_run(config)
+        check = next(
+            item for item in dry_run["checks"] if item["name"] == "capability_reconcile"
+        )
+
+        assert check["ok"] is True
+        assert check["plan"] == normal_plan
+
+    def test_bad_task_dialect_pair_matches_normal_prepare_error(self, tmp_path):
+        from sieval.cli.leaderboard.session import EvalSession
+        from sieval.cli.validation import run_dry_run
+
+        config = self._capability_config(tmp_path, dialect="openai_completions")
+        with pytest.raises(ValueError) as normal:
+            EvalSession(config).prepare_prelaunch()
+
+        result = run_dry_run(config)
+        check = next(
+            item for item in result["checks"] if item["name"] == "capability_reconcile"
+        )
+        assert check["ok"] is False
+        assert check["detail"] == str(normal.value)
+        assert "input_kind_unsupported" in check["detail"]
+        assert result["n_errors"] == 1

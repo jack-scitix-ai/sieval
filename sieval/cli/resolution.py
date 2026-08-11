@@ -6,20 +6,36 @@ rather than in ``leaderboard/session.py`` — importing the session to reach it
 would point the dependency sideways across the two CLI subpackages.
 ``scripts/check_layer_imports.py`` rejects that edge.
 
-It imports nothing from sieval (``sieval.tasks`` / ``sieval.datasets`` are
-reached through ``importlib`` at call time), so it is a leaf both subpackages can
-depend on. That is about the dependency graph, not load time: ``sieval/cli``'s
-own ``__init__`` builds the whole app, so importing any ``sieval.cli`` submodule
-already pulls in the session either way.
+The model-kind resolver consumes the provider-neutral requirements projection
+from ``sieval.core``. It deliberately imports neither CLI subpackage: both the
+eval composition root and infer recipe resolution depend on this module, never
+on each other.
 
 AI-Generated Code - Claude Opus 5 (1M context) (Anthropic)
 """
 
+import copy
+import hashlib
 import importlib
+import json
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Literal, cast
 
 from loguru import logger
+
+from sieval.core.models.requirements import (
+    AggregatedTaskRequirements,
+    InlineModelBinding,
+    InputKind,
+    NamedModelBinding,
+    RequirementContext,
+    TaskModelRequirement,
+    aggregate_task_requirements,
+)
+from sieval.core.types import JSONValue
 
 # Registry for simple name lookups
 DATASET_MODULE = "sieval.datasets"
@@ -179,91 +195,393 @@ def validate_named_config_map(
 def derive_model_type(
     model_name: str,
     explicit_type: str | None,
-    tasks_cfg: Mapping[str, Mapping[str, Any]],
-) -> str:
-    """Decide whether a config's model is a ``"chat"`` or ``"gen"`` model.
+    requirements: AggregatedTaskRequirements,
+) -> Literal["chat", "gen"]:
+    """Derive one deployment root's legacy kind from normalized evidence.
 
-    Priority:
-      1. The config's explicit ``type``.
-      2. The ``model_type`` declared by the tasks pointing at this model.
-      3. Default to ``"chat"``.
+    ``TaskModelRequirement.requires.input`` is the sole task-side authority.
+    When that evidence exists, legacy YAML ``type:`` is a checked assertion.
+    With no input evidence, an explicit value remains a compatibility fallback;
+    otherwise the historical ``chat`` default applies.
 
-    Both callers — the eval session (which model class to construct) and infer
-    recipe resolution (which capability layer to serve) — must reach the same
-    answer for one model, so the derivation is shared rather than read off
-    ``type`` twice. Explicit-only would silently mean "instruct" for every
-    config in the wild, since ``type`` is normally left to this inference.
-
-    Args:
-        model_name: Name of the model in config.
-        explicit_type: Explicitly specified type from config, if any.
-        tasks_cfg: The config's ``tasks`` mapping, used for inference.
-
-    Returns:
-        Model type: ``"chat"`` or ``"gen"``.
-
-    Raises:
-        ValueError: If tasks pointing at this model require conflicting types,
-            or if ``tasks_cfg`` is not a ``name -> dict`` mapping.
+    The resolver never inspects task ``model_type`` metadata, model wrapper
+    classes, dialects, engines, URLs, or provider response shapes.
     """
-    # 1. User explicitly specified
-    if explicit_type is not None:
-        return explicit_type
 
-    # 2. Infer from tasks
-    tasks_cfg = validate_named_config_map("tasks", tasks_cfg)
-    required_types: set[tuple[str, str]] = set()
+    if not isinstance(model_name, str) or not model_name:
+        raise TypeError("model_name must be a non-empty string")
+    if explicit_type not in (None, "chat", "gen"):
+        raise ValueError(
+            f"Model deployment root '{model_name}' has invalid type "
+            f"{explicit_type!r}; expected 'chat' or 'gen'"
+        )
+    if not isinstance(requirements, AggregatedTaskRequirements):
+        raise TypeError("requirements must be AggregatedTaskRequirements")
 
-    for task_name, task_cfg in tasks_cfg.items():
-        if task_cfg.get("model") != model_name:
-            continue
-
-        # Resolve task class to check its model_type attribute
-        task_class_spec = task_cfg.get("class")
-        if not task_class_spec:
-            continue
-
-        try:
-            task_class = resolve_task_class(task_class_spec)
-            task_model_type = getattr(task_class, "model_type", None)
-
-            if task_model_type is not None:
-                required_types.add((task_name, task_model_type))
-        except (ImportError, AttributeError):
-            # If we can't resolve the task class yet, skip it
-            # Validation will catch issues later
-            continue
-
-    # Check for conflicts
-    unique_types = {t for _, t in required_types}
-
-    if len(unique_types) > 1:
-        # Conflicting requirements
-        conflict_info = "\n".join(
-            f"  - {task_name} requires '{model_type}'"
-            for task_name, model_type in sorted(required_types)
+    kinds = requirements.input
+    if len(kinds) > 1:
+        evidence = "\n".join(
+            "  - "
+            + kind.value
+            + ": "
+            + ", ".join(sorted(requirements.input_sources.get(kind, ())))
+            for kind in sorted(kinds, key=lambda item: item.value)
         )
         raise ValueError(
-            f"Model '{model_name}' is used by tasks requiring different types:\n"
-            f"{conflict_info}\n"
-            f"Please either:\n"
-            f"  1. Explicitly specify 'type: chat' or 'type: gen' in model config\n"
-            f"  2. Use separate models for different types"
+            f"Model deployment root '{model_name}' has conflicting normalized "
+            f"input requirements:\n{evidence}\n"
+            "Chat and completion consumers must use separate root model configs."
         )
 
-    if len(unique_types) == 1:
-        # All tasks agree on the same type
-        inferred_type = unique_types.pop()
+    if kinds:
+        input_kind = next(iter(kinds))
+        derived_type: Literal["chat", "gen"] = (
+            "chat" if input_kind is InputKind.CHAT else "gen"
+        )
+        if explicit_type is not None and explicit_type != derived_type:
+            sources = ", ".join(sorted(requirements.input_sources.get(input_kind, ())))
+            source_detail = f" from {sources}" if sources else ""
+            raise ValueError(
+                f"Model deployment root '{model_name}' declares type: "
+                f"{explicit_type}, but normalized TaskRequirements require "
+                f"'{derived_type}' ({input_kind.value}){source_detail}. Legacy "
+                "type is a checked assertion when task evidence exists."
+            )
         logger.info(
-            "Inferred model '{}' type as '{}' from task requirements",
+            "Derived model deployment root '{}' type as '{}' from normalized "
+            "task requirements",
             model_name,
-            inferred_type,
+            derived_type,
         )
-        return inferred_type
+        return derived_type
 
-    # 3. Default to "chat"
-    logger.info("Using default type 'chat' for model '{}'", model_name)
+    if explicit_type is not None:
+        return cast(Literal["chat", "gen"], explicit_type)
+    logger.info(
+        "Using default type 'chat' for model deployment root '{}' with no input "
+        "requirement evidence",
+        model_name,
+    )
     return "chat"
+
+
+@dataclass(frozen=True)
+class ConfigModelTypeResolution:
+    """Legacy model kinds derived from normalized task requirement hooks."""
+
+    model_types_by_root: Mapping[str, Literal["chat", "gen"]]
+    model_types_by_config: Mapping[str, Literal["chat", "gen"]]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "model_types_by_root",
+            MappingProxyType(dict(self.model_types_by_root)),
+        )
+        object.__setattr__(
+            self,
+            "model_types_by_config",
+            MappingProxyType(dict(self.model_types_by_config)),
+        )
+
+
+def resolve_config_model_types(
+    config: Mapping[str, Any],
+) -> ConfigModelTypeResolution:
+    """Adapt YAML config into the normalized evidence accepted by the resolver.
+
+    This is the recipe-layer adapter for callers that run before an
+    :class:`EvalSession` exists. It invokes each task's
+    ``model_requirements_for()`` hook with dialect-free bindings and then calls
+    :func:`derive_model_type`; it never reads legacy ``Task.model_type``.
+
+    Import/class failures remain fail-soft here because normal configuration
+    validation reports them with richer context later. A successfully resolved
+    hook is validated strictly so it cannot replace the supplied binding.
+    """
+
+    if not isinstance(config, Mapping):
+        raise TypeError("config must be a mapping")
+    models = validate_named_config_map("models", config.get("models", {}))
+    tasks = validate_named_config_map("tasks", config.get("tasks", {}))
+    raw_datasets = config.get("datasets", {})
+    datasets = validate_named_config_map("datasets", raw_datasets)
+
+    chains = {name: _config_model_chain(name, models) for name in models}
+    bindings = {name: _config_named_binding(name, chains[name]) for name in models}
+    records: list[TaskModelRequirement] = []
+
+    for task_name, task_config in tasks.items():
+        class_spec = task_config.get("class")
+        if not isinstance(class_spec, str) or not class_spec:
+            continue
+        try:
+            task_class = resolve_task_class(class_spec)
+        except (ImportError, AttributeError):
+            continue
+
+        model_name = _config_task_model_name(task_name, task_config, models)
+        candidate = bindings[model_name]
+        context = _config_requirement_context(
+            task_name,
+            task_config,
+            candidate,
+            datasets,
+        )
+        requirement_hook = getattr(task_class, "model_requirements_for", None)
+        if not callable(requirement_hook):
+            continue
+        task_records = requirement_hook(context)
+        if not isinstance(task_records, tuple):
+            raise TypeError(
+                f"{task_class.__name__}.model_requirements_for() must return a tuple"
+            )
+        for record in task_records:
+            if not isinstance(record, TaskModelRequirement):
+                raise TypeError(
+                    f"{task_class.__name__}.model_requirements_for() returned a "
+                    "non-TaskModelRequirement value"
+                )
+            expected = context.model_bindings.get(record.role)
+            if expected is None:
+                raise ValueError(
+                    f"{task_class.__name__}.model_requirements_for() declared "
+                    f"unknown model role {record.role!r}"
+                )
+            if record.binding != expected:
+                raise ValueError(
+                    f"{task_class.__name__}.model_requirements_for() changed the "
+                    f"normalized binding for role {record.role!r}"
+                )
+            records.append(record)
+
+    by_root_bindings: dict[str, list[NamedModelBinding]] = {}
+    for binding in bindings.values():
+        by_root_bindings.setdefault(binding.root_deployment_key, []).append(binding)
+
+    by_root: dict[str, Literal["chat", "gen"]] = {}
+    by_config: dict[str, Literal["chat", "gen"]] = {}
+    for root_key, root_bindings in by_root_bindings.items():
+        root_name = chains[root_bindings[0].config_name][0][0]
+        root_records = (
+            record
+            for record in records
+            if isinstance(record.binding, NamedModelBinding)
+            and record.binding.root_deployment_key == root_key
+        )
+        requirements = aggregate_task_requirements(root_records)
+        explicit_type = _config_explicit_type_for_root(
+            root_name,
+            tuple(root_bindings),
+            models,
+        )
+        model_type = derive_model_type(root_name, explicit_type, requirements)
+        by_root[root_key] = model_type
+        for binding in root_bindings:
+            by_config[binding.config_name] = model_type
+
+    return ConfigModelTypeResolution(by_root, by_config)
+
+
+def _config_model_chain(
+    model_name: str,
+    models: Mapping[str, dict[str, Any]],
+) -> tuple[tuple[str, dict[str, Any]], ...]:
+    """Return one root-to-leaf model inheritance chain."""
+
+    chain: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+
+    def visit(current: str) -> None:
+        if current in seen:
+            raise ValueError(
+                "Circular model inheritance detected: "
+                + " -> ".join([name for name, _ in chain] + [current])
+            )
+        seen.add(current)
+        try:
+            model_config = models[current]
+        except KeyError as exc:
+            raise ValueError(
+                f"Model '{model_name}' references unknown base model '{current}'"
+            ) from exc
+        chain.append((current, model_config))
+        base = model_config.get("base")
+        if base is None:
+            return
+        if not isinstance(base, str) or not base:
+            raise ValueError(f"Model '{current}' has invalid 'base' value: {base!r}")
+        visit(base)
+
+    visit(model_name)
+    chain.reverse()
+    return tuple(chain)
+
+
+def _config_named_binding(
+    model_name: str,
+    chain: tuple[tuple[str, dict[str, Any]], ...],
+) -> NamedModelBinding:
+    root_name, root_config = chain[0]
+    requested = root_config.get("name")
+    if not requested:
+        infer_config = root_config.get("infer")
+        checkpoint = (
+            infer_config.get("checkpoint")
+            if isinstance(infer_config, Mapping)
+            else None
+        )
+        if not checkpoint:
+            checkpoint = root_config.get("path")
+        requested = Path(checkpoint).name if checkpoint else root_name
+    if not isinstance(requested, str) or not requested:
+        raise ValueError(f"Model '{root_name}' has no usable requested model id")
+    return NamedModelBinding(
+        binding_id=f"model:{model_name}",
+        root_deployment_key=f"model:{root_name}",
+        requested_model_id=requested,
+        config_name=model_name,
+    )
+
+
+def _config_task_model_name(
+    task_name: str,
+    task_config: Mapping[str, Any],
+    models: Mapping[str, dict[str, Any]],
+) -> str:
+    model_ref = task_config.get("model")
+    if model_ref is not None and not isinstance(model_ref, str):
+        raise ValueError(f"Task '{task_name}': 'model' must be a string reference")
+    if model_ref:
+        if model_ref not in models:
+            raise ValueError(
+                f"Task '{task_name}' references unknown model '{model_ref}'"
+            )
+        return model_ref
+    if len(models) == 1:
+        return next(iter(models))
+    if not models:
+        raise ValueError(f"Task '{task_name}': no models defined in config")
+    raise ValueError(
+        f"Task '{task_name}': 'model' required when multiple models are defined"
+    )
+
+
+def _config_requirement_context(
+    task_name: str,
+    task_config: Mapping[str, Any],
+    candidate: NamedModelBinding,
+    datasets: Mapping[str, dict[str, Any]],
+) -> RequirementContext:
+    raw_args = task_config.get("args") or {}
+    if not isinstance(raw_args, Mapping):
+        raise ValueError(f"Task '{task_name}' args must be a dictionary")
+    task_args = copy.deepcopy(dict(raw_args))
+    model_bindings: dict[str, NamedModelBinding | InlineModelBinding] = {
+        "candidate": candidate
+    }
+
+    grader = task_args.pop("grader", None)
+    if grader is not None:
+        if not isinstance(grader, Mapping):
+            raise ValueError(
+                f"Task '{task_name}' grader must be an inline mapping before launch"
+            )
+        model_bindings["grader"] = _config_inline_binding(task_name, "grader", grader)
+
+    dataset_ref = task_config.get("dataset")
+    if isinstance(dataset_ref, str):
+        dataset_config: Mapping[str, Any] = datasets.get(dataset_ref, {})
+    elif isinstance(dataset_ref, Mapping):
+        dataset_config = dataset_ref
+    else:
+        # Model-kind selection remains fail-soft for an incomplete task; the
+        # normal config validator reports the missing dataset later.
+        dataset_config = {}
+
+    infer_args = task_config.get("infer_args") or {}
+    if not isinstance(infer_args, Mapping):
+        raise ValueError(f"Task '{task_name}' infer_args must be a dictionary")
+    return RequirementContext(
+        model_bindings=model_bindings,
+        task_args=cast(Mapping[str, JSONValue], task_args),
+        dataset_config=cast(Mapping[str, JSONValue], copy.deepcopy(dataset_config)),
+        infer_args=cast(Mapping[str, JSONValue], copy.deepcopy(dict(infer_args))),
+    )
+
+
+def _config_inline_binding(
+    task_name: str,
+    role: str,
+    raw_config: Mapping[str, Any],
+) -> InlineModelBinding:
+    requested = raw_config.get("model")
+    if not isinstance(requested, str) or not requested:
+        raise ValueError(
+            f"Task '{task_name}' inline {role} model requires a non-empty 'model'"
+        )
+    safe_config = {
+        str(key): copy.deepcopy(value)
+        for key, value in raw_config.items()
+        if key not in {"api_key", "authorization"}
+    }
+    encoded = json.dumps(
+        safe_config,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    dialect = raw_config.get("dialect", "openai_chat")
+    if not isinstance(dialect, str) or not dialect:
+        raise ValueError(
+            f"Task '{task_name}' inline {role} dialect must be a non-empty string"
+        )
+    binding_id = f"inline:{task_name}:{role}:{digest}"
+    return InlineModelBinding(
+        binding_id=binding_id,
+        root_deployment_key=f"deployment:{binding_id}",
+        requested_model_id=requested,
+        config=cast(Mapping[str, JSONValue], safe_config),
+        dialect_id=dialect,
+    )
+
+
+def _config_explicit_type_for_root(
+    root_name: str,
+    bindings: tuple[NamedModelBinding, ...],
+    models: Mapping[str, dict[str, Any]],
+) -> Literal["chat", "gen"] | None:
+    declarations = {
+        binding.config_name: models[binding.config_name]["type"]
+        for binding in bindings
+        if "type" in models[binding.config_name]
+    }
+    invalid = {
+        name: value
+        for name, value in declarations.items()
+        if value not in ("chat", "gen")
+    }
+    if invalid:
+        details = ", ".join(
+            f"{name}={value!r}" for name, value in sorted(invalid.items())
+        )
+        raise ValueError(
+            f"Model deployment root '{root_name}' has invalid type assertion(s): "
+            f"{details}; expected 'chat' or 'gen'"
+        )
+    values = set(declarations.values())
+    if len(values) > 1:
+        details = ", ".join(
+            f"{name}={value!r}" for name, value in sorted(declarations.items())
+        )
+        raise ValueError(
+            f"Models sharing deployment root '{root_name}' declare conflicting "
+            f"type assertions: {details}"
+        )
+    if not values:
+        return None
+    return cast(Literal["chat", "gen"], next(iter(values)))
 
 
 def _guess_submodule_names(class_name: str) -> list[str]:

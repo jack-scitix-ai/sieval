@@ -7,9 +7,14 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import Request, Response, TokenLogprob
+from sieval.core.models import (
+    CompletionInput,
+    InputScoringResult,
+    Request,
+    Response,
+    TokenLogprob,
+)
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     PromptRecord,
     TaskContext,
@@ -73,10 +78,13 @@ def _crafted_response(prompt: str, choice: str, ll: float) -> Response:
     logprobs = [None, -42.0, ll / 2, ll / 2, -99.0]
     return Response(
         texts=("<gen>",),
-        logprobs=tuple(
-            TokenLogprob(token=t, logprob=lp)
-            for t, lp in zip(tokens, logprobs, strict=True)
+        input_scoring=InputScoringResult(
+            token_logprobs=tuple(
+                TokenLogprob(token=t, logprob=lp)
+                for t, lp in zip(tokens[:-1], logprobs[:-1], strict=True)
+            )
         ),
+        logprobs=(TokenLogprob(token=tokens[-1], logprob=logprobs[-1]),),
     )
 
 
@@ -89,20 +97,19 @@ class _PPLMockModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
-        if not (req.return_logprobs or req.score_input):
+        if not (req.scoring.sampled_logprobs or req.scoring.input_scoring):
             return Response(texts=("",))
-        assert isinstance(req.input, str)
-        self.calls.append(req.input)
-        self.echos.append(req.score_input)
-        self.logprobs_args.append(req.top_k)
+        assert isinstance(req.input, CompletionInput)
+        prompt = req.input.text
+        self.calls.append(prompt)
+        self.echos.append(req.scoring.input_scoring)
+        self.logprobs_args.append(req.scoring.top_logprobs)
         # CHOICES are mutually non-suffix, so exactly one endswith-matches.
-        choice = next(c for c in self._ll_by_choice if req.input.endswith(c))
-        return _crafted_response(req.input, choice, self._ll_by_choice[choice])
+        choice = next(c for c in self._ll_by_choice if prompt.endswith(c))
+        return _crafted_response(prompt, choice, self._ll_by_choice[choice])
 
 
 def _make_task(

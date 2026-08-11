@@ -10,7 +10,6 @@ from datasets import DatasetDict as HFDatasetDict
 from sieval.community.deepseek_math import eval_math
 from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.gen_model import GenModel
-from sieval.core.models.transports import OpenAICompletionsTransport
 from sieval.core.tasks import (
     NonRetriableSampleError,
     TaskContext,
@@ -39,9 +38,7 @@ class _CapturingGenModel(GenModel):
         super().__init__(model="mock-gen", api_key="fake")
 
     def _build_default_transport(self) -> HandlerTransport:
-        return HandlerTransport(
-            self._stub_arun, OpenAICompletionsTransport.CAPABILITIES
-        )
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
     async def _stub_arun(self, req: Request) -> Response:
         self.last_req = req
@@ -99,7 +96,7 @@ async def test_infer_forwards_deepseek_stop_only():
     assert req is not None
     # Only the DeepSeek stop is forwarded — no temperature / max_tokens / etc.
     assert req.sampling == SamplingParams(stop=("\nProblem:",))
-    assert req.extra_wire_params is None
+    assert req.dialect_options is None
 
 
 @pytest.mark.anyio
