@@ -537,6 +537,12 @@ class OpenAIChatDialect:
                 )
             elif path == "tools.hosted":
                 audit.rejected(path, "hosted tools are not active in PR 1")
+            elif path == "input.modality.tool_result.is_error":
+                audit.noop(
+                    path,
+                    "Chat Completions has no separate tool-result error marker; "
+                    "the tool role, call id, and result content are unchanged",
+                )
             elif path.startswith("session."):
                 audit.rejected(path, "Chat Completions has no session-state field")
             elif path == "structured_output.format" and (

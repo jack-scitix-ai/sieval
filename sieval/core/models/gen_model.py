@@ -15,8 +15,7 @@ from sieval.core.types import JSONValue
 from .dialect import Dialect
 from .dialects.openai_completions import OpenAICompletionsDialect
 from .ir import CompletionInput, ModelInput
-from .model import Model, _legacy_runtime_plan, build_legacy_openai_binding
-from .reconcile import RuntimeBindingPlan
+from .model import Model, build_legacy_openai_binding
 
 
 class GenModel(Model):
@@ -77,38 +76,3 @@ class GenModel(Model):
         if isinstance(prompt, str):
             return CompletionInput(prompt)
         raise TypeError("GenModel prompt must be text or CompletionInput")
-
-    def as_type(
-        self,
-        model_type: type[Model],
-        runtime_plan: RuntimeBindingPlan | None = None,
-    ) -> Model:
-        """Reconstruct a truthful compatibility wrapper for a target plan.
-
-        The optional second argument is the canonical composition path.  The
-        historical one-argument API remains available only for a wrapper that
-        owns its private legacy pool; session-bound wrappers cannot invent a
-        replacement reconciled plan.
-        """
-
-        from .chat_model import ChatModel
-
-        if model_type is ChatModel:
-            target_dialect = "openai_chat"
-        elif model_type is GenModel:
-            target_dialect = "openai_completions"
-        else:
-            raise TypeError("model_type must be exactly ChatModel or GenModel")
-        if runtime_plan is None:
-            if self._lifecycle_owner is None:
-                raise ValueError(
-                    "session-bound wrappers require an explicitly reconciled "
-                    "RuntimeBindingPlan"
-                )
-            runtime_plan = _legacy_runtime_plan(
-                dialect_id=target_dialect,
-                requested_model_id=self._model,
-                deployment=self._deployment,
-                identity=self._pool.identity,
-            )
-        return self._as_wrapper(model_type, target_dialect, runtime_plan)

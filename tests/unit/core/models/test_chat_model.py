@@ -19,7 +19,6 @@ from sieval.core.models import (
     ChatInput,
     ChatMessage,
     ChatModel,
-    GenModel,
     TextPart,
 )
 from sieval.core.models.transports.openai_chat import OpenAIChatTransport
@@ -46,33 +45,3 @@ class TestCompatibilityBranches:
         assert model._coerce_input(prompt) is prompt
         with pytest.raises(TypeError, match="text, ChatInput, or messages"):
             model._coerce_input({"role": "user", "content": "hi"})
-
-    def test_as_type_covers_both_targets_and_explicit_runtime_plan(self):
-        model = ChatModel(model="m", api_key="k")
-        plan = model.runtime_plan
-        assert plan is not None
-
-        same = model.as_type(ChatModel)
-        completion = model.as_type(GenModel)
-        explicit = model.as_type(ChatModel, plan)
-
-        assert type(same) is ChatModel
-        assert type(completion) is GenModel
-        assert explicit.runtime_plan is plan
-
-    def test_as_type_rejects_derived_wrapper_class(self):
-        model = ChatModel(model="m", api_key="k")
-
-        class DerivedChatModel(ChatModel):
-            pass
-
-        with pytest.raises(TypeError, match="exactly ChatModel or GenModel"):
-            model.as_type(DerivedChatModel)
-
-    def test_session_bound_chat_wrapper_requires_explicit_runtime_plan(self):
-        model = ChatModel(model="m", api_key="k")
-        session_wrapper = model.as_compat_type(ChatModel)
-        assert isinstance(session_wrapper, ChatModel)
-
-        with pytest.raises(ValueError, match="explicitly reconciled"):
-            session_wrapper.as_type(GenModel)

@@ -26,11 +26,92 @@ from .deployment import (
     Engine,
     ServingFacts,
 )
-from .dialect import validate_request_invariants
+from .dialect import (
+    RequestAuditError,
+    active_request_leaves,
+    validate_request_invariants,
+)
 from .dialect_registry import compatibility_factory_for
 from .ir import CompletionInput, ModelInput, Request, Response
 from .model import Model
-from .transports.sglang import SglangTransport
+from .transports.sglang import (
+    SGLANG_LEGACY_DIALECT_OPTION_KEYS,
+    SglangTransport,
+)
+
+_SGLANG_LEGACY_LOWERED_LEAVES = frozenset(
+    {
+        "input.completion",
+        "sampling.temperature",
+        "sampling.top_p",
+        "sampling.top_k",
+        "sampling.max_tokens",
+        "sampling.stop",
+        "sampling.frequency_penalty",
+        "sampling.presence_penalty",
+        "sampling.n",
+        "scoring.input_scoring",
+        "scoring.sampled_logprobs",
+        "scoring.top_logprobs",
+    }
+)
+_SGLANG_LEGACY_NOOP_LEAVES = frozenset(
+    {
+        # Native /generate is always one POST.  The compatibility builder
+        # defaults stream=True, so this is an explicit scheduling-only no-op.
+        "scheduling.stream",
+    }
+)
+_SGLANG_LEGACY_CANONICAL_OPTION_OWNERS = {
+    "max_tokens": "sampling.max_tokens",
+    "temperature": "sampling.temperature",
+    "top_p": "sampling.top_p",
+    "top_k": "sampling.top_k",
+    "stop": "sampling.stop",
+    "frequency_penalty": "sampling.frequency_penalty",
+    "presence_penalty": "sampling.presence_penalty",
+}
+
+
+def _validate_legacy_request_leaves(req: Request) -> None:
+    """Reject every active leaf the temporary native transport cannot lower."""
+
+    options = req.dialect_options
+    if options is not None and options.dialect_id != "sglang_legacy":
+        raise RequestAuditError(
+            f"dialect options target {options.dialect_id!r}, but the legacy "
+            "model is bound to 'sglang_legacy'"
+        )
+
+    active = active_request_leaves(req)
+    rejected: list[str] = []
+    for path, value in active.items():
+        if path in _SGLANG_LEGACY_LOWERED_LEAVES:
+            continue
+        if path in _SGLANG_LEGACY_NOOP_LEAVES or path == "dialect_options":
+            continue
+        if not path.startswith("dialect_options."):
+            rejected.append(path)
+            continue
+
+        key = path.removeprefix("dialect_options.")
+        if key not in SGLANG_LEGACY_DIALECT_OPTION_KEYS:
+            rejected.append(path)
+            continue
+        if value is None:
+            rejected.append(f"{path} (null values are not lowered)")
+            continue
+        owner = _SGLANG_LEGACY_CANONICAL_OPTION_OWNERS.get(key)
+        if owner is not None and owner in active:
+            rejected.append(f"{path} (duplicates {owner})")
+
+    if options is not None and {"prefill", "prefix"} <= set(options.values):
+        rejected.append("dialect_options.prefix (duplicates dialect_options.prefill)")
+
+    if rejected:
+        raise RequestAuditError(
+            "sglang_legacy cannot lower request leaves: " + ", ".join(sorted(rejected))
+        )
 
 
 class SglangGenModel(Model):
@@ -126,7 +207,10 @@ class SglangGenModel(Model):
         raise TypeError("SglangGenModel prompt must be text or CompletionInput")
 
     async def arun(self, req: Request) -> Response:
+        if not isinstance(req, Request):
+            raise TypeError(f"arun requires Request, got {type(req).__name__}")
         validate_request_invariants(req)
+        _validate_legacy_request_leaves(req)
         async with self._pool.acquire(self._limiter):
             return await self._legacy_transport.arun(req)
 

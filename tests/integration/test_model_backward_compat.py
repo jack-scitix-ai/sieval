@@ -12,7 +12,6 @@ mocks (no real HTTP):
     (loud ``CapabilityError`` instead of the historical silent ignore)
   - ``with_args`` derivation: generation still works, resource pool is shared
   - ``meta()`` / ``get_quota_info()`` introspection dict shapes
-  - wrapper-only ``as_type(ModelType)`` compatibility preserves the binding
 
 AI-Generated Code - Claude Fable 5 (Anthropic)
 """
@@ -22,8 +21,6 @@ import pytest
 from sieval.core.models import (
     Capability,
     CapabilityError,
-    ChatModel,
-    Model,
     ModelOutput,
 )
 from tests.conftest import MockChatModel, MockGenModel
@@ -126,17 +123,3 @@ class TestIntrospectionSurface:
         assert info["parent"] == {"available": 8, "total": 8}
         assert info["child"] == {"available": 4, "total": 4}
         assert info["available"] == 4
-
-
-class TestCompatibilitySurface:
-    def test_as_type_is_wrapper_only_and_preserves_binding(self):
-        base = MockChatModel()
-        rebound = base.as_type(ChatModel)
-
-        assert type(rebound) is ChatModel
-        assert rebound.pool is base.pool
-        assert rebound.deployment is base.deployment
-        assert rebound.runtime_plan == base.runtime_plan
-        assert rebound._limiter is base._limiter
-        assert rebound._parent_limiter is base._parent_limiter
-        assert not hasattr(Model, "as_type")

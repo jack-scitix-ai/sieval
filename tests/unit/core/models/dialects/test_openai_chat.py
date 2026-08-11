@@ -13,6 +13,7 @@ import pytest
 from sieval.core.models.capabilities import Capability, ReasoningOptions, Supported
 from sieval.core.models.dialect import (
     DialectError,
+    NoOp,
     OutputContractError,
     PreparedRequest,
     RequestAudit,
@@ -310,6 +311,34 @@ class TestWireTranslation:
                 "tool_call_id": "call_1",
                 "content": '{"ok":true,"score":3}',
             },
+        ]
+
+    @pytest.mark.anyio
+    async def test_tool_result_error_marker_is_an_explicit_noop(self) -> None:
+        dialect, create = _dialect()
+        req = Request(
+            input=_chat(
+                ChatMessage(
+                    "tool",
+                    (ToolResultPart("call_1", "boom", is_error=True),),
+                )
+            )
+        )
+        audit = RequestAudit(active_request_leaves(req))
+
+        dialect.validate_request(req, audit, SimpleNamespace())
+        decision = audit.decisions["input.modality.tool_result.is_error"]
+        assert isinstance(decision, NoOp)
+        prepared = dialect.prepare(req, audit)
+        audit.finish(prepared)
+        await dialect.execute(prepared)
+
+        assert _awaited_kwargs(create)["messages"] == [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "boom",
+            }
         ]
 
     @pytest.mark.anyio

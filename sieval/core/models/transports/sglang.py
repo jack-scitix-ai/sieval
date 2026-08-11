@@ -60,6 +60,10 @@ _SAMPLING_PARAM_MAP: dict[str, str] = {
     "repetition_penalty": "repetition_penalty",
 }
 
+SGLANG_LEGACY_DIALECT_OPTION_KEYS: frozenset[str] = frozenset(
+    {"prefill", "prefix", *_SAMPLING_PARAM_MAP}
+)
+
 
 def _request_params(body: dict[str, JSONValue]) -> dict[str, JSONValue]:
     """Return the persisted request params: the /generate body minus the prompt.
@@ -186,8 +190,14 @@ class SglangTransport:
         if n > 1:
             sampling["n"] = n
 
-        # sglang rejects max_new_tokens=0; scoring still needs at least one.
-        if req.scoring.input_scoring and not sampling.get("max_new_tokens"):
+        # sglang rejects max_new_tokens=0.  Input scoring also needs a token
+        # when the caller left the length unset, while sampled-output scoring
+        # keeps the server default unless the caller explicitly supplied zero.
+        if req.scoring.input_scoring and "max_new_tokens" not in sampling:
+            sampling["max_new_tokens"] = 1
+        if (req.scoring.input_scoring or req.scoring.sampled_logprobs) and sampling.get(
+            "max_new_tokens"
+        ) == 0:
             sampling["max_new_tokens"] = 1
 
         # Prefill capability: sglang accepts a forced prefill on sampling_params.

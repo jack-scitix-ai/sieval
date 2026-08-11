@@ -7,7 +7,6 @@ contains no network I/O, launch code, engine predicates, or condition algebra.
 AI-Generated Code - GPT-5.6 (OpenAI)
 """
 
-import hashlib
 import json
 import math
 from collections.abc import Iterable, Mapping
@@ -18,6 +17,7 @@ from typing import Never, Protocol, Self, cast
 
 from sieval.core.types import JSONValue
 
+from ._fingerprint import fingerprint_mapping
 from .capabilities import (
     CAPABILITY_KEYS,
     CAPABILITY_SPECS,
@@ -466,7 +466,9 @@ class BindingCapabilityPlan:
                 }
             ),
         )
-        object.__setattr__(self, "fingerprint", _fingerprint(self._plan_payload()))
+        object.__setattr__(
+            self, "fingerprint", fingerprint_mapping(self._plan_payload())
+        )
 
     def _plan_payload(self) -> dict[str, JSONValue]:
         return {
@@ -567,7 +569,9 @@ class DeploymentCapabilityPlan:
                 }
             ),
         )
-        object.__setattr__(self, "fingerprint", _fingerprint(self._plan_payload()))
+        object.__setattr__(
+            self, "fingerprint", fingerprint_mapping(self._plan_payload())
+        )
 
     def _plan_payload(self) -> dict[str, JSONValue]:
         return {
@@ -655,11 +659,13 @@ class RuntimeBindingPlan:
                 }
             ),
         )
-        verification_fingerprint = _fingerprint(self._verification_payload())
+        verification_fingerprint = fingerprint_mapping(self._verification_payload())
         object.__setattr__(self, "verification_fingerprint", verification_fingerprint)
         fingerprint_payload = self._plan_payload()
         fingerprint_payload["verification_fingerprint"] = verification_fingerprint
-        object.__setattr__(self, "fingerprint", _fingerprint(fingerprint_payload))
+        object.__setattr__(
+            self, "fingerprint", fingerprint_mapping(fingerprint_payload)
+        )
 
     def _verification_payload(self) -> dict[str, JSONValue]:
         """Return the realized capability evidence covered by verification."""
@@ -1907,14 +1913,3 @@ def _canonical_json(value: JSONValue) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
-
-
-def _fingerprint(payload: Mapping[str, object]) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=True,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"

@@ -22,10 +22,20 @@ import pytest
 from sieval.core.models import (
     Capability,
     CompletionInput,
+    DialectOptions,
+    HostedToolSpec,
+    OpaqueContinuation,
+    ReasoningParams,
     Request,
     Response,
+    SamplingParams,
+    SchedulingParams,
+    ScoringParams,
+    SessionParams,
     SglangGenModel,
+    ToolParams,
 )
+from sieval.core.models.dialect import RequestAuditError
 from sieval.core.models.transports.sglang import SglangTransport
 
 
@@ -113,6 +123,190 @@ class _StubTransport:
         self.entered.set()
         await self.release.wait()
         return Response(texts=("ok",))
+
+
+class _ImmediateTransport:
+    capabilities = frozenset()
+
+    def __init__(self) -> None:
+        self.requests: list[Request] = []
+
+    async def arun(self, req: Request) -> Response:
+        self.requests.append(req)
+        return Response(texts=("ok",))
+
+
+def _legacy_model(transport: object) -> tuple[SglangGenModel, AsyncMock]:
+    close = AsyncMock()
+    client = SimpleNamespace(base_url="http://host:8000/v1/", close=close)
+    with patch(
+        "sieval.core.models.sglang_gen_model.AsyncOpenAI",
+        return_value=client,
+    ):
+        model = SglangGenModel(
+            model="m",
+            api_key="local",
+            transport=cast(Any, transport),
+        )
+    return model, close
+
+
+class TestLegacyRequestGate:
+    @pytest.mark.anyio
+    async def test_legacy_builder_rejects_dropped_fields_before_pool_acquire(
+        self,
+    ) -> None:
+        transport = _ImmediateTransport()
+        model, _ = _legacy_model(transport)
+
+        with (
+            patch.object(model.pool, "acquire") as acquire,
+            pytest.raises(RequestAuditError) as exc_info,
+        ):
+            await model.agenerate(
+                "prompt",
+                reasoning_effort="high",
+                session_id="response-1",
+                suffix="tail",
+            )
+
+        detail = str(exc_info.value)
+        assert "input.completion.suffix" in detail
+        assert "reasoning.effort" in detail
+        assert "session.previous_response_id" in detail
+        acquire.assert_not_called()
+        assert transport.requests == []
+        await model.aclose()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("req", "path"),
+        [
+            (
+                Request(input=CompletionInput("prompt", suffix="tail")),
+                "input.completion.suffix",
+            ),
+            (
+                Request(
+                    input=CompletionInput("prompt"),
+                    reasoning=ReasoningParams(effort="high"),
+                ),
+                "reasoning.effort",
+            ),
+            (
+                Request(
+                    input=CompletionInput("prompt"),
+                    reasoning=ReasoningParams(budget_tokens=32),
+                ),
+                "reasoning.budget_tokens",
+            ),
+            (
+                Request(
+                    input=CompletionInput("prompt"),
+                    tools=ToolParams(hosted=(HostedToolSpec("web_search"),)),
+                ),
+                "tools.hosted",
+            ),
+            (
+                Request(
+                    input=CompletionInput("prompt"),
+                    session=SessionParams(previous_response_id="response-1"),
+                ),
+                "session.previous_response_id",
+            ),
+            (
+                Request(
+                    input=CompletionInput("prompt"),
+                    session=SessionParams(
+                        opaque_continuation=OpaqueContinuation(
+                            "sglang_legacy", "continuation"
+                        )
+                    ),
+                ),
+                "session.opaque_continuation",
+            ),
+            (
+                Request(
+                    input=CompletionInput("prompt"),
+                    sampling=SamplingParams(seed=7),
+                ),
+                "sampling.seed",
+            ),
+        ],
+    )
+    async def test_unsupported_leaf_is_rejected_before_transport(
+        self, req: Request, path: str
+    ) -> None:
+        transport = _ImmediateTransport()
+        model, close = _legacy_model(transport)
+
+        with pytest.raises(RequestAuditError, match=path):
+            await model.arun(req)
+
+        assert transport.requests == []
+        await model.aclose()
+        close.assert_awaited_once()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("options", "message"),
+        [
+            (DialectOptions("openai_chat", {"min_p": 0.1}), "target"),
+            (
+                DialectOptions("sglang_legacy", {"unknown_option": True}),
+                "dialect_options.unknown_option",
+            ),
+            (
+                DialectOptions("sglang_legacy", {"min_p": None}),
+                "null values are not lowered",
+            ),
+        ],
+    )
+    async def test_dialect_options_are_strict(
+        self, options: DialectOptions, message: str
+    ) -> None:
+        transport = _ImmediateTransport()
+        model, _ = _legacy_model(transport)
+        req = Request(input=CompletionInput("prompt"), dialect_options=options)
+
+        with pytest.raises(RequestAuditError, match=message):
+            await model.arun(req)
+
+        assert transport.requests == []
+        await model.aclose()
+
+    @pytest.mark.anyio
+    async def test_lowered_leaves_and_stream_noop_reach_transport(self) -> None:
+        transport = _ImmediateTransport()
+        model, _ = _legacy_model(transport)
+        req = Request(
+            input=CompletionInput("prompt"),
+            sampling=SamplingParams(
+                max_tokens=3,
+                temperature=0.2,
+                top_p=0.9,
+                top_k=8,
+                stop=("END",),
+                frequency_penalty=0.1,
+                presence_penalty=0.2,
+                n=2,
+            ),
+            scheduling=SchedulingParams(stream=True),
+            dialect_options=DialectOptions(
+                "sglang_legacy", {"min_p": 0.05, "prefill": "prefix"}
+            ),
+        )
+        scoring_req = Request(
+            input=CompletionInput("score"),
+            scoring=ScoringParams(sampled_logprobs=True, top_logprobs=2),
+        )
+
+        response = await model.arun(req)
+        await model.arun(scoring_req)
+
+        assert response.texts == ("ok",)
+        assert transport.requests == [req, scoring_req]
+        await model.aclose()
 
 
 class TestLegacyLifecycle:

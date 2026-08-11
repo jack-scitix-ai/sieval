@@ -10,7 +10,7 @@ AI-Generated Code - Claude Fable 5 (Anthropic)
 import anyio
 import pytest
 
-from sieval.core.models import ChatModel, GenModel
+from sieval.core.models import GenModel
 
 # These tests never execute a request.  The compatibility wrapper's real
 # dialect is therefore the most faithful fixture for pool/limiter derivation;
@@ -175,23 +175,29 @@ class TestModelDerivation:
             base_gen.with_args(concurrency_limit=concurrency_limit)
 
     @pytest.mark.anyio
-    async def test_close_via_derived_wrapper_invalidates_all_pool_siblings(
+    async def test_close_via_derived_wrapper_invalidates_compat_pool_sibling(
         self, base_gen
     ):
         child = base_gen.with_args(concurrency_limit=32)
-        converted = base_gen.as_type(ChatModel)
+        compat = base_gen.as_compat_type(GenModel)
 
         await child.aclose()
 
         assert base_gen.pool.is_closed
-        for sibling in (base_gen, child, converted):
+        for sibling in (base_gen, child):
             with pytest.raises(RuntimeError, match="ConnectionPool is closing"):
                 await sibling.__aenter__()
             with pytest.raises(RuntimeError, match="ConnectionPool is closing"):
                 await sibling.agenerate("prompt")
+        with pytest.raises(RuntimeError, match="canonical model's ConnectionPool"):
+            await compat.__aenter__()
+        with pytest.raises(RuntimeError, match="ConnectionPool is closing"):
+            await compat.agenerate("prompt")
+        with pytest.raises(RuntimeError, match="canonical Model does not own"):
+            await compat.aclose()
 
-        # Closing through any sibling remains idempotent and does not revive it.
-        await converted.aclose()
+        # Closing through an owning sibling remains idempotent and does not revive it.
+        await child.aclose()
         assert base_gen.pool.is_closed
 
     # ------------------------------------------------------------------

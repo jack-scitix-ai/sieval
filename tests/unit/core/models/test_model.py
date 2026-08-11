@@ -58,6 +58,11 @@ def unlimited_model():
 # Non-overlapping behaviors
 # ===================================================================
 class TestModelUnique:
+    @pytest.mark.parametrize("hook", ["_agenerate_impl", "_alogprobs_impl"])
+    def test_removed_subclass_hook_fails_at_class_definition(self, hook: str):
+        with pytest.raises(TypeError, match=rf"removed Model hook.*{hook}"):
+            type("LegacyHookModel", (Model,), {hook: object()})
+
     def test_derived_inherits_client(self, gen_model):
         child = gen_model.with_args(temperature=0.9)
         # Same client object
@@ -68,21 +73,6 @@ class TestModelUnique:
         assert child._kwargs == {"temperature": 0.9, "top_p": 0.8}
         # Parent unchanged
         assert gen_model._kwargs == {}
-
-    def test_as_type_is_wrapper_only(self, gen_model):
-        """One-cycle wrappers retain conversion; canonical Model does not."""
-        assert callable(gen_model.as_type)
-        assert not hasattr(Model, "as_type")
-
-    def test_as_type_retains_historical_single_argument_api(self, gen_model):
-        chat = gen_model.as_type(ChatModel)
-
-        assert type(chat) is ChatModel
-        assert chat.dialect_id == "openai_chat"
-        assert chat.pool is gen_model.pool
-        assert chat._client is gen_model._client
-        assert chat._limiter is gen_model._limiter
-        assert chat._parent_limiter is gen_model._parent_limiter
 
     def test_separate_legacy_clients_have_distinct_secret_free_binding_identity(self):
         first = ChatModel(
@@ -160,12 +150,6 @@ class TestModelUnique:
 
         fingerprints = {plan.fingerprint, *(item.fingerprint for item in variants)}
         assert len(fingerprints) == len(variants) + 1
-
-    def test_as_type_single_argument_rejects_session_bound_wrapper(self, gen_model):
-        session_wrapper = gen_model.as_compat_type(GenModel)
-
-        with pytest.raises(ValueError, match="explicitly reconciled"):
-            session_wrapper.as_type(ChatModel)
 
     def test_as_compat_type_rebuilds_truthful_non_owning_wrapper(self, gen_model):
         plan = gen_model.runtime_plan

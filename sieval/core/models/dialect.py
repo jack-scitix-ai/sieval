@@ -120,6 +120,8 @@ def _input_leaves(req: Request) -> dict[str, object]:
                     f"ChatMessage contains unclassified part {type(part).__name__}"
                 )
             result.setdefault(path, True)
+            if isinstance(part, ToolResultPart) and part.is_error:
+                result.setdefault("input.modality.tool_result.is_error", True)
     return result
 
 

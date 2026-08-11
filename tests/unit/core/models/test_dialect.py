@@ -53,6 +53,7 @@ from sieval.core.models.ir import (
     StructuredOutputParams,
     TextPart,
     ToolParams,
+    ToolResultPart,
     normalize_chat_input,
     response_field_contract,
 )
@@ -114,6 +115,20 @@ class TestLeafDerivation:
             "input.modality.image",
         }
         assert "look" not in leaves
+
+    def test_tool_result_error_marker_is_a_separate_nondefault_leaf(self):
+        normal = Request(
+            input=ChatInput((ChatMessage("tool", (ToolResultPart("call", "ok"),)),))
+        )
+        failed = Request(
+            input=ChatInput(
+                (ChatMessage("tool", (ToolResultPart("call", "boom", True),)),)
+            )
+        )
+
+        path = "input.modality.tool_result.is_error"
+        assert path not in active_request_leaves(normal)
+        assert active_request_leaves(failed)[path] is True
 
     def test_empty_dialect_options_are_an_explicit_leaf(self):
         req = Request(

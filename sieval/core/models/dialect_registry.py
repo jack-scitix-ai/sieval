@@ -216,7 +216,7 @@ def _request_schema_leaves() -> frozenset[str]:
                         TextPart("text"),
                         ImagePart(url="https://schema.invalid/image"),
                         ToolCallPart("call", "tool", {}),
-                        ToolResultPart("call", None),
+                        ToolResultPart("call", None, is_error=True),
                     ),
                 ),
             )

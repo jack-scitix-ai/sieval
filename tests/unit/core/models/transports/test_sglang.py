@@ -167,6 +167,7 @@ class TestLower:
         body = t._lower(_request("hi"))
         assert "return_logprob" not in body
         assert "logprob_start_len" not in body
+        assert "max_new_tokens" not in _sampling(body)
 
     def test_echo_never_appears_in_wire_body(self):
         t, _ = _make_transport({"text": "", "meta_info": _meta()})
@@ -182,6 +183,28 @@ class TestLower:
     def test_score_input_forces_min_one_new_token(self):
         t, _ = _make_transport({"text": "", "meta_info": _meta()})
         body = t._lower(_request("hi", input_scoring=True))
+        assert _sampling(body)["max_new_tokens"] == 1
+
+    def test_score_input_clamps_explicit_zero_to_one(self):
+        t, _ = _make_transport({"text": "", "meta_info": _meta()})
+        body = t._lower(
+            _request(
+                "hi",
+                sampling=SamplingParams(max_tokens=0),
+                input_scoring=True,
+            )
+        )
+        assert _sampling(body)["max_new_tokens"] == 1
+
+    def test_sampled_logprobs_clamp_explicit_zero_to_one(self):
+        t, _ = _make_transport({"text": "", "meta_info": _meta()})
+        body = t._lower(
+            _request(
+                "hi",
+                sampling=SamplingParams(max_tokens=0),
+                sampled_logprobs=True,
+            )
+        )
         assert _sampling(body)["max_new_tokens"] == 1
 
     def test_all_sampling_params_map(self):

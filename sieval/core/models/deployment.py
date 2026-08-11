@@ -7,9 +7,7 @@ route; it does not infer capabilities or interpret provider wire formats.
 AI-Generated Code - GPT-5.6 (OpenAI)
 """
 
-import hashlib
 import inspect
-import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
@@ -20,6 +18,8 @@ from urllib.parse import urlsplit
 import anyio
 
 from sieval.core.utils.concurrency import CompositeLimiter
+
+from ._fingerprint import fingerprint_mapping
 
 EngineSource = Literal["deployment", "config", "unknown"]
 
@@ -269,7 +269,7 @@ def deployment_fingerprint(deployment: Deployment) -> str:
             }
         ),
     }
-    return _fingerprint(payload)
+    return fingerprint_mapping(payload)
 
 
 def resolve_route(
@@ -318,7 +318,7 @@ def resolve_route(
     else:
         raise ValueError("Deployment has no routable endpoint")
 
-    fingerprint = _fingerprint(
+    fingerprint = fingerprint_mapping(
         {
             "connection_family": connection_family,
             "dialect_id": dialect_id,
@@ -485,16 +485,6 @@ class ConnectionPool[ConnectionT]:
         traceback: TracebackType | None,
     ) -> None:
         await self.aclose()
-
-
-def _fingerprint(payload: Mapping[str, object]) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _validate_endpoint(endpoint: str) -> None:

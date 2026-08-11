@@ -12,10 +12,6 @@ the model's capabilities.
 AI-Generated Code - Claude Fable 5 (Anthropic)
 """
 
-from typing import Any, cast
-
-import pytest
-
 from sieval.core.models import Capability, CompletionInput, GenModel
 from sieval.core.models.transports.openai_completions import (
     OpenAICompletionsTransport,
@@ -41,19 +37,3 @@ class TestCompatibilityBranches:
         prompt = CompletionInput("prompt")
 
         assert model._coerce_input(prompt) is prompt
-
-    def test_as_type_same_target_accepts_explicit_runtime_plan(self):
-        model = GenModel(model="m", api_key="k")
-        plan = model.runtime_plan
-        assert plan is not None
-
-        converted = model.as_type(GenModel, plan)
-
-        assert type(converted) is GenModel
-        assert converted.runtime_plan is plan
-
-    def test_as_type_rejects_unrelated_type(self):
-        model = GenModel(model="m", api_key="k")
-
-        with pytest.raises(TypeError, match="exactly ChatModel or GenModel"):
-            model.as_type(cast(Any, object))

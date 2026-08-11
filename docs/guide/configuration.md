@@ -16,25 +16,17 @@ runner_config:
 models:
     base_model:
         name: "gpt-4o"
-        type: "chat"
+        type: "gen"
         args:
             max_retries: 3
             concurrency_limit: 128
             temperature: 0.0
 
-    # Derived model — inherits base, reserves 64 from base's 128
+    # Derived model — inherits base and adds a local cap under base's 128
     math_model:
         base: base_model
         args:
             concurrency_limit: 64
-
-    # A different kind needs its own base model — a derived model always
-    # inherits its base's kind (cross-kind `type:` removed by RFC #25)
-    gen_model:
-        name: "gpt-4o"
-        type: "gen"
-        args:
-            concurrency_limit: 32
 
 datasets:
     gsm8k:
@@ -54,9 +46,16 @@ tasks:
 
 ### Key Concepts
 
-- **Model derivation**: `base: parent_model` inherits client, limiter, args — and always the base's kind
-- **Model kind**: `type: "chat"` / `type: "gen"` selects ChatModel or GenModel on a base model only; cross-kind `type:` conversion on derived models was removed by RFC #25 — define a separate base model instead
-- **Quota allocation**: `concurrency_limit` in `args` reserves capacity from base
+- **Model derivation**: `base: parent_model` inherits request defaults and
+  shares the root deployment, connection pool, and limiter hierarchy
+- **Model kind**: normalized task input requirements determine one legacy kind
+  per deployment root; YAML `type: "chat"` / `type: "gen"` is a checked
+  compatibility assertion, and every config sharing that root must agree
+- **Dialect rebinding**: the composition layer reconciles a target runtime plan
+  and uses `with_dialect()` to reuse a compatible root pool; a model never
+  invents or converts that plan locally
+- **Quota allocation**: `concurrency_limit` in `args` adds a local cap while
+  retaining the root's shared cap
 - **Class resolution**: built-in classes (exported by `sieval.tasks` / `sieval.datasets`) use short names; custom classes must use full module paths (`my_pkg.my_module.MyTask`)
 
 ## Task Pipeline
@@ -86,13 +85,20 @@ from sieval.core.models import ChatModel
 
 base = ChatModel("gpt-4o", concurrency_limit=128)
 
-math_model = base.with_args(concurrency_limit=64)  # reserves 64
-code_model = base.with_args(concurrency_limit=32)  # reserves 32
-
-# base uses remaining elastic capacity (128 - 64 - 32 = 32)
+math_model = base.with_args(concurrency_limit=64)  # local cap under shared 128
+code_model = base.with_args(concurrency_limit=32)  # local cap under shared 128
 ```
 
-A derived model always keeps its base's kind. Cross-kind conversion (`as_type`) was removed by RFC #25 — to reach the same endpoint through a `GenModel`, define a separate base model instead.
+The compatibility wrappers do not expose `as_type()`. A dialect change is
+composition-mediated: configuration/session code first reconciles a target
+`RuntimeBindingPlan`, then calls `with_dialect()` with that plan. If the target
+uses the same deployment and connection family, the rebound model retains the
+same client, pool, and limiter hierarchy. An incompatible target fails before
+allocation or I/O and requires a separately constructed deployment and pool.
+
+`with_dialect()` is therefore a low-level binding operation, not a shortcut
+that derives a plan from a wrapper class. `as_compat_type()` remains an internal
+legacy shape adapter for an already-bound model and never changes its dialect.
 
 ## Anomaly Detection
 

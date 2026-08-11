@@ -15,8 +15,6 @@ AI-Generated Code - GPT-5.6 (OpenAI)
 """
 
 import copy
-import hashlib
-import json
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields, replace
@@ -30,6 +28,7 @@ from openai import AsyncOpenAI
 from sieval.core.types import JSONValue
 from sieval.core.utils.serialization import sieval_record
 
+from ._fingerprint import fingerprint_mapping
 from .capabilities import (
     Capability,
     RequestDefaults,
@@ -179,17 +178,7 @@ _RESPONSE_CHANNEL_BY_CAPABILITY: Mapping[str, str] = {
 }
 
 _REQUEST_CHECK_VERIFIERS = frozenset({"validate_response_channel"})
-
-
-def _fingerprint(value: Mapping[str, object]) -> str:
-    encoded = json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+_REMOVED_SUBCLASS_HOOKS = frozenset({"_agenerate_impl", "_alogprobs_impl"})
 
 
 def _json_value(value: object, name: str) -> JSONValue:
@@ -278,7 +267,7 @@ def _legacy_runtime_plan(
         key for key, decision in decisions.items() if isinstance(decision, Supported)
     )
     effective: dict[str, JSONValue] = {key: {} for key in sorted(available)}
-    identity_fingerprint = _fingerprint(
+    identity_fingerprint = fingerprint_mapping(
         {
             "endpoint": identity.endpoint,
             "connection_family": identity.connection_family,
@@ -290,7 +279,7 @@ def _legacy_runtime_plan(
     identity_suffix = identity_fingerprint.removeprefix("sha256:")[:16]
     binding_id = f"legacy:{dialect_id}:{requested_model_id}:{identity_suffix}"
     root_deployment_key = f"legacy:{deployment.fingerprint}:{identity_suffix}"
-    binding_plan_fingerprint = _fingerprint(
+    binding_plan_fingerprint = fingerprint_mapping(
         {
             "available_capabilities": sorted(available),
             "binding_id": binding_id,
@@ -464,6 +453,18 @@ class Model:
     the same internal initializer after creating their private pool.
     """
 
+    def __init_subclass__(cls) -> None:
+        """Reject legacy execution hooks that the Request/Response path ignores."""
+
+        super().__init_subclass__()
+        removed = sorted(_REMOVED_SUBCLASS_HOOKS & cls.__dict__.keys())
+        if removed:
+            raise TypeError(
+                f"{cls.__name__} defines removed Model hook(s): "
+                f"{', '.join(removed)}. Compatibility wrappers must override "
+                "_build_default_transport(); canonical code must bind a Dialect."
+            )
+
     def __init__(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
         raise TypeError(
@@ -635,28 +636,6 @@ class Model:
             extra=self._extra,
             api_base=self._api_base,
             lifecycle_owner=self._lifecycle_owner,
-        )
-        return result
-
-    def _as_wrapper(
-        self,
-        wrapper_type: type["Model"],
-        dialect_id: str,
-        runtime_plan: RuntimeBindingPlan,
-    ) -> "Model":
-        plain = self.with_dialect(dialect_id, runtime_plan)
-        result = object.__new__(wrapper_type)
-        result._initialize(
-            deployment=plain._deployment,
-            pool=plain._pool,
-            runtime_plan=plain._runtime_plan,
-            dialect=plain._dialect,
-            local_limiter=plain._limiter,
-            parent_limiter=plain._parent_limiter,
-            builder_defaults=plain._kwargs,
-            extra=plain._extra,
-            api_base=plain._api_base,
-            lifecycle_owner=plain._lifecycle_owner,
         )
         return result
 
