@@ -13,7 +13,7 @@ from sieval.community.gsm_plus import (
     extract_pred_ans_none,
     is_equivalent,
 )
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import (
     TaskContext,
@@ -34,31 +34,21 @@ from sieval.tasks.gsm_plus_0shot_gen import (
     _metric_key,
     _user_turn,
 )
+from tests.conftest import HandlerTransport
 
 
 class _CapturingChatModel(ChatModel):
     def __init__(self, text: str):
-        super().__init__(model="mock-chat", api_key="fake")
-        self.last_kwargs: dict[str, object] = {}
+        self.last_req: Request | None = None
         self._text = text
+        super().__init__(model="mock-chat", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(model=self.meta(), texts=[self._text])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
-    async def _alogprobs_impl(
-        self,
-        prompt,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_req = req
+        return Response(texts=(self._text,))
 
 
 def _sample(
@@ -434,5 +424,9 @@ async def test_infer_injects_no_decode_params():
     ctx = TaskContext(sample_id=0, raw_sample=raw)
     pre = await task.preprocess(raw, ctx)
     await task.infer(pre, ctx)
-    for forbidden in ("temperature", "top_p", "max_tokens", "n", "stop"):
-        assert forbidden not in model.last_kwargs
+    req = model.last_req
+    assert req is not None
+    # `n` is the sampling budget rather than a decode override. The task injects
+    # no temperature, top-p, output cap, or stop sequence of its own.
+    assert req.sampling == SamplingParams(n=1)
+    assert req.dialect_options is None

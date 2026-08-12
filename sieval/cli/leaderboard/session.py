@@ -1564,24 +1564,40 @@ class EvalSession:
         bindings: dict[str, NormalizedModelBinding] = {"candidate": candidate}
         sources: dict[str, object] = {"candidate": candidate.config_name}
 
-        grader = json_task_args.pop("grader", None)
-        if grader is not None:
-            if isinstance(grader, Model):
-                grader_binding = self._normalized_external_binding(
-                    task_name, "grader", grader
+        for role in ("grader", "extractor"):
+            role_source = json_task_args.get(role)
+            if (
+                role == "extractor"
+                and isinstance(role_source, str)
+                and role_source == "self"
+            ):
+                # Keep the sentinel in task_args. Task construction resolves it
+                # against the candidate only after task infer_args are applied.
+                continue
+            json_task_args.pop(role, None)
+            if role_source is None:
+                continue
+            if isinstance(role_source, Model):
+                role_binding = self._normalized_external_binding(
+                    task_name, role, role_source
                 )
-            elif isinstance(grader, Mapping):
-                grader_binding = self._normalized_inline_binding(
-                    task_name, "grader", grader
+            elif isinstance(role_source, Mapping):
+                role_binding = self._normalized_inline_binding(
+                    task_name, role, role_source
                 )
             else:
                 raise ValueError(
-                    f"Task '{task_name}' grader must be an inline mapping or Model"
+                    f"Task '{task_name}' {role} must be "
+                    + (
+                        "'self', an inline mapping, or Model"
+                        if role == "extractor"
+                        else "an inline mapping or Model"
+                    )
                 )
-            bindings["grader"] = grader_binding
-            sources["grader"] = grader
+            bindings[role] = role_binding
+            sources[role] = role_source
             self._normalized_model_bindings.setdefault(
-                grader_binding.binding_id, grader_binding
+                role_binding.binding_id, role_binding
             )
 
         for key, value in tuple(json_task_args.items()):
@@ -3259,11 +3275,11 @@ class EvalSession:
             )
             models_by_role = getattr(self, "_bound_task_role_models", {}).get(task_name)
             if models_by_role is not None:
-                # Judge tasks reject two competing sources.  Post-launch
-                # composition supplies the reconciled role models here and the
-                # legacy inline config is no longer allowed to construct a
-                # hidden ChatModel inside Task.__init__.
-                task_args.pop("grader", None)
+                # Role-aware tasks reject two competing sources. Post-launch
+                # composition supplies reconciled models here, so raw inline
+                # configs may no longer construct hidden clients in Task.__init__.
+                for role in models_by_role:
+                    task_args.pop(role, None)
                 task_args["models_by_role"] = models_by_role
 
             task = task_class(

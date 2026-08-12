@@ -8,38 +8,28 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.community.deepseek_math import is_correct
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import TaskContext
 from sieval.core.utils.offload import GRADE_TIMEOUT
 from sieval.datasets.gsm1k import GSM1KDataset, GSM1KDatasetSample
 from sieval.tasks import gsm1k_0shot_gen as module
 from sieval.tasks.gsm1k_0shot_gen import COT_INSTRUCTION, GSM1KZeroShotGenTask
+from tests.conftest import HandlerTransport
 
 
 class _CapturingChatModel(ChatModel):
     def __init__(self, text: str):
-        super().__init__(model="mock-chat", api_key="fake")
-        self.last_kwargs: dict[str, object] = {}
+        self.last_req: Request | None = None
         self._text = text
+        super().__init__(model="mock-chat", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(model=self.meta(), texts=[self._text])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
-    async def _alogprobs_impl(
-        self,
-        prompt,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_req = req
+        return Response(texts=(self._text,))
 
 
 def _sample(answer: str = "42") -> GSM1KDatasetSample:

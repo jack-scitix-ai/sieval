@@ -7,7 +7,7 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.gen_model import GenModel
 from sieval.core.tasks import TaskContext
 from sieval.datasets.gsm1k import GSM1KDataset, GSM1KDatasetSample
@@ -19,30 +19,20 @@ from sieval.tasks.gsm1k_kshot_base_gen import (
     _extract_flexible_answer,
     _extract_strict_answer,
 )
+from tests.conftest import HandlerTransport
 
 
 class _CapturingGenModel(GenModel):
     def __init__(self):
+        self.last_req: Request | None = None
         super().__init__(model="mock-gen", api_key="fake")
-        self.last_kwargs: dict[str, object] = {}
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(model=self.meta(), texts=[" Work shown.\n#### 42"])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_req = req
+        return Response(texts=(" Work shown.\n#### 42",))
 
 
 def _sample(answer: str = "42") -> GSM1KDatasetSample:
@@ -145,7 +135,10 @@ async def test_infer_only_forwards_prompt_coupled_stop():
         {"prompt": "prompt"}, TaskContext(sample_id=0, raw_sample=_sample())
     )
 
-    assert model.last_kwargs == {"stop": list(STOP_SEQUENCES)}
+    req = model.last_req
+    assert req is not None
+    assert req.sampling == SamplingParams(n=1, stop=STOP_SEQUENCES)
+    assert req.dialect_options is None
 
 
 @pytest.mark.anyio

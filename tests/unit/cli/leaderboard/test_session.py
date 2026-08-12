@@ -1299,6 +1299,26 @@ class TestPrelaunchReconciliation:
                 ),
             )
 
+    class ExtractorTask:
+        model_type = "chat"
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="extractor_task",
+                ),
+                TaskModelRequirement(
+                    role="extractor",
+                    binding=context.model_bindings["extractor"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="extractor_task",
+                ),
+            )
+
     class ScoringJudgeTask:
         model_type = "chat"
 
@@ -2727,6 +2747,182 @@ tasks:
         ):
             session.prepare_prelaunch()
 
+    def test_self_extractor_reuses_candidate_requirement(self, tmp_path: Path) -> None:
+        from sieval.tasks.agieval_0shot_gen import AGIEvalZeroShotGenTask
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  extracted:
+    class: fake.AGIEvalTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      extractor: self
+    infer_args:
+      max_tokens: 4096
+""",
+        )
+        session = EvalSession(config_path)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=AGIEvalZeroShotGenTask,
+        ):
+            session.prepare_prelaunch()
+
+        context = session._task_requirement_contexts["extracted"]
+        assert set(context.model_bindings) == {"candidate"}
+        assert context.task_args["extractor"] == "self"
+        assert context.infer_args["max_tokens"] == 4096
+        assert [item.role for item in session._task_model_requirements] == ["candidate"]
+
+    def test_agieval_inline_extractor_declares_chat_requirement(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.tasks.agieval_0shot_gen import AGIEvalZeroShotGenTask
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  extracted:
+    class: fake.AGIEvalTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      extractor:
+        model: org/extractor
+        api_base: https://extractor.example/v1
+""",
+        )
+        session = EvalSession(config_path)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=AGIEvalZeroShotGenTask,
+        ):
+            session.prepare_prelaunch()
+
+        context = session._task_requirement_contexts["extracted"]
+        requirements = {item.role: item for item in session._task_model_requirements}
+        assert set(requirements) == {"candidate", "extractor"}
+        assert requirements["extractor"].binding is context.model_bindings["extractor"]
+        assert requirements["extractor"].requires.input is InputKind.CHAT
+
+    def test_invalid_extractor_string_fails_before_model_io(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.tasks.agieval_0shot_gen import AGIEvalZeroShotGenTask
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  extracted:
+    class: fake.AGIEvalTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      extractor: itself
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=AGIEvalZeroShotGenTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI"
+            ) as client_factory,
+            pytest.raises(
+                ValueError,
+                match=(
+                    "Task 'extracted' extractor must be 'self', an inline mapping, "
+                    "or Model"
+                ),
+            ),
+        ):
+            session.prepare_prelaunch()
+
+        client_factory.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_postlaunch_inline_extractor_gets_own_pool_and_role_binding(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import ChatModel
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+    api_base: https://candidate.example/v1
+    api_key: candidate-key
+tasks:
+  extracted:
+    class: fake.ExtractorTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      extractor:
+        model: org/extractor
+        api_base: https://extractor.example/v1
+        api_key: extractor-key
+        temperature: 0
+""",
+        )
+        session = EvalSession(config_path)
+        closes = [AsyncMock(), AsyncMock()]
+        connections = [types.SimpleNamespace(close=close) for close in closes]
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ExtractorTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI",
+                side_effect=connections,
+            ) as client_factory,
+        ):
+            session._setup_prelaunch_reconciliation()
+            session._setup_postlaunch_reconciliation()
+            session._setup_models()
+
+        extractor = session._bound_task_role_models["extracted"]["extractor"]
+        assert isinstance(session.models["candidate"], ChatModel)
+        assert isinstance(extractor, ChatModel)
+        assert extractor is not session.models["candidate"]
+        assert extractor.pool is not session.models["candidate"].pool
+        assert len(session._owned_pools) == 2
+        assert {call.kwargs["base_url"] for call in client_factory.call_args_list} == {
+            "https://candidate.example/v1",
+            "https://extractor.example/v1",
+        }
+
+        await session._close_owned_model_resources()
+        for close in closes:
+            close.assert_awaited_once()
+
     @pytest.mark.anyio
     async def test_postlaunch_inline_grader_gets_own_pool_and_role_binding(
         self, tmp_path: Path
@@ -3683,6 +3879,41 @@ class TestInferArgs:
         # But _kwargs differ
         assert derived_model._kwargs["max_tokens"] == 512
         assert derived_model._kwargs["temperature"] == 0.0
+
+    def test_self_extractor_uses_candidate_after_infer_args(self):
+        """The self sentinel must resolve to the final task-specific model."""
+        from sieval.tasks.agieval_0shot_gen import AGIEvalZeroShotGenTask
+
+        base_model = MockChatModel(concurrency_limit=128, temperature=0.0)
+        runner = self._make_runner(
+            {
+                "agieval": {
+                    "class": "fake.AGIEvalTask",
+                    "dataset": "ds",
+                    "model": "candidate",
+                    "args": {"extractor": "self"},
+                    "infer_args": {"max_tokens": 4096},
+                }
+            },
+            models={"candidate": base_model},
+            datasets={"ds": MagicMock()},
+        )
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=AGIEvalZeroShotGenTask,
+        ):
+            runner._setup_tasks()
+
+        assert runner.runner is not None
+        task = runner.runner._runners[0]._task
+        assert isinstance(task, AGIEvalZeroShotGenTask)
+        assert task.model is task._extractor
+        assert task.model is not base_model
+        assert task.model._kwargs["max_tokens"] == 4096
+        assert task.model.pool is base_model.pool
+        assert task.model._limiter is base_model._limiter
+        assert task.model.runtime_plan is base_model.runtime_plan
 
     def test_infer_args_e2e_yaml(self, tmp_path):
         """Full YAML E2E: infer_args overrides model defaults in task config."""
