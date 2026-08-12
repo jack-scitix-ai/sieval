@@ -46,6 +46,71 @@
       "checksums": {}
     },
     {
+      "name": "agieval",
+      "display_name": "AGIEval",
+      "description": "AGIEval v1.1 — 21 human exam subsets (Gaokao, SAT, LSAT, MATH).",
+      "source": [
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/lsat-ar.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/lsat-lr.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/lsat-rc.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/logiqa-en.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/sat-math.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/sat-en.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/aqua-rat.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/sat-en-without-passage.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/gaokao-english.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/logiqa-zh.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/jec-qa-kd.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/jec-qa-ca.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/gaokao-chinese.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/gaokao-geography.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/gaokao-history.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/gaokao-biology.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/gaokao-chemistry.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/gaokao-physics.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/gaokao-mathqa.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/math.jsonl",
+        "url:https://raw.githubusercontent.com/ruixiangcui/AGIEval/84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/gaokao-mathcloze.jsonl"
+      ],
+      "categories": [
+        {
+          "level1": "Knowledge",
+          "level2": "Multi-domain"
+        }
+      ],
+      "tags": [
+        "english",
+        "chinese",
+        "multiple-choice",
+        "open-ended"
+      ],
+      "deps_group": null,
+      "license": "CC-BY-NC-SA-4.0",
+      "checksums": {
+        "aqua-rat.jsonl": "sha256:cff42e946e6082dacb27285dae19cb4be98408ab760fe43c6c462e543be50572",
+        "gaokao-biology.jsonl": "sha256:789baadad69c998743302143a3e1c2022a2aca785bbe75644877a336242c7e69",
+        "gaokao-chemistry.jsonl": "sha256:4fb8a4b881f652a908545447a062c7ba458be2ba793a45fc11b892053406704e",
+        "gaokao-chinese.jsonl": "sha256:1ddcf8fa15e07a25589796dc1c72a341c2d874af8de41970262d66693f95285f",
+        "gaokao-english.jsonl": "sha256:2de1b1e5d9718d908ffb46665e949bff83bef956ad8b7de16ea412e058162b01",
+        "gaokao-geography.jsonl": "sha256:1170cb39171d6dfc35bd52a52505e5a120cf400abc697f282d0739db6181713b",
+        "gaokao-history.jsonl": "sha256:27350771d399814fc69dd6d7e6ce115b7913ae208e04e385a7e6fcdf51a6b8b7",
+        "gaokao-mathcloze.jsonl": "sha256:088675c147794970a3ed25c7147a3bbc59715d6813837d5f483f46dcb1b5008d",
+        "gaokao-mathqa.jsonl": "sha256:d246f12752d121289ef55cbf1bcf954243cefb65d110f71d09358e24065c808f",
+        "gaokao-physics.jsonl": "sha256:9f8f91b35b5cc2d3ba67b9c6f31bc72c51caaaa58a4a46375690d3b8b127a82b",
+        "jec-qa-ca.jsonl": "sha256:704efb9943cb827811d883163d893d483451ddaaf9f595f94866e51e70e20785",
+        "jec-qa-kd.jsonl": "sha256:fec1d0d85d480ee6c23371af59b2305732d8561296cd878b5367b65ebfc4a467",
+        "logiqa-en.jsonl": "sha256:63d0e8efaca1944e7eac5037903650f92ca9c036155a66b4e95bf2aa06da1702",
+        "logiqa-zh.jsonl": "sha256:0e5f6548932ce6cd388d8432d015db9baa468731c94409c98d20902832bb099c",
+        "lsat-ar.jsonl": "sha256:3b3e3fe09a07c695326adb82f38da0d67d5bbaadab41551f198c3102f1ea9dc8",
+        "lsat-lr.jsonl": "sha256:c6acb4d843db7b515da4d853e52bb8e6e5f776910f2e35a1805634db24bf94ea",
+        "lsat-rc.jsonl": "sha256:0eed491b3099d66b8110d4fabb98ce43285a6ac61ea5643285eec11b8abce202",
+        "math.jsonl": "sha256:43e783af2025318125a96a970a0df37941124a5c0dabea382a12ce1b04651a11",
+        "sat-en-without-passage.jsonl": "sha256:77eb57bb6f6f39466d5d169de5253e77755ef521ad6692f582307672affbf593",
+        "sat-en.jsonl": "sha256:33fe87b32ff16ae7ba52b27bb398190b082253b3617a3eb9737005262ba12dd4",
+        "sat-math.jsonl": "sha256:9cde4c0522b6196852a5562db6e72bf8817b4802822db0fc10013d1becdab3c3"
+      }
+    },
+    {
       "name": "aime_2024",
       "display_name": "AIME 2024",
       "description": "American Invitational Mathematics Examination 2024, 30 problems.",
@@ -1116,6 +1181,29 @@
       },
       "status": "experimental",
       "reference_kind": "procedure"
+    },
+    {
+      "name": "agieval_0shot_gen",
+      "display_name": "AGIEval (0-shot, generative)",
+      "description": "AGIEval v1.1 human exams — 21 subsets, two-stage 0-shot MCQ + cloze.",
+      "dataset": "agieval",
+      "eval_mode": "gen",
+      "n_shot": 0,
+      "tags": [
+        "english",
+        "chinese",
+        "multiple-choice",
+        "open-ended"
+      ],
+      "deps_group": null,
+      "model_type": "chat",
+      "reference_impl": {
+        "source": "AGIEval",
+        "url": "https://github.com/ruixiangcui/AGIEval/blob/84ab72d94318290aad2e4ec820d535a95a1f7552/src/dataset_loader.py",
+        "notes": "Port of AGIEval's own zero-shot pipeline (Microsoft, arXiv:2304.06364) on the pinned v1.1 data: prompts from src/dataset_loader.py, answer extraction from src/post_process.py, verdicts from src/evaluation.py, all vendored in community/agieval.\nTWO-STAGE, as run_prediction.py's zero-shot path: generate freely, re-prompt with the reply plus generate_second_stage_input's cue (with_format_prompt=False), and parse THAT — post_process_and_evaluation.py scores the second-stage output and keeps the first only as an audit field. Both calls are returned from infer(), so both land in profile.json. REPEATS: upstream samples each problem once (no n_repeats); its only retry re-queries empty replies, which the model's max_retries covers. An empty stage-1 reply still proceeds, as upstream's extract_answer does.\nDECODING: upstream's query_azure_openai_chat sends temperature=0 and stop=['<|im_end|>'] on both calls. Here both request n=1 explicitly (upstream has no n knob at all) and temperature comes from the model config, as examples/agieval-math.yaml sets it. The stop token is deliberately not reproduced: an OpenAI-protocol endpoint consumes ChatML's own end marker as a turn delimiter rather than emitting it as text.\nDIVERGENCE (the one protocol-level choice): upstream runs stage 2 on gpt-35-turbo no matter which model produced stage 1; sieval requires an explicit `extractor` instead, as the LLM-judge tasks require `grader`. A pinned extractor matches upstream; \"self\" measures the model's own answer-extraction, which for a weak model is not the same number.\nSCORING: set-of-letters for jec-qa-kd / jec-qa-ca / gaokao-physics, math equivalence for math / gaokao-mathcloze, exact string compare otherwise. The math grader is AGIEval's own vendored hendrycks/math is_equiv, NOT sieval.community.math (a trimmed variant of the same file whose dropped normalizations change verdicts).\nTWO UPSTREAM QUIRKS, both kept verbatim — fixing either would silently diverge from every published AGIEval number. (1) 7 of 351 gaokao-mathqa rows carry multi-letter golds ('AD', 'A B D', ...) even in v1.1, but the subset is not on upstream's multi_choice list, so exact single-letter compare makes them unwinnable (~2% of that subset). (2) 73 of 118 gaokao-mathcloze golds are wrapped in $...$, parse_math_answer returns boxed content verbatim, and is_equiv's _strip_string removes an escaped \\$ but not a bare one — so a model emitting the gold's VALUE in \\boxed{}, which is what models do, tops out at 45/118 = 38.1% there, while one reproducing the $...$ byte for byte scores 113/118 = 95.8% (both measured through upstream's own code; the 5 residual losses are golds containing '='). Read a real model against 38.1 — the ceiling is a formatting property — and note that it caps even a naturally-formatting model at about 96.9 on `score` and 87.2 on `macro_math`, the key it really binds.\nTHE EXTRACTOR DEFINES THE SCORE — measured, not asserted, which is why the arg has no default. On identical stage-1 replies (315 rows, 15/subset) the macro moved 52.70–78.73 across five extractors: a 26-point spread, wider than the published GPT-4o → GPT-3.5-Turbo gap of 16.3. Most of that is the parser, not extractor capability: find_first_capital_letter returns the first {A..F} character ANYWHERE in the reply, and both cues carry a capital A before the answer (\"Among A through E, the answer is\", \"从A到D, 我们应选择\"), so an extractor that opens by restating the cue is scored 'A' whatever it then says. On a full 7,272-row run it mis-scored 635 of 6,154 MCQ rows (10.32%) whose extraction had NAMED the gold letter — worth +9.90 on the 19-subset MCQ macro, +5.40 on macro_en_mcq, +13.18 on macro_zh_mcq, +25.16 on gaokao-english alone (68.30 as scored, 93.46 read past the cue, against GPT-4's published 91.9). On jec-qa-kd / jec-qa-ca / gaokao-physics the mechanism differs: parse_qa_multiple_answer returns EVERY A–F character, so a verbose reply yields a set no single-letter v1.1 gold can match (letters per reply 1.73 → 7.09, accuracy 68.9 → 11.1 as replies lengthen). So PIN AN EXTRACTOR THAT IS TERSE AND TEMPERATURE-CONTROLLABLE, and report which one next to the score: a terse one echoes the cue ~0% of the time, while one that rejects temperature=0 (the gpt-5 family does) is not reproducible — re-extracting over the same stage-1 replies moved macro_en_mcq 1.14 points. Never compare two runs whose extractors differ.\nCOMPARISON TARGETS (upstream README leaderboard, v1.1 zero-shot, MCQ-only for the en/zh rows): GPT-4o 62.3 all / 65.2 en / 63.3 zh; GPT-3.5-Turbo 46.0 / 54.1 / 45.0; asterisked rows there are v1.0 and not comparable. Per-subset targets are in arXiv:2304.06364 Table 2 (v1.0, zero-shot, TD-003 / ChatGPT / GPT-4), whose printed GPT-4 average of 56.4 is exactly the unweighted mean of its 21 rows — which confirms `score` is upstream's 'average for all datasets' (denominator 21 when all are selected). macro_en_mcq / macro_zh_mcq mirror the two leaderboard groups; gaokao-english is prompted in English but counted as Chinese there, matching upstream's driver.\nVALIDATION (2026-08-12, all 7,272 rows): google/gemma-4-31B-it answering at temperature 0 with gpt-5.4-mini pinned as extractor — score 68.25, macro_en_mcq 80.19, macro_zh_mcq 62.94, macro_math 70.76; 0 request errors, 12 stage-1 truncations, 0 empty stage-1 replies, 99 unparsed, no subset above its replay ceiling. Shape vs Table 2 Spearman +0.49, rising to +0.66 once the cue-echo rows above are read past — the artifact, not the port, was distorting the per-subset ordering. The extractor transcribes rather than re-solves: on rows where stage 1 never named the gold letter it scores 18.75%, below chance. An OPERATING POINT, not a reproduction — upstream's only zero-shot rows are GPT-4o and GPT-3.5-Turbo, neither servable here, and the extractor cannot be gpt-35-turbo — so status stays \"experimental\"."
+      },
+      "status": "experimental",
+      "reference_kind": "value"
     },
     {
       "name": "aime_2024_0shot_gen",
