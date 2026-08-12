@@ -13,7 +13,6 @@ import pytest
 from sieval.core.models.capabilities import Capability, ReasoningOptions, Supported
 from sieval.core.models.dialect import (
     DialectError,
-    NoOp,
     OutputContractError,
     PreparedRequest,
     RequestAudit,
@@ -314,7 +313,7 @@ class TestWireTranslation:
         ]
 
     @pytest.mark.anyio
-    async def test_tool_result_error_marker_is_an_explicit_noop(self) -> None:
+    async def test_tool_result_error_marker_is_rejected_before_io(self) -> None:
         dialect, create = _dialect()
         req = Request(
             input=_chat(
@@ -324,22 +323,13 @@ class TestWireTranslation:
                 )
             )
         )
-        audit = RequestAudit(active_request_leaves(req))
 
-        dialect.validate_request(req, audit, SimpleNamespace())
-        decision = audit.decisions["input.modality.tool_result.is_error"]
-        assert isinstance(decision, NoOp)
-        prepared = dialect.prepare(req, audit)
-        audit.finish(prepared)
-        await dialect.execute(prepared)
+        with pytest.raises(
+            RequestAuditError, match="cannot transmit the tool-result error state"
+        ):
+            await dialect.arun(req)
 
-        assert _awaited_kwargs(create)["messages"] == [
-            {
-                "role": "tool",
-                "tool_call_id": "call_1",
-                "content": "boom",
-            }
-        ]
+        create.assert_not_awaited()
 
     @pytest.mark.anyio
     async def test_inline_image_data_is_emitted_as_base64_url(self) -> None:
@@ -362,6 +352,53 @@ class TestWireTranslation:
                 "image_url": {"url": "data:image/png;base64,YWJj"},
             }
         ]
+
+    @pytest.mark.anyio
+    async def test_url_image_media_type_is_rejected_before_io(self) -> None:
+        dialect, create = _dialect()
+        req = Request(
+            input=_chat(
+                ChatMessage(
+                    "user",
+                    (
+                        ImagePart(
+                            url="https://example.test/image.png",
+                            media_type="image/png",
+                        ),
+                    ),
+                )
+            )
+        )
+
+        with pytest.raises(
+            RequestAuditError, match="no media-type field for URL-backed images"
+        ):
+            await dialect.arun(req)
+
+        create.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_mixed_images_reject_url_media_type_before_io(self) -> None:
+        dialect, create = _dialect()
+        req = Request(
+            input=_chat(
+                ChatMessage(
+                    "user",
+                    (
+                        ImagePart(data="YWJj", media_type="image/png"),
+                        ImagePart(
+                            url="https://example.test/image.jpeg",
+                            media_type="image/jpeg",
+                        ),
+                    ),
+                )
+            )
+        )
+
+        with pytest.raises(RequestAuditError, match="URL-backed images"):
+            await dialect.arun(req)
+
+        create.assert_not_awaited()
 
 
 class TestPreflightRejections:

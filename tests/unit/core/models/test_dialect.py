@@ -116,6 +116,22 @@ class TestLeafDerivation:
         }
         assert "look" not in leaves
 
+    def test_branch_sensitive_image_media_type_is_a_separate_leaf(self):
+        req = Request(
+            input=ChatInput(
+                (
+                    ChatMessage(
+                        "user",
+                        (ImagePart(data="YWJj", media_type="image/png"),),
+                    ),
+                )
+            )
+        )
+
+        assert (
+            active_request_leaves(req)["input.modality.image.media_type"] == "image/png"
+        )
+
     def test_tool_result_error_marker_is_a_separate_nondefault_leaf(self):
         normal = Request(
             input=ChatInput((ChatMessage("tool", (ToolResultPart("call", "ok"),)),))
@@ -151,6 +167,7 @@ class TestLeafDerivation:
         [
             ("input.completion.suffix", "fim"),
             ("input.modality.image", "multimodal_input"),
+            ("input.modality.image.media_type", "multimodal_input"),
             ("scoring.input_scoring", "input_scoring"),
             ("scoring.sampled_logprobs", "sampled_logprobs"),
             ("scoring.top_logprobs", "top_logprobs"),

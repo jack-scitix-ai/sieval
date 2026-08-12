@@ -112,6 +112,9 @@ def _input_leaves(req: Request) -> dict[str, object]:
         ToolCallPart: "input.modality.tool_call",
         ToolResultPart: "input.modality.tool_result",
     }
+    # A record-level leaf covers fields that every admitted branch preserves.
+    # Branch-sensitive optional fields need their own leaf so a dialect must
+    # explicitly consume or reject them instead of hiding a partial drop.
     for message in req.input.messages:
         for part in message.content:
             path = part_paths.get(type(part))
@@ -120,6 +123,8 @@ def _input_leaves(req: Request) -> dict[str, object]:
                     f"ChatMessage contains unclassified part {type(part).__name__}"
                 )
             result.setdefault(path, True)
+            if isinstance(part, ImagePart) and part.media_type is not None:
+                result.setdefault("input.modality.image.media_type", part.media_type)
             if isinstance(part, ToolResultPart) and part.is_error:
                 result.setdefault("input.modality.tool_result.is_error", True)
     return result
@@ -246,6 +251,7 @@ def request_capability(path: str) -> str | None:
     exact = {
         "input.completion.suffix": "fim",
         "input.modality.image": "multimodal_input",
+        "input.modality.image.media_type": "multimodal_input",
         "scoring.input_scoring": "input_scoring",
         "scoring.sampled_logprobs": "sampled_logprobs",
         "scoring.top_logprobs": "top_logprobs",

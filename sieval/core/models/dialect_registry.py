@@ -214,7 +214,10 @@ def _request_schema_leaves() -> frozenset[str]:
                     "user",
                     (
                         TextPart("text"),
-                        ImagePart(url="https://schema.invalid/image"),
+                        ImagePart(
+                            url="https://schema.invalid/image",
+                            media_type="image/png",
+                        ),
                         ToolCallPart("call", "tool", {}),
                         ToolResultPart("call", None, is_error=True),
                     ),

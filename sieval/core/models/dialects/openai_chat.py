@@ -145,7 +145,10 @@ CAPABILITY_DECISIONS: Mapping[str, DialectCapabilityDecision] = MappingProxyType
         "multimodal_input": Supported(
             DialectCapabilityBinding(
                 "multimodal_input",
-                request_leaves=("input.modality.image",),
+                request_leaves=(
+                    "input.modality.image",
+                    "input.modality.image.media_type",
+                ),
                 _config_validator=_validate_multimodal_config,
             )
         ),
@@ -537,11 +540,25 @@ class OpenAIChatDialect:
                 )
             elif path == "tools.hosted":
                 audit.rejected(path, "hosted tools are not active in PR 1")
-            elif path == "input.modality.tool_result.is_error":
-                audit.noop(
+            elif (
+                path == "input.modality.image.media_type"
+                and isinstance(req.input, ChatInput)
+                and any(
+                    isinstance(part, ImagePart)
+                    and part.url is not None
+                    and part.media_type is not None
+                    for message in req.input.messages
+                    for part in message.content
+                )
+            ):
+                audit.rejected(
                     path,
-                    "Chat Completions has no separate tool-result error marker; "
-                    "the tool role, call id, and result content are unchanged",
+                    "Chat Completions has no media-type field for URL-backed images",
+                )
+            elif path == "input.modality.tool_result.is_error":
+                audit.rejected(
+                    path,
+                    "Chat Completions cannot transmit the tool-result error state",
                 )
             elif path.startswith("session."):
                 audit.rejected(path, "Chat Completions has no session-state field")
@@ -587,6 +604,7 @@ class OpenAIChatDialect:
             "input.chat",
             "input.modality.text",
             "input.modality.image",
+            "input.modality.image.media_type",
             "input.modality.tool_call",
             "input.modality.tool_result",
         ):
