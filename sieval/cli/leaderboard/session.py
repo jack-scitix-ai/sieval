@@ -885,9 +885,10 @@ def _warn_best_effort_deterministic(
 ) -> None:
     """Warn when deterministic mode talks to engines we don't manage.
 
-    For models reaching an externally-hosted ``api_base`` we can pin the
-    per-request ``seed`` but cannot verify the remote engine runs batch-
-    invariant kernels. Reproducibility is best-effort on those models.
+    For models reaching an externally-hosted ``api_base`` we apply a request
+    seed when the selected protocol supports one, but cannot verify the remote
+    process seed or batch-invariant kernels. Reproducibility is best-effort on
+    those models.
 
     Only base models with their own ``api_base`` are listed; derived
     models that inherit ``api_base`` from a flagged base are covered
@@ -905,9 +906,9 @@ def _warn_best_effort_deterministic(
     if external:
         logger.warning(
             "Deterministic mode is best-effort for model(s) {} — "
-            "sieval pins `seed` in each request but cannot verify "
-            "batch-invariant kernels on the remote engine. For guaranteed "
-            "reproducibility, self-host via `sieval run` / "
+            "sieval applies request-level seeds where the protocol supports "
+            "them, but cannot verify the remote process seed or batch-invariant "
+            "kernels. For guaranteed reproducibility, self-host via `sieval run` / "
             "`sieval infer start` with a local checkpoint.",
             external,
         )

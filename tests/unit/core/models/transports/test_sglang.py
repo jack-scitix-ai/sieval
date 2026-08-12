@@ -169,6 +169,13 @@ class TestLower:
         assert "logprob_start_len" not in body
         assert "max_new_tokens" not in _sampling(body)
 
+    def test_request_seed_is_not_a_native_wire_parameter(self):
+        t, _ = _make_transport({"text": "", "meta_info": _meta()})
+        body = t._lower(_request("hi", sampling=SamplingParams(seed=7)))
+
+        assert "seed" not in body
+        assert "seed" not in _sampling(body)
+
     def test_echo_never_appears_in_wire_body(self):
         t, _ = _make_transport({"text": "", "meta_info": _meta()})
         body = t._lower(_request("hi", input_scoring=True))

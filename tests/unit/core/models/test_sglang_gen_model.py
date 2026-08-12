@@ -225,13 +225,6 @@ class TestLegacyRequestGate:
                 ),
                 "session.opaque_continuation",
             ),
-            (
-                Request(
-                    input=CompletionInput("prompt"),
-                    sampling=SamplingParams(seed=7),
-                ),
-                "sampling.seed",
-            ),
         ],
     )
     async def test_unsupported_leaf_is_rejected_before_transport(
@@ -246,6 +239,18 @@ class TestLegacyRequestGate:
         assert transport.requests == []
         await model.aclose()
         close.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_request_seed_is_an_explicit_engine_level_noop(self) -> None:
+        transport = _ImmediateTransport()
+        model, _ = _legacy_model(transport)
+
+        output = await model.agenerate("prompt", seed=7)
+
+        assert output.texts == ["ok"]
+        assert len(transport.requests) == 1
+        assert transport.requests[0].sampling.seed == 7
+        await model.aclose()
 
     @pytest.mark.anyio
     @pytest.mark.parametrize(

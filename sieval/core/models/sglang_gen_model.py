@@ -9,7 +9,7 @@ the temporary task compatibility checks.
 AI-Generated Code - GPT-5.6 (OpenAI)
 """
 
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Any, Self, cast
 from uuid import uuid4
 
@@ -55,11 +55,18 @@ _SGLANG_LEGACY_LOWERED_LEAVES = frozenset(
         "scoring.top_logprobs",
     }
 )
-_SGLANG_LEGACY_NOOP_LEAVES = frozenset(
+_SGLANG_LEGACY_NOOP_LEAVES = MappingProxyType(
     {
-        # Native /generate is always one POST.  The compatibility builder
+        # Native /generate is always one POST. The compatibility builder
         # defaults stream=True, so this is an explicit scheduling-only no-op.
-        "scheduling.stream",
+        "scheduling.stream": "native /generate is a single non-streaming POST",
+        # SGLang has no per-request seed on /generate. Deterministic managed
+        # deployments pin the process seed through DeploymentPlan.seed and
+        # --random-seed; external deployments remain explicitly best-effort.
+        "sampling.seed": (
+            "native /generate has no per-request seed; managed deterministic "
+            "serving pins DeploymentPlan.seed at engine startup"
+        ),
     }
 )
 _SGLANG_LEGACY_CANONICAL_OPTION_OWNERS = {

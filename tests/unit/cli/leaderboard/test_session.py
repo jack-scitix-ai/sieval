@@ -3191,6 +3191,85 @@ tasks:
         await session._close_owned_model_resources()
         close.assert_awaited_once()
 
+    @pytest.mark.anyio
+    async def test_deterministic_sglang_legacy_seed_is_engine_level_noop(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import (
+            Request,
+            Response,
+            SglangGenModel,
+            TokenLogprob,
+        )
+
+        config_path = self._config(
+            tmp_path,
+            """
+deterministic: true
+models:
+  m:
+    name: org/model
+    type: gen
+    engine: sglang
+    api_base: https://sglang.example/v1
+    api_key: local
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+        close = AsyncMock()
+        connection = types.SimpleNamespace(
+            close=close,
+            base_url="https://sglang.example/v1",
+        )
+        transport_arun = AsyncMock(
+            return_value=Response(
+                texts=("ok",),
+                logprobs=(TokenLogprob("ok", -0.1),),
+            )
+        )
+
+        try:
+            with (
+                patch(
+                    "sieval.cli.leaderboard.session.resolve_task_class",
+                    return_value=self.CompletionTask,
+                ),
+                patch(
+                    "sieval.core.models.sglang_gen_model.AsyncOpenAI",
+                    return_value=connection,
+                ),
+            ):
+                session._setup_prelaunch_reconciliation()
+                session._setup_postlaunch_reconciliation()
+                session._setup_models()
+
+            model = session.models["m"]
+            assert isinstance(model, SglangGenModel)
+            with patch.object(model._legacy_transport, "arun", transport_arun):
+                generated = await model.agenerate("prompt")
+                scored = await model.alogprobs("prompt", echo=False)
+
+            assert generated.texts == ["ok"]
+            assert scored.texts == ["ok"]
+            requests = [
+                cast(Request, call.args[0]) for call in transport_arun.await_args_list
+            ]
+            assert len(requests) == 2
+            assert all(
+                request.sampling.seed == DETERMINISTIC_DEFAULT_SEED
+                for request in requests
+            )
+        finally:
+            await session._close_owned_model_resources()
+
+        close.assert_awaited_once()
+
 
 class TestEvalSessionWrappers:
     @pytest.mark.anyio
