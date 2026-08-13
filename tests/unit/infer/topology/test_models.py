@@ -504,18 +504,43 @@ class TestDeploymentPlanProjection:
         assert deployment_plan_projection(plan).service_roles == ("full",)
 
     def test_fingerprint_covers_all_plan_fields(self):
+        """Every ``DeploymentPlan`` field must move the fingerprint.
+
+        The mutation map is cross-checked against ``dataclasses.fields`` rather
+        than hand-listed: a hand-listed set keeps passing after the source
+        grows a field, which is exactly how the core projection would silently
+        fall behind ``DeploymentPlan``.
+        """
         plan = self._plan()
-        variants = (
-            dataclasses.replace(plan, checkpoint="/models/other"),
-            dataclasses.replace(plan, backend="sglang"),
-            dataclasses.replace(plan, deterministic=False),
-            dataclasses.replace(plan, seed=8),
-            dataclasses.replace(plan, attachments=()),
+        mutations: dict[str, object] = {
+            "checkpoint": "/models/other",
+            "backend": "sglang",
+            "assignments": (
+                RoleAssignment(
+                    role="prefill",
+                    devices=DeviceGroup(count=2, gpu_model="H100"),
+                    topology=ParallelTopology(tp=2),
+                    engine_params={"dtype": "bfloat16"},
+                ),
+            ),
+            "attachments": (),
+            "deterministic": False,
+            "seed": 8,
+        }
+        assert set(mutations) == {
+            field.name for field in dataclasses.fields(DeploymentPlan)
+        }, (
+            "DeploymentPlan's fields changed. Decide whether "
+            "DeploymentPlanProjection must carry the new field, then update "
+            "this mutation map."
         )
 
-        fingerprints = {deployment_plan_fingerprint(plan)}
-        fingerprints.update(deployment_plan_fingerprint(item) for item in variants)
-        assert len(fingerprints) == len(variants) + 1
+        baseline = deployment_plan_fingerprint(plan)
+        for name, value in mutations.items():
+            variant = dataclasses.replace(plan, **{name: value})
+            assert deployment_plan_fingerprint(variant) != baseline, (
+                f"{name} does not reach the plan fingerprint"
+            )
 
     def test_mapping_order_does_not_change_fingerprint(self):
         plain = {"backend": "vllm", "checkpoint": "/models/test"}
