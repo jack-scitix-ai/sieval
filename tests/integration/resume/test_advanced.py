@@ -14,6 +14,7 @@ from tests.conftest import (
     MockChatModel,
     MockDataset,
     make_config,
+    prompt_of,
 )
 
 from .conftest import (
@@ -173,12 +174,12 @@ class TestIterationBoundarySnapshots:
         call_counts = {}
 
         class FailOnSecondIterModel(MockChatModel):
-            async def _agenerate_impl(self, prompt, **kwargs):
-                q = prompt if isinstance(prompt, str) else list(prompt)[-1]["content"]
+            async def _stub_arun(self, req):
+                q = prompt_of(req)
                 call_counts[q] = call_counts.get(q, 0) + 1
                 if call_counts[q] == 2:
                     raise RuntimeError("Fail on iteration 1")
-                return await super()._agenerate_impl(prompt, **kwargs)
+                return await super()._stub_arun(req)
 
         model1 = FailOnSecondIterModel(answers={"I1": "A1", "I2": "A2"})
         task1 = IterativeTask(dataset=dataset, model=model1, name="iter_resume")

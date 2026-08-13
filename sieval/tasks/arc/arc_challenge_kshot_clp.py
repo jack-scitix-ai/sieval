@@ -32,7 +32,10 @@ from sieval.core.tasks import (
     PredictionRecord,
     PromptRecord,
     ReferenceImpl,
+    RequirementContext,
     Task,
+    TaskModelRequirement,
+    TaskRequirements,
     sieval_task,
 )
 from sieval.core.utils.ppl import choice_scores_from_top_logprobs
@@ -97,6 +100,19 @@ class ARCChallengeFewShotClpTask(
         dict[str, float | str],
     ]
 ):
+    requires = TaskRequirements(
+        sampled_logprobs=True, min_top_logprobs=DEFAULT_CLP_LOGPROBS
+    )
+
+    @classmethod
+    @override
+    def model_requirements_for(
+        cls, context: RequirementContext
+    ) -> tuple[TaskModelRequirement, ...]:
+        return cls._bind_top_logprobs_requirements(
+            context, default=DEFAULT_CLP_LOGPROBS
+        )
+
     def __init__(
         self,
         dataset,

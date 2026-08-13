@@ -14,7 +14,7 @@ from sieval.community.livecodebench.prompts.code_generation import (
     get_base_model_question_template_answer,
     get_base_model_target_block,
 )
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.gen_model import GenModel
 from sieval.core.tasks import (
     TaskContext,
@@ -28,6 +28,7 @@ from sieval.tasks.livecodebench_code_generation_kshot_base_gen import (
     STOP_SEQUENCES,
     LiveCodeBenchCodeGenerationFewShotBaseGenTask,
 )
+from tests.conftest import HandlerTransport
 
 _STARTER = "class Solution:\n    def solve(self) -> int:\n        "
 
@@ -45,27 +46,19 @@ def _judgement(*rollouts: tuple[bool, str]):
 
 class _CapturingGenModel(GenModel):
     def __init__(self, texts: list[str] | None = None):
-        super().__init__(model="mock-gen", api_key="fake")
-        self.last_kwargs: dict[str, object] = {}
+        self.last_req: Request | None = None
         self._texts = texts if texts is not None else ["print(1)"]
+        super().__init__(model="mock-gen", api_key="fake")
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(model=self.meta(), texts=list(self._texts))
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_req = req
+        texts = tuple(self._texts)
+        if len(texts) == 1:
+            texts *= req.sampling.n
+        return Response(texts=texts)
 
 
 def _raw(starter_code: str = "") -> dict:
@@ -192,10 +185,11 @@ async def test_infer_forwards_only_stop_and_n_not_decoding_params():
     finally:
         await task.shutdown()
 
-    assert model.last_kwargs["stop"] == ["###"]
-    assert model.last_kwargs["n"] == 4
-    assert "max_tokens" not in model.last_kwargs
-    assert "temperature" not in model.last_kwargs
+    req = model.last_req
+    assert req is not None
+    # Exactly stop + n — no max_tokens / temperature injected by the task.
+    assert req.sampling == SamplingParams(stop=("###",), n=4)
+    assert req.dialect_options is None
 
 
 @pytest.mark.anyio

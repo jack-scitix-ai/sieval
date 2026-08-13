@@ -7,7 +7,7 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import (
     TaskContext,
@@ -17,28 +17,18 @@ from sieval.core.tasks import (
 )
 from sieval.datasets.mmlu import MMLUDataset, MMLUDatasetSample
 from sieval.tasks.mmlu_0shot_gen import MMLUZeroShotGenTask
+from tests.conftest import HandlerTransport
 
 
 class _StubChatModel(ChatModel):
     def __init__(self):
         super().__init__(model="mock-chat", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=["Answer: A"])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
-    async def _alogprobs_impl(
-        self,
-        prompt,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        return Response(texts=("Answer: A",))
 
 
 def _sample(subject: str = "anatomy", answer: int = 0) -> MMLUDatasetSample:

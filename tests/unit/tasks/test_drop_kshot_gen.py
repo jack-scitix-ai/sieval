@@ -10,11 +10,12 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import TaskContext
 from sieval.datasets.drop import DROPDataset, DROPDatasetSample
 from sieval.tasks.drop_kshot_gen import DROPFewShotGenTask
+from tests.conftest import HandlerTransport
 
 
 def test_import_does_not_pull_drop_eval_backend():
@@ -40,8 +41,11 @@ class _StubChatModel(ChatModel):
     def __init__(self):
         super().__init__(model="mock-chat", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        return ModelOutput(model=self.meta(), texts=["Answer: 1"])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
+
+    async def _stub_arun(self, req: Request) -> Response:
+        return Response(texts=("Answer: 1",) * req.sampling.n)
 
 
 def _sample(tag: str) -> DROPDatasetSample:

@@ -21,7 +21,7 @@ from sieval.core.datasets.meta import (
     DatasetMeta,
     Level1Category,
 )
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, ModelProvenance
 from sieval.core.runners.resume_gate import ResumeIdentityError, ResumeVersionError
 from sieval.core.runners.runner import (
     ResultDirExistsError,
@@ -39,6 +39,7 @@ from sieval.core.tasks.consts import (
     TaskStage,
 )
 from sieval.core.tasks.context import TaskContext, TaskRunIdentity, TaskStageOutput
+from sieval.core.tasks.loader import TaskLoader
 from sieval.core.tasks.meta import (
     _TASK_CLASSES,
     TASK_REGISTRY,
@@ -266,6 +267,35 @@ class TestE2ERunMetaTaskIdentity:
         }
         assert task.name != meta["task"]["name"]
         assert meta["version"] == __version__
+
+    @pytest.mark.anyio
+    async def test_task_identity_and_model_provenance_coexist(
+        self, tmp_path, decorated_mock_task_cls
+    ):
+        """Run identity and call provenance persist in their separate schemas."""
+        task = decorated_mock_task_cls(
+            dataset=MockDataset(),
+            model=MockChatModel(answers=DEFAULT_ANSWERS),
+            name="identity_with_provenance",
+        )
+        runner = TaskRunner(task, make_config(tmp_path, record_each_stage=True))
+        await runner.arun()
+
+        meta = orjson.loads((runner.root_dir / "meta.json").read_bytes())
+        assert meta["task"]["name"] == "e2e_identity_task"
+
+        loader = TaskLoader(task=task, root_dir=runner.root_dir)
+        contexts = await loader.load_initial_state()
+        await loader.hydrate(
+            contexts,
+            set(),
+            include_stages={TaskStage.FINAL},
+            record_each_stage=True,
+        )
+
+        for ctx in contexts.values():
+            assert isinstance(ctx.infer_result, ModelOutput)
+            assert isinstance(ctx.infer_result.model["provenance"], ModelProvenance)
 
     @pytest.mark.anyio
     async def test_persisted_n_shot_is_the_run_not_the_declaration(

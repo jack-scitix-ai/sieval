@@ -8,11 +8,15 @@ by BackendTranslator.
 AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
+import dataclasses
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal
 
+from sieval.core.models import DeploymentPlanProjection
 from sieval.infer.config import ParamValue
 from sieval.infer.params import merge_params
 
@@ -205,22 +209,75 @@ class DeploymentPlan:
         return errors
 
 
-@dataclass(frozen=True)
-class DeploymentCapabilities:
-    """Deployment capabilities exposed from infer to eval side.
+def deployment_plan_fingerprint(
+    plan: DeploymentPlan | Mapping[str, object],
+) -> str:
+    """Return the stable fingerprint shared by desired and realized state.
 
-    Constructed by Deployer after all processes are ready.
+    ``Mapping`` input supports the plain, serialization-safe plan shape used by
+    the composition layer.  A typed :class:`DeploymentPlan` is normalized to
+    that exact shape before hashing, including every current or future
+    dataclass field.  This prevents a realized deployment from silently using a
+    different identity than its persisted ``infer_plans.yaml`` source.
     """
 
-    api_base: str
-    is_disaggregated: bool
-    roles: tuple[str, ...]
-    total_gpus: int
-    endpoints: Mapping[str, str] = field(default_factory=dict)
-    metrics_url: str | None = None
+    normalized = _plain_plan_value(plan)
+    if not isinstance(normalized, dict):
+        raise TypeError("DeploymentPlan must normalize to a mapping")
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "endpoints", _freeze_dict(self.endpoints))
+
+def deployment_plan_projection(
+    plan: DeploymentPlan | Mapping[str, object],
+) -> DeploymentPlanProjection:
+    """Project an infer-layer desired plan into the provider-neutral core."""
+
+    normalized = _plain_plan_value(plan)
+    if not isinstance(normalized, dict):
+        raise TypeError("DeploymentPlan must normalize to a mapping")
+    engine_id = normalized.get("backend")
+    if not isinstance(engine_id, str) or not engine_id:
+        raise ValueError("DeploymentPlan.backend must not be empty")
+    raw_assignments = normalized.get("assignments", ())
+    if not isinstance(raw_assignments, (list, tuple)):
+        raise TypeError("DeploymentPlan.assignments must be a sequence")
+    roles: set[str] = set()
+    for index, assignment in enumerate(raw_assignments):
+        if not isinstance(assignment, Mapping):
+            raise TypeError(f"DeploymentPlan.assignments[{index}] must be a mapping")
+        role = assignment.get("role")
+        if not isinstance(role, str) or not role:
+            raise ValueError(
+                f"DeploymentPlan.assignments[{index}].role must not be empty"
+            )
+        roles.add(role)
+    return DeploymentPlanProjection(
+        fingerprint=deployment_plan_fingerprint(normalized),
+        engine_id=engine_id,
+        service_roles=tuple(sorted(roles)),
+    )
+
+
+def _plain_plan_value(value: Any) -> Any:
+    """Recursively normalize plan dataclasses and frozen mappings for JSON."""
+
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _plain_plan_value(getattr(value, item.name))
+            for item in dataclasses.fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {key: _plain_plan_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_plan_value(item) for item in value]
+    return value
 
 
 # --- Resolver inputs ---

@@ -11,10 +11,50 @@ from unittest.mock import AsyncMock, patch
 import orjson
 import pytest
 
+from sieval.core.models import (
+    CapabilityEvidence,
+    ModelIdentity,
+    ModelMeta,
+    ModelOutput,
+    ModelProvenance,
+)
 from sieval.core.tasks.context import TaskAction, TaskContext, TaskStage
 from sieval.core.tasks.loader import TaskLoader
+from sieval.core.tasks.records import (
+    GRADER_OUTPUT_KEY,
+    build_judgement_record,
+    build_rollout_judgement,
+)
+from sieval.core.utils.meta import build_stage_meta
+from sieval.core.utils.serialization import obj_to_dict
 
 from .conftest import make_ctx, make_mock_task, write_contexts, write_snapshot
+
+
+def _model_provenance() -> ModelProvenance:
+    return ModelProvenance(
+        dialect_id="openai_chat",
+        engine_id="vllm",
+        engine_source="deployment",
+        model_identity=ModelIdentity("alias", "served-model"),
+        deployment_id="deployment-1",
+        capabilities=CapabilityEvidence(
+            declared={"reasoning": {}},
+            effective={"reasoning": {"effort": "high"}},
+            plan_fingerprint="plan-1",
+        ),
+    )
+
+
+def _model_output(*, provenance: ModelProvenance | None) -> ModelOutput:
+    model: ModelMeta = {
+        "model": "alias",
+        "api_base": None,
+        "default_params": {},
+    }
+    if provenance is not None:
+        model["provenance"] = provenance
+    return ModelOutput(model=model, texts=["answer"])
 
 
 def _write_manual_preprocessed_record(
@@ -89,6 +129,134 @@ class TestSaverLoaderIntegration:
         h = loaded[0]
         assert h.postprocess_result == "4"
         assert h.feedback_result == {"correct": True}
+
+    @pytest.mark.anyio
+    async def test_model_call_provenance_rehydrates_from_fresh_loader(self, tmp_path):
+        root = tmp_path / "provenance_round_trip"
+        output = _model_output(provenance=_model_provenance())
+        meta = build_stage_meta(
+            output,
+            extra={
+                "user_payload": {
+                    "__sieval_cls__": "tuple",
+                    "items": ["ordinary", "metadata"],
+                }
+            },
+        )
+        ctx = TaskContext(
+            sample_id=0,
+            raw_sample={"question": "q"},
+        ).to_inferred(output, meta)
+        await write_contexts(root, [ctx])
+
+        loader = TaskLoader(task=make_mock_task(), root_dir=root)
+        loaded = await loader.load_initial_state()
+        await loader.hydrate(
+            loaded,
+            set(),
+            include_stages={TaskStage.INFERRED},
+        )
+
+        hydrated = loaded[0]
+        assert hydrated.infer_result is not None
+        assert isinstance(hydrated.infer_result.model["provenance"], ModelProvenance)
+        hydrated_meta = hydrated.stage_meta[TaskStage.INFERRED.value][0]
+        meta_provenance = hydrated_meta["model_calls"][0]["model"]["provenance"]
+        assert isinstance(meta_provenance, ModelProvenance)
+        assert isinstance(meta_provenance.model_identity, ModelIdentity)
+        assert hydrated_meta["extra"]["user_payload"] == {
+            "__sieval_cls__": "tuple",
+            "items": ["ordinary", "metadata"],
+        }
+
+    @pytest.mark.anyio
+    async def test_mixed_legacy_and_provenance_outputs_rehydrate_together(
+        self, tmp_path
+    ):
+        """A resumed shard may contain records from both sides of the migration."""
+        root = tmp_path / "mixed_provenance_resume"
+        legacy_output = _model_output(provenance=None)
+        current_output = _model_output(provenance=_model_provenance())
+        contexts = [
+            TaskContext(sample_id=0, raw_sample={"question": "old"}).to_inferred(
+                legacy_output,
+                build_stage_meta(legacy_output),
+            ),
+            TaskContext(sample_id=1, raw_sample={"question": "new"}).to_inferred(
+                current_output,
+                build_stage_meta(current_output),
+            ),
+        ]
+        await write_contexts(root, contexts)
+
+        loader = TaskLoader(task=make_mock_task(), root_dir=root)
+        loaded = await loader.load_initial_state()
+        await loader.hydrate(
+            loaded,
+            set(),
+            include_stages={TaskStage.INFERRED},
+        )
+
+        legacy = loaded[0]
+        assert legacy.infer_result is not None
+        assert "provenance" not in legacy.infer_result.model
+        legacy_call = legacy.stage_meta[TaskStage.INFERRED.value][0]["model_calls"][0]
+        assert "provenance" not in legacy_call["model"]
+
+        current = loaded[1]
+        assert current.infer_result is not None
+        assert isinstance(current.infer_result.model["provenance"], ModelProvenance)
+        current_call = current.stage_meta[TaskStage.INFERRED.value][0]["model_calls"][0]
+        assert isinstance(current_call["model"]["provenance"], ModelProvenance)
+
+    @pytest.mark.anyio
+    async def test_plain_grader_output_keeps_nested_provenance_on_disk(self, tmp_path):
+        """#60's grader output stays a mapping while retaining provenance data."""
+        root = tmp_path / "grader_provenance_round_trip"
+        grader_output = obj_to_dict(
+            _model_output(provenance=_model_provenance()),
+            add_type=False,
+        )
+        judgement = build_judgement_record(
+            "gold",
+            [
+                build_rollout_judgement(
+                    0,
+                    True,
+                    extra={GRADER_OUTPUT_KEY: grader_output},
+                )
+            ],
+        )
+        ctx = (
+            TaskContext(
+                sample_id=0,
+                raw_sample={"question": "q"},
+            )
+            .to_feedback(judgement)
+            .to_final()
+        )
+        await write_contexts(root, [ctx])
+
+        loader = TaskLoader(task=make_mock_task(), root_dir=root)
+        loaded = await loader.load_initial_state()
+        await loader.hydrate(
+            loaded,
+            set(),
+            include_stages={TaskStage.FINAL},
+        )
+
+        hydrated = loaded[0].feedback_result
+        assert hydrated is not None
+        nested = hydrated["rollouts"][0]["extra"][GRADER_OUTPUT_KEY]
+        nested_provenance = nested["model"]["provenance"]
+        assert isinstance(nested, dict)
+        assert isinstance(nested_provenance, dict)
+        assert nested_provenance["dialect_id"] == "openai_chat"
+        assert nested_provenance["engine_id"] == "vllm"
+        assert nested_provenance["model_identity"] == {
+            "requested_model_id": "alias",
+            "provider_reported_model_id": "served-model",
+        }
 
     @pytest.mark.anyio
     async def test_idx_offsets_roundtrip(self, tmp_path):

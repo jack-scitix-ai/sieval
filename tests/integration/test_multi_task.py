@@ -110,7 +110,7 @@ class TestMultiTaskRunner:
         good_model = MockChatModel(answers={"B1?": "X", "B2?": "Y"})
 
         class FailingModel(MockChatModel):
-            async def _agenerate_impl(self, prompt, **kwargs):
+            async def _stub_arun(self, req):
                 raise RuntimeError("Task A always fails")
 
         bad_model = FailingModel()

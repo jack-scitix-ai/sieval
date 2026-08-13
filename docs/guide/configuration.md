@@ -15,25 +15,18 @@ runner_config:
 
 models:
     base_model:
-        name: "gpt-4o"
-        type: "chat"
+        name: "gpt-3.5-turbo-instruct"
+        type: "gen"
         args:
             max_retries: 3
             concurrency_limit: 128
             temperature: 0.0
 
-    # Derived model — inherits base, reserves 64 from base's 128
+    # Derived model — inherits base and adds a local cap under base's 128
     math_model:
         base: base_model
         args:
             concurrency_limit: 64
-
-    # Derived model with type conversion (ChatModel -> GenModel)
-    gen_model:
-        base: base_model
-        type: "gen"
-        args:
-            concurrency_limit: 32
 
 datasets:
     gsm8k:
@@ -53,9 +46,16 @@ tasks:
 
 ### Key Concepts
 
-- **Model derivation**: `base: parent_model` inherits client, limiter, and args
-- **Type conversion**: `type: "gen"` switches between ChatModel and GenModel
-- **Quota allocation**: `concurrency_limit` in `args` reserves capacity from base
+- **Model derivation**: `base: parent_model` inherits request defaults and
+  shares the root deployment, connection pool, and limiter hierarchy
+- **Model kind**: normalized task input requirements determine one legacy kind
+  per deployment root; YAML `type: "chat"` / `type: "gen"` is a checked
+  compatibility assertion, and every config sharing that root must agree
+- **Dialect rebinding**: the composition layer reconciles a target runtime plan
+  and uses `with_dialect()` to reuse a compatible root pool; a model never
+  invents or converts that plan locally
+- **Quota allocation**: `concurrency_limit` in `args` adds a local cap while
+  retaining the root's shared cap
 - **Class resolution**: built-in classes (exported by `sieval.tasks` / `sieval.datasets`) use short names; custom classes must use full module paths (`my_pkg.my_module.MyTask`)
 
 ## Task Pipeline
@@ -81,16 +81,24 @@ preprocess -> infer -> postprocess -> feedback -> report
 Hierarchical concurrency control — derive child models from a base and allocate API quotas:
 
 ```python
-from sieval.core.models import ChatModel, GenModel
+from sieval.core.models import ChatModel
 
 base = ChatModel("gpt-4o", concurrency_limit=128)
 
-math_model = base.with_args(concurrency_limit=64)   # reserves 64
-code_model = base.with_args(concurrency_limit=32)   # reserves 32
-gen_model = base.as_type(GenModel)                   # same quota, different type
-
-# base uses remaining elastic capacity (128 - 64 - 32 = 32)
+math_model = base.with_args(concurrency_limit=64)  # local cap under shared 128
+code_model = base.with_args(concurrency_limit=32)  # local cap under shared 128
 ```
+
+The compatibility wrappers do not expose `as_type()`. A dialect change is
+composition-mediated: configuration/session code first reconciles a target
+`RuntimeBindingPlan`, then calls `with_dialect()` with that plan. If the target
+uses the same deployment and connection family, the rebound model retains the
+same client, pool, and limiter hierarchy. An incompatible target fails before
+allocation or I/O and requires a separately constructed deployment and pool.
+
+`with_dialect()` is therefore a low-level binding operation, not a shortcut
+that derives a plan from a wrapper class. `as_compat_type()` remains an internal
+legacy shape adapter for an already-bound model and never changes its dialect.
 
 ## Anomaly Detection
 

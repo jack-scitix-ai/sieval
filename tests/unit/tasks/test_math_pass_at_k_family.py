@@ -15,7 +15,7 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ChatModel, ModelOutput
+from sieval.core.models import ChatModel, ModelOutput, Request, Response
 from sieval.core.tasks import (
     TaskContext,
     build_judgement_record,
@@ -48,6 +48,7 @@ from sieval.tasks.hmmt_nov_2025_0shot_gen import HMMTNov2025ZeroShotGenTask
 from sieval.tasks.imo_answer_bench_0shot_gen import IMOAnswerBenchZeroShotGenTask
 from sieval.tasks.math_500_0shot_gen import MATH500ZeroShotGenTask
 from sieval.tasks.smt_2025_0shot_gen import SMT2025ZeroShotGenTask
+from tests.conftest import HandlerTransport
 
 PROBLEM = "What is 6 times 7?"
 ANSWER = "42"
@@ -88,13 +89,11 @@ class _StubChatModel(ChatModel):
     def __init__(self):
         super().__init__(model="mock-chat", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[rf"\boxed{{{ANSWER}}}"])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        return Response(texts=(rf"\boxed{{{ANSWER}}}",) * req.sampling.n)
 
 
 def _sample(field: str) -> dict[str, str]:

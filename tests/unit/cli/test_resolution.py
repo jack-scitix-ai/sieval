@@ -13,14 +13,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-import yaml
 
 from sieval.cli.resolution import (
     _guess_submodule_names,
     derive_model_type,
     load_class_from_name,
     load_class_from_path,
+    normalize_inline_model_binding,
     resolve_class,
+    resolve_config_model_types,
+)
+from sieval.core.models.requirements import (
+    AggregatedTaskRequirements,
+    InlineModelBinding,
+    InputKind,
+    TaskModelRequirement,
+    TaskRequirements,
 )
 
 # ===================================================================
@@ -208,80 +216,416 @@ class TestGuessSubmoduleNames:
 
 
 class TestDeriveModelType:
-    """`derive_model_type` is shared by the eval session and recipe resolution,
-    so both reach the same answer for one model. Tested directly because
-    `sieval run` calls the function, not the session method."""
+    """The shared resolver accepts only normalized task-side evidence."""
 
-    def test_explicit_type_wins(self):
-        assert derive_model_type("m", "gen", {}) == "gen"
+    @staticmethod
+    def _requirements(*kinds: InputKind) -> AggregatedTaskRequirements:
+        return AggregatedTaskRequirements(
+            input=frozenset(kinds),
+            input_sources={kind: frozenset({f"{kind.value}_task"}) for kind in kinds},
+        )
 
-    def test_defaults_to_chat_with_no_tasks(self):
-        assert derive_model_type("m", None, {}) == "chat"
+    def test_explicit_type_is_fallback_only_without_evidence(self):
+        empty = self._requirements()
+        assert derive_model_type("m", "gen", empty) == "gen"
+        assert derive_model_type("m", None, empty) == "chat"
 
-    def test_rejects_non_mapping_tasks_section(self):
-        """A list-shaped `tasks:` must not surface as an AttributeError.
+    def test_normalized_task_evidence_is_authoritative(self):
+        completion = self._requirements(InputKind.COMPLETION)
+        assert derive_model_type("m", None, completion) == "gen"
+        with pytest.raises(ValueError, match="checked assertion"):
+            derive_model_type("m", "chat", completion)
 
-        The infer layer reaches this before an EvalSession exists, and full
-        config validation only runs under `--dry-run`, so this is the first
-        code to touch the section on a normal `sieval run`. The shapes come
-        from `yaml.safe_load` rather than a literal because that is how an
-        untyped config actually reaches the annotated parameter.
-        """
-        tasks_cfg = yaml.safe_load("tasks:\n  - arc\n  - hellaswag\n")["tasks"]
-        with pytest.raises(ValueError, match="'tasks' configuration must be"):
-            derive_model_type("m", None, tasks_cfg)
+    def test_conflicting_normalized_inputs_report_sources(self):
+        requirements = self._requirements(InputKind.CHAT, InputKind.COMPLETION)
+        with pytest.raises(ValueError, match="conflicting normalized input") as exc:
+            derive_model_type("m", None, requirements)
+        assert "chat_task" in str(exc.value)
+        assert "completion_task" in str(exc.value)
 
-    def test_rejects_non_mapping_task_entry(self):
-        tasks_cfg = yaml.safe_load("tasks:\n  arc: ARCEasyFewShotPplTask\n")["tasks"]
-        with pytest.raises(ValueError, match="'tasks.arc' configuration must be"):
-            derive_model_type("m", None, tasks_cfg)
 
-    def test_infers_gen_from_task_without_explicit_type(self):
-        """The case explicit-only reading would miss: no `type:` in config."""
+class TestResolveConfigModelTypes:
+    """The YAML adapter invokes requirement hooks and delegates kind choice."""
 
-        class FakeTask:
-            model_type = "gen"
+    class MisleadingCompletionTask:
+        model_type = "chat"  # Legacy metadata must not be consulted.
 
-        tasks_cfg = {"t1": {"model": "m", "class": "fake.FakeTask"}}
+        def __init__(self, *, grader=None, models_by_role=None):
+            del grader, models_by_role
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.COMPLETION),
+                    source_task="normalized_completion",
+                ),
+            )
+
+    class CompletionWithExtractorTask:
+        def __init__(self, *, extractor=None, models_by_role=None):
+            del extractor, models_by_role
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            assert "extractor" not in context.task_args
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.COMPLETION),
+                    source_task="completion_with_extractor",
+                ),
+                TaskModelRequirement(
+                    role="extractor",
+                    binding=context.model_bindings["extractor"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="completion_with_extractor",
+                ),
+            )
+
+    class CompletionWithSelfExtractorTask:
+        def __init__(self, *, extractor=None, models_by_role=None):
+            del extractor, models_by_role
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            assert context.task_args["extractor"] == "self"
+            assert "extractor" not in context.model_bindings
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.COMPLETION),
+                    source_task="completion_with_self_extractor",
+                ),
+            )
+
+    def test_hook_evidence_flows_through_derived_model_root(self):
+        config = {
+            "models": {
+                "base": {"name": "org/model"},
+                "child": {"base": "base"},
+            },
+            "tasks": {"task": {"model": "child", "class": "fake.CompletionTask"}},
+        }
         with patch(
             "sieval.cli.resolution.resolve_task_class",
-            return_value=FakeTask,
+            return_value=self.MisleadingCompletionTask,
         ):
-            assert derive_model_type("m", None, tasks_cfg) == "gen"
+            result = resolve_config_model_types(config)
 
-    def test_ignores_tasks_pointing_at_other_models(self):
-        class FakeTask:
-            model_type = "gen"
+        assert result.model_types_by_root == {"model:base": "gen"}
+        assert result.model_types_by_config == {"base": "gen", "child": "gen"}
 
-        tasks_cfg = {"t1": {"model": "other", "class": "fake.FakeTask"}}
+    def test_explicit_type_cannot_override_hook_evidence(self):
+        config = {
+            "models": {"m": {"name": "org/model", "type": "chat"}},
+            "tasks": {"task": {"model": "m", "class": "fake.Task"}},
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.MisleadingCompletionTask,
+            ),
+            pytest.raises(ValueError, match="checked assertion"),
+        ):
+            resolve_config_model_types(config)
+
+    def test_inline_extractor_is_available_to_requirement_hook(self):
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {
+                        "extractor": {
+                            "model": "org/extractor",
+                            "api_key": "secret",
+                        }
+                    },
+                }
+            },
+        }
         with patch(
             "sieval.cli.resolution.resolve_task_class",
-            return_value=FakeTask,
+            return_value=self.CompletionWithExtractorTask,
         ):
-            assert derive_model_type("m", None, tasks_cfg) == "chat"
+            result = resolve_config_model_types(config)
+
+        assert result.model_types_by_config == {"m": "gen"}
+
+    def test_inline_sglang_legacy_role_is_rejected_during_resolution(self):
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {
+                        "extractor": {
+                            "model": "org/extractor",
+                            "dialect": "sglang_legacy",
+                        }
+                    },
+                }
+            },
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.CompletionWithExtractorTask,
+            ),
+            pytest.raises(
+                ValueError,
+                match=r"inline extractor.*sglang_legacy.*named model",
+            ),
+        ):
+            resolve_config_model_types(config)
+
+    def test_configured_role_must_be_declared_by_requirement_hook(self):
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {"grader": {"model": "org/grader"}},
+                }
+            },
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.MisleadingCompletionTask,
+            ),
+            pytest.raises(
+                ValueError,
+                match=(
+                    r"MisleadingCompletionTask\.model_requirements_for\(\) "
+                    r"did not declare normalized model role\(s\): 'grader'"
+                ),
+            ),
+        ):
+            resolve_config_model_types(config)
+
+    def test_self_extractor_remains_task_arg_and_reuses_candidate(self):
+        from sieval.tasks.agieval_0shot_gen import AGIEvalZeroShotGenTask
+
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {"extractor": "self"},
+                }
+            },
+        }
+        with patch(
+            "sieval.cli.resolution.resolve_task_class",
+            return_value=AGIEvalZeroShotGenTask,
+        ):
+            result = resolve_config_model_types(config)
+
+        assert result.model_types_by_config == {"m": "chat"}
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("name", None),
+            ("dataset", {}),
+            ("model", None),
+            ("models_by_role", {}),
+        ],
+    )
+    def test_composition_owned_task_args_are_rejected_by_presence(self, key, value):
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {key: value},
+                }
+            },
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.MisleadingCompletionTask,
+            ),
+            pytest.raises(ValueError, match=rf"composition-owned.*{key}"),
+        ):
+            resolve_config_model_types(config)
+
+    @pytest.mark.parametrize(
+        ("role", "source"),
+        [
+            ("grader", None),
+            ("extractor", None),
+            ("extractor", "self"),
+            ("extractor", {"model": "org/extractor"}),
+        ],
+    )
+    def test_non_owner_task_cannot_configure_model_role(self, role, source):
+        from sieval.tasks.gsm8k_0shot_gen import GSM8KZeroShotGenTask
+
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {role: source},
+                }
+            },
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=GSM8KZeroShotGenTask,
+            ),
+            pytest.raises(ValueError, match=rf"model role.*{role}"),
+        ):
+            resolve_config_model_types(config)
+
+    def test_nested_inline_secret_is_absent_and_does_not_change_binding_id(self):
+        captured: list[InlineModelBinding] = []
+
+        class CapturingJudgeTask:
+            def __init__(self, *, grader=None, models_by_role=None):
+                del grader, models_by_role
+
+            @classmethod
+            def model_requirements_for(cls, context):
+                candidate = TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="capturing_judge",
+                )
+                grader = TaskModelRequirement(
+                    role="grader",
+                    binding=context.model_bindings["grader"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="capturing_judge",
+                )
+                assert isinstance(grader.binding, InlineModelBinding)
+                captured.append(grader.binding)
+                return (candidate, grader)
+
+        configs = []
+        for secret in ("SECRET-A", "SECRET-B"):
+            config = {
+                "models": {"m": {"name": "org/candidate"}},
+                "tasks": {
+                    "task": {
+                        "model": "m",
+                        "class": "fake.Task",
+                        "args": {
+                            "grader": {
+                                "model": "org/grader",
+                                "args": {
+                                    "api_key": secret,
+                                    "temperature": 0,
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+            configs.append(config)
+            with patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=CapturingJudgeTask,
+            ):
+                resolve_config_model_types(config)
+
+        first, second = captured
+        assert first.binding_id == second.binding_id
+        assert first.config == second.config
+        assert "SECRET-A" not in repr(first.config)
+        assert "SECRET-B" not in repr(second.config)
+        assert first.config["args"] == {"temperature": 0}
+        assert "SECRET-A" in repr(configs[0])
+
+    @pytest.mark.parametrize(
+        ("field", "value", "match"),
+        [
+            ("args", [], "args must be a dictionary"),
+            ("infer_args", [], "infer_args must be a dictionary"),
+            ("infer_args", {"api_key": "secret"}, "binding resources.*api_key"),
+        ],
+    )
+    def test_config_adapter_rejects_invalid_task_argument_surfaces(
+        self, field, value, match
+    ):
+        task = {"model": "m", "class": "fake.Task", field: value}
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {"task": task},
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.MisleadingCompletionTask,
+            ),
+            pytest.raises(ValueError, match=match),
+        ):
+            resolve_config_model_types(config)
+
+    def test_non_self_extractor_string_is_rejected(self):
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {"extractor": "itself"},
+                }
+            },
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.CompletionWithSelfExtractorTask,
+            ),
+            pytest.raises(ValueError, match="extractor must be 'self'"),
+        ):
+            resolve_config_model_types(config)
+
+    @pytest.mark.parametrize("tasks", [["arc"], {"arc": "Task"}])
+    def test_rejects_malformed_tasks_mapping(self, tasks):
+        with pytest.raises(ValueError, match="'tasks.*configuration must be"):
+            resolve_config_model_types({"models": {"m": {}}, "tasks": tasks})
 
     @pytest.mark.parametrize(
         "error",
         [ImportError("module not found"), AttributeError("class not found")],
     )
     def test_unresolvable_task_class_is_skipped(self, error):
-        """Validation reports import errors; derivation must not raise here."""
-        tasks_cfg = {"t1": {"model": "m", "class": "missing.Task"}}
+        config = {
+            "models": {"m": {}},
+            "tasks": {"t1": {"model": "m", "class": "missing.Task"}},
+        }
         with patch(
             "sieval.cli.resolution.resolve_task_class",
             side_effect=error,
         ):
-            assert derive_model_type("m", None, tasks_cfg) == "chat"
+            result = resolve_config_model_types(config)
+        assert result.model_types_by_config == {"m": "chat"}
 
     def test_unresolvable_task_does_not_block_resolvable_task(self):
-        """One task failing to resolve must not hide a sibling that succeeds."""
-
-        class GenTask:
-            model_type = "gen"
-
-        tasks_cfg = {
-            "bad_task": {"model": "m", "class": "bad.module.BadTask"},
-            "good_task": {"model": "m", "class": "good.module.GenTask"},
+        config = {
+            "models": {"m": {}},
+            "tasks": {
+                "bad_task": {"model": "m", "class": "bad.module.BadTask"},
+                "good_task": {"model": "m", "class": "good.module.GenTask"},
+            },
         }
 
         call_count = 0
@@ -291,13 +635,14 @@ class TestDeriveModelType:
             call_count += 1
             if call_count == 1:
                 raise ImportError("bad module")
-            return GenTask
+            return self.MisleadingCompletionTask
 
         with patch(
             "sieval.cli.resolution.resolve_task_class",
             side_effect=mock_resolve,
         ):
-            assert derive_model_type("m", None, tasks_cfg) == "gen"
+            result = resolve_config_model_types(config)
+        assert result.model_types_by_config == {"m": "gen"}
         assert call_count == 2
 
 
@@ -391,3 +736,48 @@ class TestResolveTaskClass:
             pytest.raises(ModuleNotFoundError, match="scipy"),
         ):
             resolve_task_class("SomeTask")
+
+
+class TestNormalizeInlineModelBinding:
+    """Guards on the inline-binding normalizer shared by both entry points."""
+
+    @staticmethod
+    def _config(**overrides):
+        config = {"model": "gpt-4.1", "api_base": "https://api.openai.com/v1"}
+        config.update(overrides)
+        return config
+
+    def test_non_string_key_is_rejected(self):
+        non_string_keys: dict = {1: "x", "model": "gpt-4.1"}
+        with pytest.raises(TypeError, match="keys must be strings"):
+            normalize_inline_model_binding("t", "grader", non_string_keys)
+
+    def test_non_mapping_args_is_rejected(self):
+        with pytest.raises(ValueError, match="args must be a mapping"):
+            normalize_inline_model_binding("t", "grader", self._config(args=[]))
+
+    @pytest.mark.parametrize("model", ["", None, 7])
+    def test_missing_or_empty_model_is_rejected(self, model):
+        with pytest.raises(ValueError, match="requires a non-empty 'model'"):
+            normalize_inline_model_binding("t", "grader", self._config(model=model))
+
+    @pytest.mark.parametrize("dialect", ["", None, 7])
+    def test_empty_dialect_is_rejected(self, dialect):
+        with pytest.raises(ValueError, match="dialect must be a non-empty string"):
+            normalize_inline_model_binding("t", "grader", self._config(dialect=dialect))
+
+    def test_sglang_legacy_bypass_is_rejected(self):
+        with pytest.raises(ValueError, match="sglang_legacy"):
+            normalize_inline_model_binding(
+                "t", "grader", self._config(dialect="sglang_legacy")
+            )
+
+    def test_credentials_are_kept_out_of_the_stored_config(self):
+        binding = normalize_inline_model_binding(
+            "t", "grader", self._config(api_key="sk-secret", args={"api_key": "sk-n"})
+        )
+        assert "api_key" not in binding.config
+        nested_args = binding.config["args"]
+        assert isinstance(nested_args, dict)
+        assert "api_key" not in nested_args
+        assert "sk-secret" not in binding.binding_id

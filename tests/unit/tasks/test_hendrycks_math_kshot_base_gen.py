@@ -8,7 +8,7 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.community.deepseek_math import eval_math
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.gen_model import GenModel
 from sieval.core.tasks import (
     NonRetriableSampleError,
@@ -27,34 +27,22 @@ from sieval.tasks.hendrycks_math_kshot_base_gen import (
     N_SHOT,
     HendrycksMathFewShotBaseGenTask,
 )
+from tests.conftest import HandlerTransport
 
 _FA = "\nFinal Answer: The final answer is ${}$. I hope it is correct."
 
 
 class _CapturingGenModel(GenModel):
     def __init__(self):
+        self.last_req: Request | None = None
         super().__init__(model="mock-gen", api_key="fake")
-        self.last_kwargs: dict[str, object] = {}
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(
-            model=self.meta(), texts=[f"$\\boxed{{16}}${_FA.format('16')}"]
-        )
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_req = req
+        return Response(texts=(f"$\\boxed{{16}}${_FA.format('16')}",))
 
 
 def _sample(
@@ -104,11 +92,11 @@ async def test_infer_forwards_deepseek_stop_only():
     await task.infer(
         {"prompt": "prompt"}, TaskContext(sample_id=0, raw_sample=_sample())
     )
-    # `n` rides along because it is the sampling budget rather than a decoding
-    # param; `stop` is prompt-coupled and everything else stays the caller's.
-    assert model.last_kwargs == {"n": 1, "stop": ["\nProblem:"]}
-    assert "temperature" not in model.last_kwargs
-    assert "max_tokens" not in model.last_kwargs
+    req = model.last_req
+    assert req is not None
+    # Only the DeepSeek stop is forwarded — no temperature / max_tokens / etc.
+    assert req.sampling == SamplingParams(stop=("\nProblem:",))
+    assert req.dialect_options is None
 
 
 @pytest.mark.anyio

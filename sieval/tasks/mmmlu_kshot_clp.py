@@ -64,8 +64,11 @@ from sieval.core.tasks import (
     PredictionRecord,
     PromptRecord,
     ReferenceImpl,
+    RequirementContext,
     Task,
     TaskContext,
+    TaskModelRequirement,
+    TaskRequirements,
     TaskStageOutput,
     build_judgement_record,
     build_prediction_record,
@@ -83,6 +86,7 @@ from sieval.datasets import MMMLUDatasetSample
 
 CHOICES = ("A", "B", "C", "D")
 DEFAULT_N_SHOT = 5
+DEFAULT_LOGPROBS = 100
 OFFICIAL_MISSING_LOGPROB = -100.0
 
 
@@ -198,15 +202,26 @@ class MMMLUKShotClpTask(
 ):
     """Full MMMLU evaluation with weighted locale/category/subject reporting."""
 
+    requires = TaskRequirements(
+        sampled_logprobs=True, min_top_logprobs=DEFAULT_LOGPROBS
+    )
+
+    @classmethod
+    @override
+    def model_requirements_for(
+        cls, context: RequirementContext
+    ) -> tuple[TaskModelRequirement, ...]:
+        return cls._bind_top_logprobs_requirements(context, default=DEFAULT_LOGPROBS)
+
     def __init__(
         self,
         dataset: Dataset[MMMLUDatasetSample],
-        model: Model[str],
+        model: Model,
         name: str | None = None,
         *,
         n_shot: int = DEFAULT_N_SHOT,
         fewshot_split: str = "test",
-        logprobs: int = 100,
+        logprobs: int = DEFAULT_LOGPROBS,
     ):
         if n_shot < 0:
             raise ValueError(f"n_shot must be >= 0, got {n_shot}")

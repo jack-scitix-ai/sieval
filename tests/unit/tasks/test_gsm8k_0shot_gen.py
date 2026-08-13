@@ -8,7 +8,7 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.community.deepseek_math import is_correct
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import (
     TaskContext,
@@ -23,31 +23,21 @@ from sieval.tasks.gsm8k_0shot_gen import (
     GSM8KZeroShotGenTask,
     _gold_answer,
 )
+from tests.conftest import HandlerTransport
 
 
 class _CapturingChatModel(ChatModel):
     def __init__(self, text: str):
-        super().__init__(model="mock-chat", api_key="fake")
-        self.last_kwargs: dict[str, object] = {}
+        self.last_req: Request | None = None
         self._text = text
+        super().__init__(model="mock-chat", api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(model=self.meta(), texts=[self._text])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
-    async def _alogprobs_impl(
-        self,
-        prompt,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_req = req
+        return Response(texts=(self._text,))
 
 
 def _sample(answer: str = "Solution.\n#### 42") -> GSM8KDatasetSample:
@@ -280,9 +270,10 @@ async def test_infer_injects_no_decode_params():
         _sample(), TaskContext(sample_id=0, raw_sample=_sample())
     )
     await task.infer(pre, TaskContext(sample_id=0, raw_sample=_sample()))
+    req = model.last_req
+    assert req is not None
     # `n` is the sampling budget, not a decoding param: it MUST reach the model,
-    # or `k` is validated against a budget nothing requested. Everything else
-    # stays the caller's to configure.
-    assert model.last_kwargs == {"n": 1}
-    for forbidden in ("temperature", "top_p", "max_tokens", "stop"):
-        assert forbidden not in model.last_kwargs
+    # or `k` is validated against a budget nothing requested. No decode params
+    # are injected; everything else stays the caller's to configure.
+    assert req.sampling == SamplingParams(n=1)
+    assert req.dialect_options is None

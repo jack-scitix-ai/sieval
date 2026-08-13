@@ -11,7 +11,15 @@ AI-Generated Code - Claude Opus 4.6 (Anthropic)
 
 import pytest
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import (
+    ChatInput,
+    ChatMessage,
+    ModelOutput,
+    ModelProvenance,
+    Request,
+    Response,
+    TextPart,
+)
 from sieval.core.runners.runner import TaskRunner
 from sieval.core.tasks import TaskStageOutput
 from sieval.core.tasks.consts import TaskStage
@@ -94,6 +102,20 @@ class ExplicitMetaTask(Task):
             1 for f in finals if f.feedback_result and f.feedback_result["correct"]
         )
         return {"accuracy": correct / total if total else 0.0}
+
+
+class ResponsePayloadTask(ImplicitMetaTask):
+    """Persist the provider-neutral response directly instead of its legacy view."""
+
+    async def infer(self, pre, ctx):
+        return await self.model.arun(
+            Request(
+                input=ChatInput((ChatMessage(role="user", content=(TextPart(pre),)),))
+            )
+        )
+
+    async def postprocess(self, inf, ctx):
+        return inf.texts[0].strip()
 
 
 class TestMetadataPersistence:
@@ -183,7 +205,7 @@ class TestMetadataPersistence:
 
     @pytest.mark.anyio
     async def test_metadata_disabled_not_persisted_to_disk(self, tmp_path):
-        """With record_meta=False, stage_meta must be absent from disk records."""
+        """Disabling stage metadata must not strip provenance from the payload."""
 
         dataset = MockDataset(SAMPLES)
         model = MockChatModel(answers={"What is 1+1?": "2", "What is 2+3?": "5"})
@@ -212,6 +234,40 @@ class TestMetadataPersistence:
                     f"stage_meta should be empty dict when record_meta=False, "
                     f"got {ctx.stage_meta!r}"
                 )
+                assert isinstance(ctx.infer_result, ModelOutput)
+                assert isinstance(ctx.infer_result.model["provenance"], ModelProvenance)
+
+    @pytest.mark.anyio
+    async def test_metadata_disabled_preserves_response_provenance(self, tmp_path):
+        """Response provenance is payload data, independent of TaskStageMeta."""
+
+        dataset = MockDataset(SAMPLES)
+        model = MockChatModel(answers={"What is 1+1?": "2", "What is 2+3?": "5"})
+        task = ResponsePayloadTask(
+            dataset=dataset,
+            model=model,
+            name="response_no_meta",
+        )
+        config = make_config(tmp_path, record_meta=False, record_each_stage=True)
+
+        runner = TaskRunner(task, config)
+        report = await runner.arun()
+        assert report["accuracy"] == 1.0
+
+        loader = TaskLoader(task=task, root_dir=runner.root_dir)
+        contexts = await loader.load_initial_state()
+        await loader.hydrate(
+            contexts,
+            set(),
+            include_stages={TaskStage.FINAL},
+            record_each_stage=True,
+        )
+
+        for ctx in contexts.values():
+            if ctx.stage == TaskStage.FINAL:
+                assert ctx.stage_meta == {}
+                assert isinstance(ctx.infer_result, Response)
+                assert isinstance(ctx.infer_result.provenance, ModelProvenance)
 
     @pytest.mark.anyio
     async def test_implicit_metadata_persisted_record_each_stage_false(self, tmp_path):

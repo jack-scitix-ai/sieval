@@ -40,7 +40,7 @@ AI-Generated Code - Claude Opus 4.8 (Anthropic)
 """
 
 from collections import defaultdict
-from typing import Any, override
+from typing import override
 
 from sieval.community.simple_evals.mmlu_eval import subject2category
 from sieval.core.datasets import Dataset
@@ -51,7 +51,10 @@ from sieval.core.tasks import (
     PredictionRecord,
     PromptRecord,
     ReferenceImpl,
+    RequirementContext,
     Task,
+    TaskModelRequirement,
+    TaskRequirements,
     build_judgement_record,
     build_prediction_record,
     build_prompt_record,
@@ -132,10 +135,23 @@ class MMLUFewShotCLPTask(
         dict[str, float | str],
     ]
 ):
+    requires = TaskRequirements(
+        sampled_logprobs=True, min_top_logprobs=DEFAULT_LOGPROBS
+    )
+
+    @classmethod
+    @override
+    def model_requirements_for(
+        cls, context: RequirementContext
+    ) -> tuple[TaskModelRequirement, ...]:
+        return cls._bind_top_logprobs_requirements(
+            context, default=DEFAULT_LOGPROBS, floor=len(CHOICES)
+        )
+
     def __init__(
         self,
         dataset: Dataset[MMLUDatasetSample],
-        model: Model[Any],
+        model: Model,
         name: str | None = None,
         *,
         n_shot: int = DEFAULT_N_SHOT,

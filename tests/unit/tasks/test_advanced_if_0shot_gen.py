@@ -14,7 +14,7 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.community import advanced_if as community_advanced_if
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response, UsageStats
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import (
     GRADER_OUTPUT_KEY,
@@ -26,6 +26,7 @@ from sieval.core.tasks import (
 from sieval.datasets.advanced_if import AdvancedIFDataset, AdvancedIFDatasetSample
 from sieval.tasks import advanced_if_0shot_gen
 from sieval.tasks.advanced_if_0shot_gen import AdvancedIFZeroShotGenTask
+from tests.conftest import HandlerTransport, prompt_of
 
 COMPLEX = "complex_if_single_turn_v5"
 STEERABILITY = "system_steerability_v2"
@@ -37,21 +38,17 @@ class _ScriptedChatModel(ChatModel):
     def __init__(self, reply: str, model: str = "mock"):
         super().__init__(model=model, api_key="fake")
         self._reply = reply
-        self.last_prompt = None
+        self.last_prompt: str | None = None
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        self.last_prompt = prompt
-        return ModelOutput(
-            model=self.meta(),
-            texts=[self._reply],
-            usage={"input_tokens": 40, "output_tokens": 3, "total_tokens": 43},
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
+
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_prompt = prompt_of(req)
+        return Response(
+            texts=(self._reply,) * req.sampling.n,
+            usage=UsageStats(input_tokens=40, output_tokens=3, total_tokens=43),
         )
-
-    async def _alogprobs_impl(
-        self, prompt, *, max_tokens=1, logprobs=5, echo=True, temperature=0.0, **kwargs
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
 
 
 def _sample(
@@ -149,6 +146,33 @@ def test_build_grader_accepts_mapping_and_model():
     assert isinstance(built, ChatModel)
     existing = _ScriptedChatModel(reply="{}")
     assert AdvancedIFZeroShotGenTask._build_grader(existing) is existing
+
+
+def test_constructor_accepts_composed_grader_model():
+    base, grader = _task()
+    task = AdvancedIFZeroShotGenTask(
+        base.dataset,
+        base.model,
+        models_by_role={"grader": grader},
+    )
+    assert task._grader is grader
+
+
+def test_constructor_rejects_missing_composed_grader_role():
+    base, _ = _task()
+    with pytest.raises(ValueError, match="missing the 'grader'"):
+        AdvancedIFZeroShotGenTask(base.dataset, base.model, models_by_role={})
+
+
+def test_constructor_rejects_ambiguous_grader_sources():
+    base, grader = _task()
+    with pytest.raises(ValueError, match="cannot both be supplied"):
+        AdvancedIFZeroShotGenTask(
+            base.dataset,
+            base.model,
+            grader=grader,
+            models_by_role={"grader": grader},
+        )
 
 
 # --- preprocess ---

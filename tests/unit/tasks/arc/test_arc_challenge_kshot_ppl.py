@@ -8,7 +8,15 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import (
+    CompletionInput,
+    InputScoringResult,
+    ModelOutput,
+    Request,
+    Response,
+    TokenLogprob,
+    UsageStats,
+)
 from sieval.core.models.gen_model import GenModel
 from sieval.core.tasks import EvalMode, TaskContext
 from sieval.core.tasks.meta import get_task_meta
@@ -18,6 +26,7 @@ from sieval.datasets.arc_challenge import (
 )
 from sieval.tasks.arc._base import ARC_UNCOND_CONTEXT, echoed_logprob
 from sieval.tasks.arc.arc_challenge_kshot_ppl import ARCChallengeFewShotPplTask
+from tests.conftest import HandlerTransport
 
 
 class _ScriptedGenModel(GenModel):
@@ -30,37 +39,35 @@ class _ScriptedGenModel(GenModel):
     """
 
     def __init__(self, scores: dict[str, tuple[float, float]]):
-        super().__init__(model="mock-gen", api_key="fake")
         self._scores = scores
         self.prompts: list[str] = []
+        super().__init__(model="mock-gen", api_key="fake")
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (max_tokens, temperature, kwargs)
-        assert echo is True
-        assert logprobs == 0  # ppl requests no top-k (matches hellaswag sibling)
+    async def _stub_arun(self, req: Request) -> Response:
+        if not (req.scoring.sampled_logprobs or req.scoring.input_scoring):
+            return Response(texts=("",))
+        assert isinstance(req.input, CompletionInput)
+        prompt = req.input.text
+        assert req.scoring.input_scoring is True
+        # PPL requests no alternatives, matching the HellaSwag sibling.
+        assert req.scoring.top_logprobs == 0
         self.prompts.append(prompt)
         option = prompt.split("Answer:")[-1].strip()
         cond_lp, uncond_lp = self._scores[option]
         value = uncond_lp if prompt.startswith(ARC_UNCOND_CONTEXT) else cond_lp
-        return ModelOutput(
-            model=self.meta(),
-            texts=[""],
-            logprobs_tokens=["_ctx", "_opt", "_generated"],
-            logprobs=[None, value, -99.0],
-            usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+        return Response(
+            texts=("",),
+            input_scoring=InputScoringResult(
+                token_logprobs=(
+                    TokenLogprob(token="_ctx", logprob=None),
+                    TokenLogprob(token="_opt", logprob=value),
+                )
+            ),
+            logprobs=(TokenLogprob(token="_generated", logprob=-99.0),),
+            usage=UsageStats(input_tokens=2, output_tokens=1, total_tokens=3),
         )
 
 

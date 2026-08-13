@@ -175,6 +175,8 @@ python -m pytest tests/integration/resume/test_basic.py::TestResumePartialComple
 
 All shared test infrastructure lives here — available to every test layer without any explicit import.
 
+Mock models stub at the **Transport seam** (RFC #25): each overrides `_build_default_transport()` to return a `HandlerTransport` bound to its `async _stub_arun(Request) -> Response` handler, so `agenerate` / `alogprobs` exercise the real request builders and the `Response -> ModelOutput` bridge while the wire layer stays canned. Subclass mocks override `_stub_arun` and chain via `await super()._stub_arun(req)`.
+
 ### Unit / Integration mocks
 
 | Class | Description |
@@ -183,10 +185,12 @@ All shared test infrastructure lives here — available to every test layer with
 | `MockChatModel(answers={...})` | Deterministic chat model |
 | `MockGenModel(logprob_scores={...})` | Deterministic gen model (alogprobs) |
 | `MockJudgeModel(verdict="yes")` | LLM-as-judge mock |
-| `MockCountingChatModel(answers={...})` | `MockChatModel` that counts `_agenerate_impl` calls |
+| `MockCountingChatModel(answers={...})` | `MockChatModel` that counts transport hits (`_stub_arun` calls) |
 | `MockAlwaysFailModel()` | Always raises an exception |
 | `MockFailingChatModel(fail_count=1)` | Fails N times then succeeds |
 | `MockSelectiveFailModel(fail_samples={...})` | Fails on first call for specific prompts |
+| `HandlerTransport(handler, capabilities)` | Transport double; records every lowered `Request` in `.requests` |
+| `prompt_of(req)` / `n_of(req)` | Extract the flat prompt text / sample count from a `Request` |
 | `make_config(tmp_path, **overrides)` | `TaskRunnerConfig` for unit/integration tests |
 
 ### Performance / Acceptance infrastructure
@@ -283,8 +287,7 @@ All async tests use `@pytest.mark.anyio`. Do **not** use `@pytest.mark.asyncio`.
 
 ```python
 @pytest.mark.anyio
-async def test_my_async_test(self, tmp_path):
-    ...
+async def test_my_async_test(self, tmp_path): ...
 ```
 
 ---

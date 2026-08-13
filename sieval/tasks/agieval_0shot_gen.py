@@ -45,11 +45,15 @@ from sieval.community.agieval.post_process import post_process
 from sieval.core.models import ChatModel, Model, ModelOutput
 from sieval.core.tasks import (
     EvalMode,
+    InputKind,
     JudgementRecord,
     PredictionRecord,
     PromptRecord,
     ReferenceImpl,
+    RequirementContext,
     Task,
+    TaskModelRequirement,
+    TaskRequirements,
     build_judgement_record,
     build_prediction_record,
     build_prompt_record,
@@ -219,15 +223,53 @@ class AGIEvalZeroShotGenTask(
 ):
     """AGIEval zero-shot: answer, extract, score — routed per subset."""
 
+    @classmethod
+    @override
+    def model_requirements_for(
+        cls, context: RequirementContext
+    ) -> tuple[TaskModelRequirement, ...]:
+        candidate = super().model_requirements_for(context)
+        if context.task_args.get("extractor") == _EXTRACTOR_SELF:
+            return candidate
+        extractor = cls._bind_role_requirement(
+            context,
+            "extractor",
+            TaskRequirements(input=InputKind.CHAT),
+        )
+        return candidate + extractor
+
     def __init__(
         self,
         dataset,
         model,
         name: str | None = None,
         extractor: Mapping | Model | str | None = None,
+        models_by_role: Mapping[str, Model] | None = None,
     ):
         super().__init__(dataset=dataset, model=model, name=name)
-        self._extractor = self._build_extractor(extractor, model)
+        self._extractor = self._resolve_extractor(
+            extractor,
+            model,
+            models_by_role,
+        )
+
+    @classmethod
+    def _resolve_extractor(
+        cls,
+        extractor: Mapping | Model | str | None,
+        model: Model,
+        models_by_role: Mapping[str, Model] | None,
+    ) -> Model:
+        if models_by_role is not None:
+            if extractor is not None:
+                raise ValueError("extractor and models_by_role cannot both be supplied")
+            try:
+                return models_by_role["extractor"]
+            except KeyError as exc:
+                raise ValueError(
+                    "models_by_role is missing the 'extractor' model"
+                ) from exc
+        return cls._build_extractor(extractor, model)
 
     @staticmethod
     def _build_extractor(

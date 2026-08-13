@@ -4,10 +4,19 @@ Unit tests for deployment topology data models.
 AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
+import dataclasses
+
 import pytest
 
+import sieval.infer as infer_api
+from sieval.core.models import (
+    Deployment,
+    DeploymentPlanProjection,
+    DeploymentTopology,
+    Engine,
+    ServingFacts,
+)
 from sieval.infer.topology.models import (
-    DeploymentCapabilities,
     DeploymentPlan,
     DeviceGroup,
     HardwareEnv,
@@ -20,7 +29,21 @@ from sieval.infer.topology.models import (
     ServiceBinding,
     UserHints,
     WellKnownRole,
+    deployment_plan_fingerprint,
+    deployment_plan_projection,
 )
+
+
+def test_public_api_exposes_realized_deployment_types_and_plan_projection():
+    assert infer_api.Deployment is Deployment
+    assert infer_api.DeploymentPlanProjection is DeploymentPlanProjection
+    assert infer_api.DeploymentTopology is DeploymentTopology
+    assert infer_api.Engine is Engine
+    assert infer_api.ServingFacts is ServingFacts
+    assert infer_api.deployment_plan_fingerprint is deployment_plan_fingerprint
+    assert infer_api.deployment_plan_projection is deployment_plan_projection
+    assert not hasattr(infer_api, "DeploymentCapabilities")
+
 
 # ---------- ParallelTopology ----------
 
@@ -406,33 +429,129 @@ class TestDeploymentPlan:
         assert plan.seed == DETERMINISTIC_DEFAULT_SEED
 
 
-# ---------- DeploymentCapabilities ----------
+# ---------- DeploymentPlan projection ----------
 
 
-class TestDeploymentCapabilities:
-    def test_basic_construction(self):
-        caps = DeploymentCapabilities(
-            api_base="http://localhost:8000/v1",
-            is_disaggregated=False,
-            roles=("full",),
-            total_gpus=4,
+class TestDeploymentPlanProjection:
+    @staticmethod
+    def _plan() -> DeploymentPlan:
+        return DeploymentPlan(
+            checkpoint="/models/test",
+            backend="vllm",
+            assignments=(
+                RoleAssignment(
+                    role="full",
+                    devices=DeviceGroup(count=2, gpu_model="H100"),
+                    topology=ParallelTopology(tp=2),
+                    engine_params={"dtype": "bfloat16"},
+                ),
+            ),
+            attachments=(
+                ServiceBinding(
+                    kind="kv_cache",
+                    provider="simm",
+                    address="cache:30001",
+                    options={"namespace": "eval"},
+                ),
+            ),
+            deterministic=True,
+            seed=7,
         )
-        assert caps.api_base == "http://localhost:8000/v1"
-        assert caps.is_disaggregated is False
-        assert caps.roles == ("full",)
-        assert caps.total_gpus == 4
-        assert caps.endpoints == {}
-        assert caps.metrics_url is None
 
-    def test_frozen(self):
-        caps = DeploymentCapabilities(
-            api_base="http://localhost:8000/v1",
-            is_disaggregated=False,
-            roles=("full",),
-            total_gpus=4,
+    def test_typed_and_serialized_shapes_share_fingerprint(self):
+        plan = self._plan()
+        plain = {
+            "checkpoint": "/models/test",
+            "backend": "vllm",
+            "assignments": [
+                {
+                    "role": "full",
+                    "devices": {
+                        "count": 2,
+                        "gpu_model": "H100",
+                        "host": "localhost",
+                    },
+                    "topology": {
+                        "tp": 2,
+                        "dp": 1,
+                        "pp": 1,
+                        "ep": None,
+                        "enable_dp_attention": False,
+                        "cp": None,
+                    },
+                    "replicas": 1,
+                    "engine_params": {"dtype": "bfloat16"},
+                    "scaling": None,
+                }
+            ],
+            "attachments": [
+                {
+                    "kind": "kv_cache",
+                    "provider": "simm",
+                    "address": "cache:30001",
+                    "options": {"namespace": "eval"},
+                }
+            ],
+            "deterministic": True,
+            "seed": 7,
+        }
+
+        fingerprint = deployment_plan_fingerprint(plan)
+        assert fingerprint == deployment_plan_fingerprint(plain)
+        assert fingerprint.startswith("sha256:")
+        assert deployment_plan_projection(plan).fingerprint == fingerprint
+        assert deployment_plan_projection(plan).engine_id == "vllm"
+        assert deployment_plan_projection(plan).service_roles == ("full",)
+
+    def test_fingerprint_covers_all_plan_fields(self):
+        """Every ``DeploymentPlan`` field must move the fingerprint.
+
+        The mutation map is cross-checked against ``dataclasses.fields`` rather
+        than hand-listed: a hand-listed set keeps passing after the source
+        grows a field, which is exactly how the core projection would silently
+        fall behind ``DeploymentPlan``.
+        """
+        plan = self._plan()
+        mutations: dict[str, object] = {
+            "checkpoint": "/models/other",
+            "backend": "sglang",
+            "assignments": (
+                RoleAssignment(
+                    role="prefill",
+                    devices=DeviceGroup(count=2, gpu_model="H100"),
+                    topology=ParallelTopology(tp=2),
+                    engine_params={"dtype": "bfloat16"},
+                ),
+            ),
+            "attachments": (),
+            "deterministic": False,
+            "seed": 8,
+        }
+        assert set(mutations) == {
+            field.name for field in dataclasses.fields(DeploymentPlan)
+        }, (
+            "DeploymentPlan's fields changed. Decide whether "
+            "DeploymentPlanProjection must carry the new field, then update "
+            "this mutation map."
         )
-        with pytest.raises(AttributeError):
-            caps.api_base = "other"  # type: ignore[misc]
+
+        baseline = deployment_plan_fingerprint(plan)
+        for name, value in mutations.items():
+            variant = dataclasses.replace(plan, **{name: value})
+            assert deployment_plan_fingerprint(variant) != baseline, (
+                f"{name} does not reach the plan fingerprint"
+            )
+
+    def test_mapping_order_does_not_change_fingerprint(self):
+        plain = {"backend": "vllm", "checkpoint": "/models/test"}
+        reversed_order = {"checkpoint": "/models/test", "backend": "vllm"}
+        assert deployment_plan_fingerprint(plain) == deployment_plan_fingerprint(
+            reversed_order
+        )
+
+    def test_projection_rejects_missing_engine_identity(self):
+        with pytest.raises(ValueError, match="backend must not be empty"):
+            deployment_plan_projection({"backend": ""})
 
 
 # ---------- ModelProfile ----------

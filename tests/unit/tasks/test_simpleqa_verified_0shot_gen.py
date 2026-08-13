@@ -8,7 +8,7 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.community.simpleqa_verified import aggregate_metrics, parse_grade
-from sieval.core.models import ModelOutput
+from sieval.core.models import ReasoningOutput, Request, Response, UsageStats
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import (
     RolloutJudgement,
@@ -22,6 +22,7 @@ from sieval.datasets.simpleqa_verified import (
     SimpleQAVerifiedDatasetSample,
 )
 from sieval.tasks.simpleqa_verified_0shot_gen import SimpleQAVerifiedZeroShotGenTask
+from tests.conftest import HandlerTransport
 
 
 def _graded(*grades: str):
@@ -41,7 +42,7 @@ def _graded(*grades: str):
 
 
 class _ScriptedChatModel(ChatModel):
-    """ChatModel returning a fixed reply, recording the last agenerate kwargs."""
+    """ChatModel returning a fixed reply, recording the last Request."""
 
     def __init__(
         self,
@@ -54,24 +55,24 @@ class _ScriptedChatModel(ChatModel):
         self._reply = reply
         self._finish_reason = finish_reason
         self._reasoning = reasoning
-        self.last_kwargs: dict[str, object] = {}
+        self.last_req: Request | None = None
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(
-            model=self.meta(),
-            texts=[self._reply],
-            finish_reasons=[self._finish_reason] if self._finish_reason else None,
-            reasoning_texts=[self._reasoning] if self._reasoning else None,
-            usage={"input_tokens": 40, "output_tokens": 3, "total_tokens": 43},
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
+
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_req = req
+        n = req.sampling.n
+        return Response(
+            texts=(self._reply,) * n,
+            reasoning=(
+                (ReasoningOutput(text=self._reasoning),) * n
+                if self._reasoning
+                else None
+            ),
+            usage=UsageStats(input_tokens=40, output_tokens=3, total_tokens=43),
+            finish_reasons=(self._finish_reason,) * n if self._finish_reason else None,
         )
-
-    async def _alogprobs_impl(
-        self, prompt, *, max_tokens=1, logprobs=5, echo=True, temperature=0.0, **kwargs
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
 
 
 def _sample() -> SimpleQAVerifiedDatasetSample:
@@ -124,6 +125,33 @@ def test_build_grader_accepts_mapping_and_model():
     assert SimpleQAVerifiedZeroShotGenTask._build_grader(existing) is existing
 
 
+def test_constructor_accepts_composed_grader_model():
+    base, grader = _task()
+    task = SimpleQAVerifiedZeroShotGenTask(
+        base.dataset,
+        base.model,
+        models_by_role={"grader": grader},
+    )
+    assert task._grader is grader
+
+
+def test_constructor_rejects_missing_composed_grader_role():
+    base, _ = _task()
+    with pytest.raises(ValueError, match="missing the 'grader'"):
+        SimpleQAVerifiedZeroShotGenTask(base.dataset, base.model, models_by_role={})
+
+
+def test_constructor_rejects_ambiguous_grader_sources():
+    base, grader = _task()
+    with pytest.raises(ValueError, match="cannot both be supplied"):
+        SimpleQAVerifiedZeroShotGenTask(
+            base.dataset,
+            base.model,
+            grader=grader,
+            models_by_role={"grader": grader},
+        )
+
+
 # --- preprocess: bare problem as a single user turn (no template) ---
 
 
@@ -153,7 +181,9 @@ async def test_infer_forwards_n():
     await task.infer(
         {"prompt": [{"role": "user", "content": "q"}]}, TaskContext(sample_id=0)
     )
-    assert model.last_kwargs.get("n") == 3
+    assert model.last_req is not None
+    assert model.last_req.sampling is not None
+    assert model.last_req.sampling.n == 3
 
 
 # --- feedback: grades each answer via the grader, records provenance ---

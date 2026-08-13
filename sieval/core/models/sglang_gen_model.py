@@ -1,345 +1,253 @@
-"""SglangGenModel: native sglang ``/generate`` backend for text + logprobs.
+"""Explicit one-cycle bypass for SGLang's native ``/generate`` protocol.
 
-sglang's OpenAI ``/v1/completions`` endpoint rejects ``echo=True`` together
-with ``logprobs``, so PPL-style scoring (ARC/HellaSwag read the logprob of an
-answer token appended to the prompt; CMMLU/MMLU-Base read the first output
-token's top-k) cannot go through it. This model speaks sglang's native
-``/generate`` protocol for BOTH generation and logprob extraction, so a single
-object talks one wire protocol end-to-end.
+``sglang_native`` has no executable PR-1 binder, so this facade intentionally
+does not fabricate a ``RuntimeBindingPlan`` or enter the canonical dialect
+registry.  It preserves the existing native wire implementation until PR 5
+activates that dialect, while exposing a truthful ``sglang_legacy`` identity to
+the temporary task compatibility checks.
 
-It extends ``Model[str]`` rather than ``GenModel`` deliberately: the only thing
-``GenModel`` would contribute is its OpenAI-completions ``_agenerate_impl``,
-which is a different protocol than the ``/generate`` logprob path — incidental
-reuse, not coupling. The genuinely shared infrastructure (OpenAI async client,
-limiters, ``with_args``/``meta``, the public ``agenerate``/``alogprobs``
-wrappers) lives in ``Model`` and is inherited directly.
-
-AI-Generated Code - Claude Opus 4.8 (Anthropic)
+AI-Generated Code - GPT-5.6 (OpenAI)
 """
 
-from typing import cast, override
+from types import MappingProxyType, TracebackType
+from typing import Any, Self, cast
+from uuid import uuid4
+
+import anyio
+from openai import AsyncOpenAI
 
 from sieval.core.types import JSONValue
 
-from .model import Model, ModelOutput, ModelUsage
+from .capabilities import Capability
+from .deployment import (
+    ConnectionIdentity,
+    ConnectionPool,
+    Deployment,
+    Engine,
+    ServingFacts,
+)
+from .dialect import (
+    RequestAuditError,
+    active_request_leaves,
+    validate_request_invariants,
+)
+from .dialect_registry import compatibility_factory_for
+from .ir import CompletionInput, ModelInput, Request, Response
+from .model import Model
+from .transports.sglang import (
+    SGLANG_LEGACY_DIALECT_OPTION_KEYS,
+    SglangTransport,
+)
 
-# OpenAI-style generation kwarg -> sglang sampling_params key. Only these are
-# forwarded to /generate; unrecognized kwargs (e.g. seed, stream, echo) are
-# dropped rather than risk sglang rejecting an unknown sampling param.
-_SAMPLING_PARAM_MAP: dict[str, str] = {
-    "max_tokens": "max_new_tokens",
-    "temperature": "temperature",
-    "top_p": "top_p",
-    "top_k": "top_k",
-    "min_p": "min_p",
-    "stop": "stop",
-    "frequency_penalty": "frequency_penalty",
-    "presence_penalty": "presence_penalty",
-    "repetition_penalty": "repetition_penalty",
+_SGLANG_LEGACY_LOWERED_LEAVES = frozenset(
+    {
+        "input.completion",
+        "sampling.temperature",
+        "sampling.top_p",
+        "sampling.top_k",
+        "sampling.max_tokens",
+        "sampling.stop",
+        "sampling.frequency_penalty",
+        "sampling.presence_penalty",
+        "sampling.n",
+        "scoring.input_scoring",
+        "scoring.sampled_logprobs",
+        "scoring.top_logprobs",
+    }
+)
+_SGLANG_LEGACY_NOOP_LEAVES = MappingProxyType(
+    {
+        # Native /generate is always one POST. The compatibility builder
+        # defaults stream=True, so this is an explicit scheduling-only no-op.
+        "scheduling.stream": "native /generate is a single non-streaming POST",
+        # SGLang has no per-request seed on /generate. Deterministic managed
+        # deployments pin the process seed through DeploymentPlan.seed and
+        # --random-seed; external deployments remain explicitly best-effort.
+        "sampling.seed": (
+            "native /generate has no per-request seed; managed deterministic "
+            "serving pins DeploymentPlan.seed at engine startup"
+        ),
+    }
+)
+_SGLANG_LEGACY_CANONICAL_OPTION_OWNERS = {
+    "max_tokens": "sampling.max_tokens",
+    "temperature": "sampling.temperature",
+    "top_p": "sampling.top_p",
+    "top_k": "sampling.top_k",
+    "stop": "sampling.stop",
+    "frequency_penalty": "sampling.frequency_penalty",
+    "presence_penalty": "sampling.presence_penalty",
 }
 
 
-def _request_params(body: dict[str, JSONValue]) -> dict[str, JSONValue]:
-    """Return the persisted request params: the /generate body minus the prompt.
+def _validate_legacy_request_leaves(req: Request) -> None:
+    """Reject every active leaf the temporary native transport cannot lower."""
 
-    ``body["text"]`` is the full prompt, already recorded as the sample input —
-    copying it verbatim into every per-call record would duplicate it. This
-    shape is sglang-native (``sampling_params`` etc.) and intentionally differs
-    from the OpenAI-flavoured ``GenModel``/``ChatModel`` request_params; the
-    client/protocol decoupling that would unify them is tracked in RFC #25.
-    """
-    return {k: v for k, v in body.items() if k != "text"}
-
-
-def _normalize_token_text(text: str | None) -> str:
-    """Map GPT-2 byte-level BPE markers back to literal whitespace.
-
-    sglang detokenizes when ``return_text_in_logprobs=True``, but some
-    tokenizers (e.g. Qwen) surface the raw byte-level markers ``Ġ`` (space)
-    and ``Ċ`` (newline). ``extract_option_logprob`` matches ``" A"`` /
-    ``A`` and CMMLU keys its top-k on the token text, so an un-normalized
-    ``"ĠA"`` would silently never match and the prediction would degrade.
-    Normalize here so downstream scoring is fed the same token text the
-    OpenAI path would produce.
-
-    ``text`` is ``None`` when the server did not detokenize the logprobs
-    (a server launched with ``--skip-tokenizer-init`` ignores
-    ``return_text_in_logprobs``). Letter/option scoring cannot work without
-    token text, so fail loud with an actionable message rather than crash on
-    ``None.replace`` or silently degrade every token to ``""``.
-
-    Limitation: only GPT-2 byte-level markers are handled. SentencePiece
-    (``▁``, U+2581) and other tokenizer conventions pass through unchanged —
-    add them here if a tokenizer that uses them needs the same contract.
-    """
-    if text is None:
-        raise RuntimeError(
-            "sglang returned a logprob entry with no token text; option/letter "
-            "scoring needs detokenized text. Do not launch sglang with "
-            "--skip-tokenizer-init (it ignores return_text_in_logprobs)."
-        )
-    return text.replace("Ġ", " ").replace("Ċ", "\n")
-
-
-class SglangGenModel(Model[str]):
-    """Model backend reading text and logprobs from sglang native ``/generate``.
-
-    AI-Generated Code - Claude Opus 4.8 (Anthropic)
-    """
-
-    def _generate_url(self) -> str:
-        """Derive the native ``/generate`` URL from the OpenAI ``/v1`` base."""
-        base = (self._api_base or "").rstrip("/").removesuffix("/v1").rstrip("/")
-        return f"{base}/generate"
-
-    async def _post(self, body: dict[str, JSONValue]) -> dict | list:
-        """POST ``body`` to ``/generate`` via the OpenAI client.
-
-        Reuses the OpenAI SDK's low-level ``self._client.post`` to speak the
-        native ``/generate`` protocol: this keeps the configured auth and
-        ``max_retries``, and an absolute URL is required because the client
-        would otherwise append the path to the ``/v1`` base. It couples us to
-        an SDK-internal surface — the client/protocol decoupling is tracked in
-        RFC #25. Returns the parsed JSON (a dict, or a list when
-        ``sampling_params.n > 1``).
-        """
-        return cast(
-            "dict | list",
-            await self._client.post(self._generate_url(), cast_to=object, body=body),
+    options = req.dialect_options
+    if options is not None and options.dialect_id != "sglang_legacy":
+        raise RequestAuditError(
+            f"dialect options target {options.dialect_id!r}, but the legacy "
+            "model is bound to 'sglang_legacy'"
         )
 
-    @staticmethod
-    def _validate_n(final_kwargs: dict) -> int:
-        """Validate and return ``n`` (mirrors GenModel's guard)."""
-        n = final_kwargs.get("n", 1)
-        if isinstance(n, bool) or not isinstance(n, int):
-            raise TypeError(f"n must be an int, got {type(n).__name__}: {n!r}")
-        if n < 1:
-            raise ValueError(f"n must be >= 1, got {n}")
-        return n
+    active = active_request_leaves(req)
+    rejected: list[str] = []
+    for path, value in active.items():
+        if path in _SGLANG_LEGACY_LOWERED_LEAVES:
+            continue
+        if path in _SGLANG_LEGACY_NOOP_LEAVES or path == "dialect_options":
+            continue
+        if not path.startswith("dialect_options."):
+            rejected.append(path)
+            continue
 
-    @classmethod
-    def _sampling_params(
-        cls, final_kwargs: dict, *, temperature: float | None = None
-    ) -> dict[str, JSONValue]:
-        """Translate recognized OpenAI-style kwargs into sglang sampling_params."""
-        params: dict[str, JSONValue] = {}
-        for src, dst in _SAMPLING_PARAM_MAP.items():
-            if src in final_kwargs and final_kwargs[src] is not None:
-                params[dst] = final_kwargs[src]
-        if temperature is not None:
-            params["temperature"] = temperature
-        return params
+        key = path.removeprefix("dialect_options.")
+        if key not in SGLANG_LEGACY_DIALECT_OPTION_KEYS:
+            rejected.append(path)
+            continue
+        owner = _SGLANG_LEGACY_CANONICAL_OPTION_OWNERS.get(key)
+        if owner is not None:
+            rejected.append(f"{path} (use canonical request leaf {owner})")
+            continue
+        if value is None:
+            rejected.append(f"{path} (null values are not lowered)")
+            continue
 
-    @staticmethod
-    def _finish_reason(meta: dict) -> str:
-        """Extract a flat finish-reason string from sglang ``meta_info``."""
-        fr = meta.get("finish_reason")
-        if isinstance(fr, dict):
-            return str(fr.get("type", ""))
-        return str(fr) if fr else ""
+    if options is not None and {"prefill", "prefix"} <= set(options.values):
+        rejected.append("dialect_options.prefix (duplicates dialect_options.prefill)")
 
-    @staticmethod
-    def _parse_logprobs(meta: dict, echo: bool) -> tuple[list[str], list[float | None]]:
-        """Flatten sglang ``*_token_logprobs`` into token-text + logprob lists.
+    if rejected:
+        raise RequestAuditError(
+            "sglang_legacy cannot lower request leaves: " + ", ".join(sorted(rejected))
+        )
 
-        Each entry is ``[logprob, token_id, token_text]`` (first input
-        logprob is ``None``). With ``echo`` the input segment precedes the
-        output segment so echoed candidate tokens land at the sequence end.
-        """
-        entries: list[list] = []
-        if echo:
-            entries.extend(meta.get("input_token_logprobs") or [])
-        entries.extend(meta.get("output_token_logprobs") or [])
 
-        tokens: list[str] = []
-        token_logprobs: list[float | None] = []
-        for logprob, _token_id, token_text in entries:
-            tokens.append(_normalize_token_text(token_text))
-            token_logprobs.append(logprob)
-        return tokens, token_logprobs
+class SglangGenModel(Model):
+    """Legacy native SGLang facade, deliberately outside canonical binding."""
 
-    @staticmethod
-    def _parse_top_logprobs(meta: dict, echo: bool) -> list[dict[str, float]] | None:
-        """Flatten sglang ``*_top_logprobs`` into ``[{token: logprob}, ...]``.
+    def __new__(cls, *args: object, **kwargs: object) -> Any:
+        if cls is SglangGenModel:
+            factory = compatibility_factory_for("sglang_native")
+            if factory is not None:
+                return factory(*args, **kwargs)
+        return super().__new__(cls)
 
-        Aligns index-for-index with the token list from ``_parse_logprobs``
-        (input segment first when ``echo``). A ``None``/empty per-token entry
-        (e.g. the first input token) becomes ``{}``. Returns ``None`` when the
-        server sent no top-k at all, matching ``ModelOutput.top_logprobs``'s
-        optional shape. CMMLU keys A/B/C/D off ``top_logprobs[0]``.
-
-        Distinct token ids can normalize to identical text (e.g. a byte-level
-        ``"ĠA"`` and a literal ``" A"`` both → ``" A"``). Coalescing them by
-        keeping the highest logprob prevents a low-probability duplicate from
-        clobbering the real one, matching CMMLU's max-over-strip semantics.
-        """
-        entries: list = []
-        if echo:
-            entries.extend(meta.get("input_top_logprobs") or [])
-        entries.extend(meta.get("output_top_logprobs") or [])
-        if not entries:
-            return None
-
-        result: list[dict[str, float]] = []
-        for per_token in entries:
-            if not per_token:
-                result.append({})
-                continue
-            merged: dict[str, float] = {}
-            for logprob, _token_id, token_text in per_token:
-                key = _normalize_token_text(token_text)
-                if key not in merged or logprob > merged[key]:
-                    merged[key] = logprob
-            result.append(merged)
-        return result
-
-    @staticmethod
-    def _parse_usage(meta: dict) -> ModelUsage | None:
-        """Build ``ModelUsage`` from sglang ``meta_info`` token counts."""
-        input_tokens = meta.get("prompt_tokens")
-        output_tokens = meta.get("completion_tokens")
-        if input_tokens is None or output_tokens is None:
-            return None
-        return {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-        }
-
-    @override
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        if not isinstance(prompt, str):
-            raise TypeError("SglangGenModel requires a string prompt.")
-
-        final_kwargs = {**self._kwargs, **kwargs}
-        num_choices = self._validate_n(final_kwargs)
-
-        # Cross-engine parity note: with max_tokens unset no max_new_tokens is
-        # sent, so sglang applies its own default (128) while the vllm/OpenAI
-        # completions path applies the OpenAI default. Set max_tokens explicitly
-        # for identical output length when flipping engine: vllm <-> sglang.
-        sampling = self._sampling_params(final_kwargs)
-        if num_choices > 1:
-            sampling["n"] = num_choices
-
-        body: dict[str, JSONValue] = {"text": prompt, "sampling_params": sampling}
-        raw = await self._post(body)
-
-        # n>1 yields a list of per-sample dicts; n==1 a single dict.
-        results = raw if isinstance(raw, list) else [raw]
-        if not results or not all(
-            isinstance(r, dict) and "meta_info" in r for r in results
-        ):
-            raise RuntimeError(
-                "sglang /generate returned an unexpected response shape "
-                "(missing meta_info)."
-            )
-        texts = [r.get("text", "") for r in results]
-        metas = [r["meta_info"] for r in results]
-        finish_reasons = [self._finish_reason(m) for m in metas]
-
-        # Prompt tokens are shared across samples; completions sum.
-        input_tokens = metas[0].get("prompt_tokens")
-        output_tokens = sum(m.get("completion_tokens") or 0 for m in metas)
-        usage: ModelUsage | None = (
-            {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-            }
-            if input_tokens is not None
+    def __init__(
+        self,
+        model: str,
+        api_base: str | None = None,
+        api_key: str | None = None,
+        max_retries: int = 3,
+        concurrency_limit: int | None = None,
+        parent_limiter: anyio.CapacityLimiter | None = None,
+        extra: dict[str, JSONValue] | None = None,
+        transport: SglangTransport | None = None,
+        **kwargs: object,
+    ) -> None:
+        self._model = model
+        self._api_base = api_base
+        self._client = AsyncOpenAI(
+            base_url=api_base,
+            api_key=api_key,
+            max_retries=max_retries,
+        )
+        self._kwargs = dict(kwargs)
+        self._extra = dict(extra) if extra is not None else None
+        self._parent_limiter = parent_limiter
+        self._limiter = (
+            anyio.CapacityLimiter(concurrency_limit)
+            if concurrency_limit is not None
             else None
         )
+        endpoint = str(self._client.base_url).rstrip("/")
+        shared_limiter = parent_limiter if parent_limiter is not None else self._limiter
+        private_scope = uuid4().hex
+        identity = ConnectionIdentity(
+            endpoint=endpoint,
+            connection_family="openai_sdk",
+            credential_scope=(
+                f"legacy-private:{private_scope}:explicit-credential"
+                if api_key is not None
+                else f"legacy-private:{private_scope}:environment-credential"
+            ),
+            retry_policy=f"openai-sdk:max-retries={max_retries}",
+            quota_scope=f"legacy-private:{private_scope}",
+        )
+        self._deployment = Deployment(
+            deployment_id=None,
+            plan=None,
+            engine=Engine("sglang"),
+            engine_source="config",
+            api_base=endpoint,
+            endpoints={},
+            topology=None,
+            metrics_url=None,
+            facts=ServingFacts(),
+        )
+        self._pool = ConnectionPool(self._client, identity, shared_limiter)
+        legacy_transport = (
+            transport if transport is not None else self._build_default_transport()
+        )
+        self._legacy_transport = legacy_transport
+        self._transport = cast(Any, legacy_transport)
+        self._lifecycle_owner = self
 
-        return ModelOutput(
-            model=self.meta(),
-            texts=texts,
-            finish_reasons=finish_reasons,
-            usage=usage,
-            request_params=_request_params(body),
-            response_model=self._model,
+    def _build_default_transport(self) -> SglangTransport:
+        return SglangTransport(self._client, self._model, self._api_base)
+
+    @property
+    def dialect_id(self) -> str:
+        return "sglang_legacy"
+
+    @property
+    def runtime_plan(self) -> None:
+        return None
+
+    @property
+    def capabilities(self) -> frozenset[Capability]:
+        return self._legacy_transport.capabilities
+
+    def _coerce_input(self, prompt: object) -> ModelInput:
+        if isinstance(prompt, CompletionInput):
+            return prompt
+        if isinstance(prompt, str):
+            return CompletionInput(prompt)
+        raise TypeError("SglangGenModel prompt must be text or CompletionInput")
+
+    async def arun(self, req: Request) -> Response:
+        if not isinstance(req, Request):
+            raise TypeError(f"arun requires Request, got {type(req).__name__}")
+        validate_request_invariants(req)
+        _validate_legacy_request_leaves(req)
+        async with self._pool.acquire(self._limiter):
+            return await self._legacy_transport.arun(req)
+
+    def with_dialect(self, dialect_id: str, runtime_plan: Any) -> Model:
+        del dialect_id, runtime_plan
+        raise RuntimeError(
+            "sglang_legacy cannot rebind before the sglang_native PR-5 binder"
         )
 
-    @override
-    async def _alogprobs_impl(
+    def _legacy_lifecycle_owner(self) -> "SglangGenModel":
+        owner = self._lifecycle_owner
+        if not isinstance(owner, SglangGenModel):
+            raise RuntimeError("sglang_legacy binding has no lifecycle owner")
+        return owner
+
+    async def aclose(self) -> None:
+        owner = self._legacy_lifecycle_owner()
+        await owner._pool.aclose()
+
+    async def __aenter__(self) -> Self:
+        owner = self._legacy_lifecycle_owner()
+        await owner._pool.__aenter__()
+        return self
+
+    async def __aexit__(
         self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        final_kwargs = {**self._kwargs, **kwargs}
-        num_choices = self._validate_n(final_kwargs)
-        if num_choices > 1:
-            raise ValueError(f"alogprobs only supports n=1; received n={num_choices}")
-
-        sampling = self._sampling_params(final_kwargs, temperature=temperature)
-        # sglang rejects max_new_tokens=0; the generated token is ignored for
-        # scoring but at least one is required.
-        sampling["max_new_tokens"] = max(max_tokens, 1)
-
-        body: dict[str, JSONValue] = {
-            "text": prompt,
-            "sampling_params": sampling,
-            "return_logprob": True,
-            # 0 → all echoed input token logprobs; -1 → output only.
-            "logprob_start_len": 0 if echo else -1,
-            "top_logprobs_num": logprobs,
-            "return_text_in_logprobs": True,
-        }
-
-        data = await self._post(body)
-        if not isinstance(data, dict):
-            raise RuntimeError(
-                f"sglang /generate returned {type(data).__name__}, expected an object."
-            )
-        meta = data["meta_info"]
-
-        # sglang's radix prefix cache does not recompute logprobs for cached
-        # positions: on a cache hit it truncates input_token_logprobs to
-        # (prompt_tokens - cached_tokens). echo-based scoring reads the full
-        # echoed input sequence, so a truncated set would score silently wrong
-        # (vLLM errors in this case; sglang stays silent). Deliberate stance:
-        # ANY cache touch — or a response we can't verify against because it
-        # omitted prompt_tokens — is untrusted, so fail loud. echo-based scoring
-        # requires launching sglang with --disable-radix-cache.
-        if echo:
-            input_lps = meta.get("input_token_logprobs") or []
-            prompt_tokens = meta.get("prompt_tokens")
-            cached_tokens = meta.get("cached_tokens") or 0
-            if prompt_tokens is None:
-                raise RuntimeError(
-                    "sglang response omitted prompt_tokens, so echoed-input "
-                    "completeness cannot be verified; refusing to score silently. "
-                    "Launch sglang with --disable-radix-cache."
-                )
-            if cached_tokens or len(input_lps) != prompt_tokens:
-                raise RuntimeError(
-                    "sglang returned partial echoed-input logprobs "
-                    f"({len(input_lps)} of {prompt_tokens} prompt tokens, "
-                    f"cached_tokens={cached_tokens}): its radix prefix cache does "
-                    "not recompute logprobs for cached positions, so echo-based "
-                    "scoring would be silently wrong. Launch sglang with "
-                    "--disable-radix-cache."
-                )
-
-        tokens, token_logprobs = self._parse_logprobs(meta, echo)
-        top_logprobs = self._parse_top_logprobs(meta, echo)
-        if not token_logprobs and not top_logprobs:
-            raise RuntimeError("sglang /generate returned no logprobs.")
-
-        return ModelOutput(
-            model=self.meta(),
-            texts=[data.get("text", "")],
-            finish_reasons=[self._finish_reason(meta)],
-            logprobs_tokens=tokens,
-            logprobs=token_logprobs,
-            top_logprobs=top_logprobs,
-            usage=self._parse_usage(meta),
-            request_params=_request_params(body),
-            response_model=self._model,
-        )
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        await self.aclose()

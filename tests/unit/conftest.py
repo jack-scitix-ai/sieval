@@ -4,10 +4,19 @@ Shared fixtures for unit tests.
 AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
+import os
+
 import pytest
 
 from sieval.core.models.model import ModelMeta, ModelOutput, ModelUsage
 from sieval.core.tasks.context import TaskContext, TaskStageMeta
+
+# scripts/ tests are repo-hygiene checks (preflight, layer imports) that run
+# tooling against the LIVE repo tree. Inside mutmut's mutants/ sandbox that
+# tree is a partial copy, so they fail spuriously — and they exercise no
+# sieval/core mutants. Skip collecting them under mutation testing only
+# (mutmut sets MUTANT_UNDER_TEST for every pytest run it drives).
+collect_ignore = ["scripts"] if os.environ.get("MUTANT_UNDER_TEST") else []
 
 
 @pytest.fixture

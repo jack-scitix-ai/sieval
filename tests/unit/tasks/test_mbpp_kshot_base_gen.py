@@ -1,8 +1,13 @@
+"""Unit tests for the MBPP k-shot base-gen task.
+
+AI-Generated Code - Claude Fable 5 (Anthropic)
+"""
+
 import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.gen_model import GenModel
 from sieval.core.tasks import (
     TaskContext,
@@ -11,6 +16,7 @@ from sieval.core.tasks import (
 )
 from sieval.datasets.mbpp import MBPPDataset, MBPPDatasetSample
 from sieval.tasks.mbpp_kshot_base_gen import MBPPFewShotBaseGenTask
+from tests.conftest import HandlerTransport
 
 
 def _judgement(*rollouts: tuple[bool, str]):
@@ -26,26 +32,15 @@ def _judgement(*rollouts: tuple[bool, str]):
 
 class _CapturingGenModel(GenModel):
     def __init__(self):
+        self.last_req: Request | None = None
         super().__init__(model="mock-gen", api_key="fake")
-        self.last_kwargs: dict[str, object] = {}
 
-    async def _agenerate_impl(self, prompt: str, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(model=self.meta(), texts=["def f():\n    pass\n[DONE]"])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_completions")
 
-    async def _alogprobs_impl(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 1,
-        logprobs: int = 5,
-        echo: bool = True,
-        temperature: float = 0.0,
-        **kwargs,
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_req = req
+        return Response(texts=("def f():\n    pass\n[DONE]",) * req.sampling.n)
 
 
 def _sample() -> MBPPDatasetSample:
@@ -113,11 +108,12 @@ async def test_infer_forwards_n_and_stop_but_not_decoding_params():
     result = await task.infer({"prompt": "prompt"}, TaskContext(0, _sample()))
     await task.shutdown()
 
-    assert result.texts == ["def f():\n    pass\n[DONE]"]
-    assert model.last_kwargs["n"] == 3
-    assert model.last_kwargs["stop"] == ["[DONE]"]
+    assert result.texts == ["def f():\n    pass\n[DONE]"] * 3
+    req = model.last_req
+    assert req is not None
     # Decoding params stay in the model layer; the task must not inject them.
-    assert "max_tokens" not in model.last_kwargs
+    assert req.sampling == SamplingParams(stop=("[DONE]",), n=3)
+    assert req.dialect_options is None
 
 
 def test_k_above_n_raises():

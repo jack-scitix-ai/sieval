@@ -8,6 +8,7 @@ AI-Generated Code - Claude Opus 5 (1M context) (Anthropic)
 """
 
 from typing import cast
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from datasets import Dataset as HFDataset
@@ -15,7 +16,14 @@ from datasets import DatasetDict as HFDatasetDict
 
 from sieval.community.agieval.dataset_loader import MATH_SUBSETS
 from sieval.community.agieval.evaluation import LEADERBOARD_EN_MCQ_SUBSETS
-from sieval.core.models import ModelOutput
+from sieval.core.models import (
+    ChatInput,
+    ChatMessage,
+    ModelOutput,
+    Request,
+    Response,
+    TextPart,
+)
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import (
     TaskContext,
@@ -30,28 +38,34 @@ from sieval.core.tasks.metrics import (
 )
 from sieval.datasets.agieval import AGIEvalDataset, AGIEvalDatasetSample
 from sieval.tasks.agieval_0shot_gen import AGIEvalZeroShotGenTask
+from tests.conftest import HandlerTransport
 
 
 class _ScriptedChatModel(ChatModel):
-    """Replies with ``reply``, recording each prompt and each resolved kwarg set."""
+    """Replies with ``reply`` and records each canonical request."""
 
     def __init__(self, name: str = "mock-chat", reply: str = "The answer is D", **args):
-        super().__init__(model=name, api_key="fake", **args)
         self.reply = reply
-        self.prompts: list = []
-        self.resolved: list[dict] = []
+        self.requests: list[Request] = []
+        super().__init__(model=name, api_key="fake", **args)
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        self.prompts.append(prompt)
-        # The merge ChatModel._agenerate_impl performs: configured model args
-        # first, call-site kwargs last, so the call site wins.
-        resolved = {**self._kwargs, **kwargs}
-        self.resolved.append(resolved)
-        return ModelOutput(model=self.meta(), texts=[self.reply] * resolved.get("n", 1))
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.requests.append(req)
+        return Response(texts=(self.reply,) * req.sampling.n)
+
+
+def _chat_messages(req: Request) -> tuple[ChatMessage, ...]:
+    assert isinstance(req.input, ChatInput)
+    return req.input.messages
+
+
+def _message_text(message: ChatMessage) -> str:
+    text_parts = [part for part in message.content if isinstance(part, TextPart)]
+    assert len(text_parts) == len(message.content)
+    return "".join(part.text for part in text_parts)
 
 
 def _sample(subset: str = "sat-math", **overrides) -> AGIEvalDatasetSample:
@@ -119,12 +133,13 @@ async def test_infer_runs_two_stages_and_returns_both_outputs():
     # Both calls come back, so the runner profiles both and the first stage's
     # reasoning stays on disk.
     assert len(outputs) == 2
-    assert len(model.prompts) == 2
+    assert len(model.requests) == 2
     # Stage 2 re-sends the stage-1 prompt + reply + the family extraction cue,
     # under the same system turn upstream sends on both calls.
-    assert [m["role"] for m in model.prompts[1]] == ["system", "user"]
-    assert model.prompts[1][0]["content"] == "You are a helpful AI assistant."
-    stage2 = model.prompts[1][1]["content"]
+    stage2_messages = _chat_messages(model.requests[1])
+    assert [message.role for message in stage2_messages] == ["system", "user"]
+    assert _message_text(stage2_messages[0]) == "You are a helpful AI assistant."
+    stage2 = _message_text(stage2_messages[1])
     # The QUESTION, not the system turn: stage 2's context is selected by role.
     assert stage2.startswith("Q: Q? Answer Choices:")
     assert "I think it is D" in stage2
@@ -140,26 +155,29 @@ async def test_infer_routes_stage_two_to_the_extractor_when_given():
 
     outputs = await task.infer(pre, TaskContext(sample_id=0))
 
-    assert len(answerer.prompts) == 1 and len(extractor.prompts) == 1
+    assert len(answerer.requests) == 1 and len(extractor.requests) == 1
     assert outputs[1].texts == [" D"]
 
 
 @pytest.mark.anyio
 async def test_infer_carries_an_empty_first_stage_reply_into_stage_two():
-    class _Empty(_ScriptedChatModel):
-        async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-            _ = kwargs
-            self.prompts.append(prompt)
-            return ModelOutput(model=self.meta(), texts=[])
-
-    model = _Empty()
+    model = _ScriptedChatModel()
+    generate = AsyncMock(
+        side_effect=(
+            ModelOutput(model=model.meta(), texts=[]),
+            ModelOutput(model=model.meta(), texts=[""]),
+        )
+    )
     task = _task(model)
     pre = await task.preprocess(_sample(), TaskContext(sample_id=0))
 
     # Upstream feeds "" onward rather than dropping the sample.
-    outputs = await task.infer(pre, TaskContext(sample_id=0))
+    with patch.object(model, "agenerate", generate):
+        outputs = await task.infer(pre, TaskContext(sample_id=0))
+
     assert len(outputs) == 2
-    assert model.prompts[1][1]["content"].endswith(
+    stage2_prompt = generate.await_args_list[1].args[0]
+    assert stage2_prompt[1]["content"].endswith(
         "\n\nTherefore, among A through E, the answer is"
     )
 
@@ -205,7 +223,7 @@ async def test_infer_pins_n_to_one_on_both_calls():
 
     outputs = await task.infer(pre, TaskContext(sample_id=0))
 
-    assert [resolved["n"] for resolved in model.resolved] == [1, 1]
+    assert [req.sampling.n for req in model.requests] == [1, 1]
     assert [len(out.texts) for out in outputs] == [1, 1]
 
 
@@ -218,21 +236,21 @@ async def test_infer_rejects_a_backend_that_ignored_n():
     stops stage 2 from billing for rollouts that scoring would drop.
     """
 
-    class _IgnoresN(_ScriptedChatModel):
-        async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-            _ = kwargs
-            self.prompts.append(prompt)
-            return ModelOutput(model=self.meta(), texts=["A", "B", "C", "D"])
-
-    model = _IgnoresN()
+    model = _ScriptedChatModel()
+    generate = AsyncMock(
+        return_value=ModelOutput(model=model.meta(), texts=["A", "B", "C", "D"])
+    )
     task = _task(model)
     pre = await task.preprocess(_sample(), TaskContext(sample_id=0))
 
-    with pytest.raises(ValueError, match="backend ignored `n=1`"):
+    with (
+        patch.object(model, "agenerate", generate),
+        pytest.raises(ValueError, match="backend ignored `n=1`"),
+    ):
         await task.infer(pre, TaskContext(sample_id=0))
 
     # Raised on stage 1, so stage 2 was never called.
-    assert len(model.prompts) == 1
+    assert generate.await_count == 1
 
 
 def test_extractor_is_required():
@@ -261,12 +279,45 @@ def test_extractor_self_runs_stage_two_on_the_model_under_test():
     assert task._extractor is model
 
 
+def test_constructor_accepts_composed_extractor_model():
+    base = _task()
+    extractor = _ScriptedChatModel("extractor")
+
+    task = AGIEvalZeroShotGenTask(
+        base.dataset,
+        base.model,
+        models_by_role={"extractor": extractor},
+    )
+
+    assert task._extractor is extractor
+
+
+def test_constructor_rejects_missing_composed_extractor_role():
+    base = _task()
+
+    with pytest.raises(ValueError, match="missing the 'extractor'"):
+        AGIEvalZeroShotGenTask(base.dataset, base.model, models_by_role={})
+
+
+def test_constructor_rejects_ambiguous_extractor_sources():
+    base = _task()
+    extractor = _ScriptedChatModel("extractor")
+
+    with pytest.raises(ValueError, match="cannot both be supplied"):
+        AGIEvalZeroShotGenTask(
+            base.dataset,
+            base.model,
+            extractor=extractor,
+            models_by_role={"extractor": extractor},
+        )
+
+
 @pytest.mark.anyio
 async def test_postprocess_parses_the_second_stage_reply():
     task = _task()
     inf = [
-        ModelOutput(model=None, texts=["long reasoning about A and B"]),  # type: ignore[invalid-argument-type]
-        ModelOutput(model=None, texts=[" D."]),  # type: ignore[invalid-argument-type]
+        ModelOutput(model=None, texts=["long reasoning about A and B"]),  # ty: ignore[invalid-argument-type]
+        ModelOutput(model=None, texts=[" D."]),  # ty: ignore[invalid-argument-type]
     ]
     post = await task.postprocess(inf, TaskContext(sample_id=0, raw_sample=_sample()))
 

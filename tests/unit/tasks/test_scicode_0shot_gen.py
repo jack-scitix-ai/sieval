@@ -9,8 +9,9 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.community.scicode import build_test_program, encode_targets
-from sieval.core.models import ModelOutput
+from sieval.core.models import ChatInput, Request, Response, TextPart
 from sieval.core.models.chat_model import ChatModel
+from sieval.core.models.dialect import OutputContractError
 from sieval.core.tasks import (
     PredictionRecord,
     TaskContext,
@@ -21,9 +22,27 @@ from sieval.core.tasks import (
 )
 from sieval.datasets.scicode import SciCodeDataset
 from sieval.tasks.scicode_0shot_gen import SciCodeZeroShotGenTask
+from tests.conftest import HandlerTransport
 
 # h5py is an optional (scicode-group) dependency; skip the whole module without it.
 h5py = pytest.importorskip("h5py")
+
+
+def _legacy_prompt(req: Request) -> list[dict[str, str]]:
+    """Recover this task's text-only legacy message shape from the IR."""
+
+    assert isinstance(req.input, ChatInput)
+    messages: list[dict[str, str]] = []
+    for message in req.input.messages:
+        text_parts = [part for part in message.content if isinstance(part, TextPart)]
+        assert len(text_parts) == len(message.content)
+        messages.append(
+            {
+                "role": message.role,
+                "content": "".join(part.text for part in text_parts),
+            }
+        )
+    return messages
 
 
 class _ScriptedChatModel(ChatModel):
@@ -32,19 +51,20 @@ class _ScriptedChatModel(ChatModel):
     def __init__(self, replies: list[str], model: str = "candidate"):
         super().__init__(model=model, api_key="fake")
         self._replies = list(replies)
-        self.prompts: list = []
+        self.prompts: list[list[dict[str, str]]] = []
         self.last_kwargs: dict[str, object] = {}
         self.calls = 0
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        self.prompts.append(prompt)
-        self.last_kwargs = dict(kwargs)
-        self.calls += 1
-        return ModelOutput(model=self.meta(), texts=[self._replies.pop(0)])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
-    async def _alogprobs_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = (prompt, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.prompts.append(_legacy_prompt(req))
+        # SciCode deliberately passes n=1 on every step. Keep that explicit
+        # call-site contract observable even though one is also the IR default.
+        self.last_kwargs = {"n": req.sampling.n}
+        self.calls += 1
+        return Response(texts=(self._replies.pop(0),))
 
 
 def _code_reply(fn: str) -> str:
@@ -309,15 +329,15 @@ async def test_infer_flags_empty_extraction_when_model_returns_no_code():
 
 
 @pytest.mark.anyio
-async def test_infer_survives_empty_choices_response():
-    # An aborted/filtered response can carry an empty `texts` list. infer() must
-    # treat it as an empty extraction (raw_response="") rather than IndexError
-    # on texts[0], which would fail the whole problem at the pipeline level.
+async def test_infer_rejects_empty_choices_response():
+    # A provider that omits the requested choice violates the model-layer output
+    # contract. Fail before SciCode can turn that protocol error into an ordinary
+    # empty extraction and score it as though the provider returned text.
     class _EmptyChoicesModel(_ScriptedChatModel):
-        async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-            self.prompts.append(prompt)
+        async def _stub_arun(self, req: Request) -> Response:
+            self.prompts.append(_legacy_prompt(req))
             self.calls += 1
-            return ModelOutput(model=self.meta(), texts=[])
+            return Response(texts=())
 
     sub_steps = [_substep("6.1", "def only_step():", ["assert only_step() == 1"])]
     task = _task(_EmptyChoicesModel([]))
@@ -327,10 +347,8 @@ async def test_infer_survives_empty_choices_response():
         "sub_steps": sub_steps,
     }
 
-    _pre, boxed = await _run_infer(task, raw)
-    step = boxed.value[0]
-    assert step["raw_response"] == ""
-    assert step["empty_extraction"] is True
+    with pytest.raises(OutputContractError, match="expected 1 choices, received 0"):
+        await _run_infer(task, raw)
 
 
 # --- postprocess: h5 targets inlined into a self-contained, runnable program ---

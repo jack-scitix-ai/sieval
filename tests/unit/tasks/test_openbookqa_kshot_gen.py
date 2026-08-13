@@ -8,27 +8,28 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 from sieval.community.openbookqa import OBQA_PROMPT_TEMPLATE
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response, SamplingParams
 from sieval.core.models.chat_model import ChatModel
-from sieval.core.tasks import (
-    TaskContext,
-)
+from sieval.core.tasks import TaskContext
 from sieval.datasets.openbookqa import OpenBookQADataset, OpenBookQADatasetSample
 from sieval.tasks.openbookqa_kshot_gen import (
     STOP_SEQUENCES,
     OpenBookQAFewShotGenTask,
 )
+from tests.conftest import HandlerTransport
 
 
 class _CapturingChatModel(ChatModel):
     def __init__(self):
+        self.last_req: Request | None = None
         super().__init__(model="mock-chat", api_key="fake")
-        self.last_kwargs: dict[str, object] = {}
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(model=self.meta(), texts=["The answer is A."])
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
+
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_req = req
+        return Response(texts=("The answer is A.",))
 
 
 def _sample(stem: str, answer_key: str = "A") -> OpenBookQADatasetSample:
@@ -131,8 +132,11 @@ async def test_infer_does_not_forward_decoding_params():
         TaskContext(sample_id=0, raw_sample=raw),
     )
 
-    for forbidden in ("temperature", "top_p", "max_tokens", "n", "stop"):
-        assert forbidden not in model.last_kwargs
+    req = model.last_req
+    assert req is not None
+    # No decoding params forwarded: default sampling (n=1, everything else unset).
+    assert req.sampling == SamplingParams()
+    assert req.dialect_options is None
 
 
 def test_stop_sequences_pinned():
@@ -151,7 +155,8 @@ async def test_infer_bounds_generation_at_kshot_but_not_zero_shot():
         {"prompt": [{"role": "user", "content": "x"}]},
         TaskContext(sample_id=0, raw_sample=_sample("q-test")),
     )
-    assert model_k.last_kwargs.get("stop") == list(STOP_SEQUENCES)
+    assert model_k.last_req is not None
+    assert model_k.last_req.sampling == SamplingParams(stop=STOP_SEQUENCES)
 
     # n_shot=0: no stop — preserves upstream 0-shot parity.
     model_0 = _CapturingChatModel()
@@ -160,7 +165,8 @@ async def test_infer_bounds_generation_at_kshot_but_not_zero_shot():
         {"prompt": [{"role": "user", "content": "x"}]},
         TaskContext(sample_id=0, raw_sample=_sample("q-test")),
     )
-    assert "stop" not in model_0.last_kwargs
+    assert model_0.last_req is not None
+    assert model_0.last_req.sampling == SamplingParams()
 
 
 @pytest.mark.anyio

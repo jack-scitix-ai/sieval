@@ -264,6 +264,7 @@ also_copy = [
   "sieval/cli",
   "sieval/meta",
   "sieval/__main__.py",
+  "sieval/_version.py",
 ]
 
 [tool.pytest]

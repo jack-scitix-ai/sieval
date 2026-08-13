@@ -51,7 +51,10 @@ from sieval.core.tasks import (
     PredictionRecord,
     PromptRecord,
     ReferenceImpl,
+    RequirementContext,
     Task,
+    TaskModelRequirement,
+    TaskRequirements,
     build_judgement_record,
     build_prediction_record,
     build_prompt_record,
@@ -181,6 +184,19 @@ class CEvalFewShotCLPTask(
     ]
 ):
     """C-Eval few-shot next-token logprob evaluation for base models."""
+
+    requires = TaskRequirements(
+        sampled_logprobs=True, min_top_logprobs=DEFAULT_LOGPROBS
+    )
+
+    @classmethod
+    @override
+    def model_requirements_for(
+        cls, context: RequirementContext
+    ) -> tuple[TaskModelRequirement, ...]:
+        return cls._bind_top_logprobs_requirements(
+            context, default=DEFAULT_LOGPROBS, floor=len(CHOICES)
+        )
 
     def __init__(
         self,

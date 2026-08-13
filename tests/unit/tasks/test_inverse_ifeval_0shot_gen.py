@@ -10,7 +10,14 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
 import sieval.datasets.inverse_ifeval as dataset_module
-from sieval.core.models import ModelOutput
+from sieval.core.models import (
+    ChatInput,
+    ModelOutput,
+    Request,
+    Response,
+    SamplingParams,
+    TextPart,
+)
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import (
     TaskContext,
@@ -21,6 +28,7 @@ from sieval.core.tasks import (
 from sieval.core.tasks.metrics import DENOMINATOR_FIELD, DENOMINATOR_REQUESTED
 from sieval.datasets.inverse_ifeval import InverseIFEvalDataset
 from sieval.tasks.inverse_ifeval_0shot_gen import InverseIFEvalZeroShotGenTask
+from tests.conftest import HandlerTransport
 
 # The two shipped template shapes: one with a `{prompt}` slot, one without. Five
 # of the eight instruction types use the second, whose judge never sees the
@@ -42,30 +50,41 @@ _FAIL_REPLY = (
 
 
 class _ScriptedChatModel(ChatModel):
-    """ChatModel returning a fixed reply, recording what it was called with."""
+    """ChatModel returning a fixed reply, recording the last Request seen."""
 
     def __init__(self, reply: str, model: str = "mock"):
-        super().__init__(model=model, api_key="fake")
         self._reply = reply
-        self.last_prompt: object = None
-        self.last_kwargs: dict[str, object] = {}
+        self.last_req: Request | None = None
         self.calls = 0
+        super().__init__(model=model, api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
+
+    async def _stub_arun(self, req: Request) -> Response:
         self.calls += 1
-        self.last_prompt = prompt
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(
-            model=self.meta(),
-            texts=[self._reply] * int(kwargs.get("n", 1)),
-            finish_reasons=["stop"] * int(kwargs.get("n", 1)),
+        self.last_req = req
+        return Response(
+            texts=(self._reply,) * req.sampling.n,
+            finish_reasons=("stop",) * req.sampling.n,
         )
 
-    async def _alogprobs_impl(
-        self, prompt, *, max_tokens=1, logprobs=5, echo=True, temperature=0.0, **kwargs
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+
+def _chat_messages_of(req: Request) -> list[dict[str, str]]:
+    """Project canonical chat input back to the text-only shape under test."""
+    assert isinstance(req.input, ChatInput)
+    messages: list[dict[str, str]] = []
+    for message in req.input.messages:
+        assert all(isinstance(part, TextPart) for part in message.content)
+        messages.append(
+            {
+                "role": message.role,
+                "content": "".join(
+                    part.text for part in message.content if isinstance(part, TextPart)
+                ),
+            }
+        )
+    return messages
 
 
 def _row(
@@ -125,6 +144,33 @@ def test_build_grader_accepts_mapping_and_model():
     assert InverseIFEvalZeroShotGenTask._build_grader(existing) is existing
 
 
+def test_constructor_accepts_composed_grader_model():
+    base, _, grader = _task()
+    task = InverseIFEvalZeroShotGenTask(
+        base.dataset,
+        base.model,
+        models_by_role={"grader": grader},
+    )
+    assert task._grader is grader
+
+
+def test_constructor_rejects_missing_composed_grader_role():
+    base, _, _ = _task()
+    with pytest.raises(ValueError, match="missing the 'grader'"):
+        InverseIFEvalZeroShotGenTask(base.dataset, base.model, models_by_role={})
+
+
+def test_constructor_rejects_ambiguous_grader_sources():
+    base, _, grader = _task()
+    with pytest.raises(ValueError, match="cannot both be supplied"):
+        InverseIFEvalZeroShotGenTask(
+            base.dataset,
+            base.model,
+            grader=grader,
+            models_by_role={"grader": grader},
+        )
+
+
 def test_k_greater_than_n_rejected():
     dataset = _dataset([_row()])
     grader = _ScriptedChatModel(reply=_PASS_REPLY)
@@ -158,7 +204,8 @@ async def test_infer_forwards_only_n():
         {"prompt": [{"role": "user", "content": "q"}]}, TaskContext(sample_id=0)
     )
     # Decoding is model-layer; the task passes n and nothing else.
-    assert model.last_kwargs == {"n": 3}
+    assert model.last_req is not None
+    assert model.last_req.sampling == SamplingParams(n=3)
 
 
 @pytest.mark.anyio
@@ -178,7 +225,8 @@ async def test_judge_receives_the_sample_system_prompt_and_rendered_template():
     ctx = TaskContext(sample_id=0, raw_sample=_row())
     await task.feedback(build_prediction_record(["42"]), ctx)
 
-    assert grader.last_prompt == [
+    assert grader.last_req is not None
+    assert _chat_messages_of(grader.last_req) == [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {
             "role": "user",
@@ -199,7 +247,8 @@ async def test_template_without_a_prompt_slot_omits_the_question():
     ctx = TaskContext(sample_id=0, raw_sample=_row(template=_TEMPLATE_WITHOUT_PROMPT))
     await task.feedback(build_prediction_record(["42"]), ctx)
 
-    user_turn = grader.last_prompt[1]["content"]
+    assert grader.last_req is not None
+    user_turn = _chat_messages_of(grader.last_req)[1]["content"]
     assert user_turn == (
         "<标准答案>：\nThe answer must omit all reasoning.\n\n<学生答案>：\n42"
     )
@@ -218,7 +267,8 @@ async def test_braces_in_the_content_survive_rendering():
     ctx = TaskContext(sample_id=0, raw_sample=raw)
     await task.feedback(build_prediction_record(['{"x": {"y": 1}}']), ctx)
 
-    user_turn = grader.last_prompt[1]["content"]
+    assert grader.last_req is not None
+    user_turn = _chat_messages_of(grader.last_req)[1]["content"]
     assert "SELECT {a} FROM t" in user_turn
     assert "keep {} intact." in user_turn
     assert '{"x": {"y": 1}}' in user_turn

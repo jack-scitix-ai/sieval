@@ -12,7 +12,6 @@ from sieval.infer.topology.models import (
     PP_KEYS,
     TOPO_KEYS,
     TP_KEYS,
-    DeploymentCapabilities,
     DeploymentPlan,
     DeviceGroup,
     HardwareEnv,
@@ -25,6 +24,8 @@ from sieval.infer.topology.models import (
     ServiceBinding,
     UserHints,
     WellKnownRole,
+    deployment_plan_fingerprint,
+    deployment_plan_projection,
 )
 from sieval.infer.topology.resolver import precision_key
 from sieval.infer.topology.validator import validate_plan
@@ -37,7 +38,6 @@ __all__ = [
     "PP_KEYS",
     "TOPO_KEYS",
     "TP_KEYS",
-    "DeploymentCapabilities",
     "DeploymentPlan",
     "DeviceGroup",
     "HardwareEnv",
@@ -50,6 +50,8 @@ __all__ = [
     "ServiceBinding",
     "UserHints",
     "WellKnownRole",
+    "deployment_plan_fingerprint",
+    "deployment_plan_projection",
     "precision_key",
     "validate_plan",
 ]

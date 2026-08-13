@@ -4,6 +4,13 @@ Inference service orchestration.
 AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
+from sieval.core.models import (
+    Deployment,
+    DeploymentPlanProjection,
+    DeploymentTopology,
+    Engine,
+    ServingFacts,
+)
 from sieval.infer.config import (
     InferCommand,
     InferCondition,
@@ -20,7 +27,6 @@ from sieval.infer.deployer import DeployError, DeployTimeoutError, LocalDeployer
 from sieval.infer.introspect import QuantizationInfo, bytes_per_param
 from sieval.infer.recipes import Recipe
 from sieval.infer.topology import (
-    DeploymentCapabilities,
     DeploymentPlan,
     DeviceGroup,
     HardwareEnv,
@@ -31,6 +37,8 @@ from sieval.infer.topology import (
     RoleAssignment,
     UserHints,
     WellKnownRole,
+    deployment_plan_fingerprint,
+    deployment_plan_projection,
 )
 from sieval.infer.topology.resolver import (
     auto_resolve_plan,
@@ -55,13 +63,18 @@ __all__ = [
     "DeployError",
     "DeployTimeoutError",
     "LocalDeployer",
+    # Realized deployment types
+    "Deployment",
+    "DeploymentPlanProjection",
+    "DeploymentTopology",
+    "Engine",
+    "ServingFacts",
     # Introspect
     "QuantizationInfo",
     "bytes_per_param",
     # Recipes
     "Recipe",
     # Topology models
-    "DeploymentCapabilities",
     "DeploymentPlan",
     "DeviceGroup",
     "HardwareEnv",
@@ -72,6 +85,8 @@ __all__ = [
     "RoleAssignment",
     "UserHints",
     "WellKnownRole",
+    "deployment_plan_fingerprint",
+    "deployment_plan_projection",
     # Resolver
     "auto_resolve_plan",
     "compute_tp",

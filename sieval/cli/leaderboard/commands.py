@@ -201,7 +201,14 @@ def run(
     if dry_run:
         from sieval.cli.validation import run_dry_run
 
-        dry_result = run_dry_run(config)
+        dry_result = run_dry_run(
+            config,
+            model_override=model,
+            resume=resume,
+            result_dir_override=result_dir,
+            deterministic_override=deterministic,
+            invocation=shlex.join(sys.argv),
+        )
         result = CommandResult(
             command=dry_run_command,
             ok=dry_result["n_errors"] == 0,

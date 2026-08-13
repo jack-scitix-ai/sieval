@@ -18,7 +18,7 @@ from sieval.community.hle import (
     calib_err,
     parse_judge,
 )
-from sieval.core.models import ModelOutput
+from sieval.core.models import Request, Response
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import (
     TaskContext,
@@ -28,32 +28,30 @@ from sieval.core.tasks import (
 )
 from sieval.datasets.hle import HLEDataset
 from sieval.tasks.hle_0shot_gen import HLEZeroShotGenTask
+from tests.conftest import HandlerTransport
 
 
 class _ScriptedChatModel(ChatModel):
     """ChatModel returning a fixed reply, recording the last agenerate kwargs."""
 
     def __init__(self, reply: str, model: str = "mock"):
-        super().__init__(model=model, api_key="fake")
         self._reply = reply
         self.last_kwargs: dict[str, object] = {}
+        super().__init__(model=model, api_key="fake")
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        _ = prompt
-        self.last_kwargs = dict(kwargs)
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
+
+    async def _stub_arun(self, req: Request) -> Response:
+        self.last_kwargs = {"n": req.sampling.n}
         # `finish_reasons` is set because the judge-family migration exists to
         # persist the grader's WHOLE ModelOutput: it is the field that separates a
         # reasoning judge which spent its budget thinking from an empty API
         # response, and #51's flat `grader_reply` never carried it.
-        return ModelOutput(
-            model=self.meta(), texts=[self._reply], finish_reasons=["stop"]
+        return Response(
+            texts=(self._reply,) * req.sampling.n,
+            finish_reasons=("stop",) * req.sampling.n,
         )
-
-    async def _alogprobs_impl(
-        self, prompt, *, max_tokens=1, logprobs=5, echo=True, temperature=0.0, **kwargs
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
 
 
 def _row(image: str = "") -> dict:
@@ -108,6 +106,33 @@ def test_build_grader_accepts_mapping_and_model():
     assert isinstance(built, ChatModel)
     existing = _ScriptedChatModel(reply="x")
     assert HLEZeroShotGenTask._build_grader(existing) is existing
+
+
+def test_constructor_accepts_composed_grader_model():
+    base, _, grader = _task()
+    task = HLEZeroShotGenTask(
+        base.dataset,
+        base.model,
+        models_by_role={"grader": grader},
+    )
+    assert task._grader is grader
+
+
+def test_constructor_rejects_missing_composed_grader_role():
+    base, _, _ = _task()
+    with pytest.raises(ValueError, match="missing the 'grader'"):
+        HLEZeroShotGenTask(base.dataset, base.model, models_by_role={})
+
+
+def test_constructor_rejects_ambiguous_grader_sources():
+    base, _, grader = _task()
+    with pytest.raises(ValueError, match="cannot both be supplied"):
+        HLEZeroShotGenTask(
+            base.dataset,
+            base.model,
+            grader=grader,
+            models_by_role={"grader": grader},
+        )
 
 
 # --- subset is the dataset's decision; the task only grades what it is handed ---

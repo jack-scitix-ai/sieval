@@ -1,3 +1,11 @@
+from sieval.core.models.requirements import (
+    InputKind,
+    InputModality,
+    RequirementContext,
+    TaskModelRequirement,
+    TaskRequirements,
+)
+
 from .anomaly import sieval_detection_rule
 from .consts import NonRetriableSampleError, TaskAction, TaskStage
 from .context import TaskContext, TaskStageMeta, TaskStageOutput
@@ -22,17 +30,22 @@ from .task import Task
 __all__ = [
     "GRADER_OUTPUT_KEY",
     "EvalMode",
+    "InputKind",
+    "InputModality",
     "JudgementRecord",
     "NonRetriableSampleError",
     "PredictionRecord",
     "PromptRecord",
     "ReferenceImpl",
+    "RequirementContext",
     "RolloutJudgement",
     "RolloutPrediction",
     "Task",
     "TaskAction",
     "TaskContext",
     "TaskMeta",
+    "TaskModelRequirement",
+    "TaskRequirements",
     "TaskStage",
     "TaskStageMeta",
     "TaskStageOutput",

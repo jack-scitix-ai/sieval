@@ -9,7 +9,7 @@ import pytest
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 
-from sieval.core.models import ModelOutput
+from sieval.core.models import ModelOutput, Request, Response
 from sieval.core.models.chat_model import ChatModel
 from sieval.core.tasks import (
     TaskContext,
@@ -24,6 +24,7 @@ from sieval.datasets.complex_constraints import (
 from sieval.tasks.complex_constraints_0shot_gen import (
     ComplexConstraintsZeroShotGenTask,
 )
+from tests.conftest import HandlerTransport, prompt_of
 
 
 class _ScriptedChatModel(ChatModel):
@@ -32,21 +33,19 @@ class _ScriptedChatModel(ChatModel):
     def __init__(self, reply: str, model: str = "mock"):
         super().__init__(model=model, api_key="fake")
         self._reply = reply
-        self.prompts: list[object] = []
+        self.prompts: list[str] = []
         self.last_kwargs: dict[str, object] = {}
 
-    async def _agenerate_impl(self, prompt, **kwargs) -> ModelOutput:
-        self.prompts.append(prompt)
-        self.last_kwargs = dict(kwargs)
-        return ModelOutput(
-            model=self.meta(), texts=[self._reply], finish_reasons=["stop"]
-        )
+    def _build_default_transport(self) -> HandlerTransport:
+        return HandlerTransport(self._stub_arun, "openai_chat")
 
-    async def _alogprobs_impl(
-        self, prompt, *, max_tokens=1, logprobs=5, echo=True, temperature=0.0, **kwargs
-    ) -> ModelOutput:
-        _ = (prompt, max_tokens, logprobs, echo, temperature, kwargs)
-        return ModelOutput(model=self.meta(), texts=[""])
+    async def _stub_arun(self, req: Request) -> Response:
+        self.prompts.append(prompt_of(req))
+        self.last_kwargs = {"n": req.sampling.n}
+        return Response(
+            texts=(self._reply,) * req.sampling.n,
+            finish_reasons=("stop",) * req.sampling.n,
+        )
 
 
 def _sample(n_criteria: int = 3) -> ComplexConstraintsDatasetSample:
@@ -92,6 +91,33 @@ def test_build_grader_accepts_mapping_and_model():
     assert isinstance(built, ChatModel)
     existing = _ScriptedChatModel(reply="1: PASS")
     assert ComplexConstraintsZeroShotGenTask._build_grader(existing) is existing
+
+
+def test_constructor_accepts_composed_grader_model():
+    base, _, grader = _task()
+    task = ComplexConstraintsZeroShotGenTask(
+        base.dataset,
+        base.model,
+        models_by_role={"grader": grader},
+    )
+    assert task._grader is grader
+
+
+def test_constructor_rejects_missing_composed_grader_role():
+    base, _, _ = _task()
+    with pytest.raises(ValueError, match="missing the 'grader'"):
+        ComplexConstraintsZeroShotGenTask(base.dataset, base.model, models_by_role={})
+
+
+def test_constructor_rejects_ambiguous_grader_sources():
+    base, _, grader = _task()
+    with pytest.raises(ValueError, match="cannot both be supplied"):
+        ComplexConstraintsZeroShotGenTask(
+            base.dataset,
+            base.model,
+            grader=grader,
+            models_by_role={"grader": grader},
+        )
 
 
 # --- preprocess: the rubric is a procedure, so it goes to extra, not reference ---

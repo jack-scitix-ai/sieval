@@ -1,38 +1,22 @@
 """
-Unit tests for Model.with_args, Model.as_type, and meta() derivation logic.
+Unit tests for Model.with_args, lifecycle, and meta() derivation logic.
 
-Covers parent limiter wiring, type conversion, nested derivation,
-and meta() field presence — paths not exercised by test_model.py.
+Covers parent limiter wiring, nested derivation, shared wrapper ownership, and
+meta() field presence — paths not exercised by test_model.py.
 
-AI-Generated Code - Claude Sonnet 4.6 (Anthropic)
+AI-Generated Code - Claude Fable 5 (Anthropic)
 """
 
+import anyio
 import pytest
 
-from sieval.core.models import ChatModel, GenModel
+from sieval.core.models import GenModel
 
-
-# ---------------------------------------------------------------------------
-# Stub implementations — no real API calls
-# ---------------------------------------------------------------------------
-class StubGenModel(GenModel):
-    """GenModel stub that never hits a real API."""
-
-    async def _agenerate_impl(self, prompt, **kwargs):
-        raise RuntimeError("Stub must not be called in unit tests")
-
-    async def _alogprobs_impl(self, prompt, **kwargs):
-        raise RuntimeError("Stub must not be called in unit tests")
-
-
-class StubChatModel(ChatModel):
-    """ChatModel stub that never hits a real API."""
-
-    async def _agenerate_impl(self, prompt, **kwargs):
-        raise RuntimeError("Stub must not be called in unit tests")
-
-    async def _alogprobs_impl(self, prompt, **kwargs):
-        raise RuntimeError("Stub must not be called in unit tests")
+# These tests never execute a request.  The compatibility wrapper's real
+# dialect is therefore the most faithful fixture for pool/limiter derivation;
+# retaining an old ``Transport.CAPABILITIES`` double would exercise the
+# capability system that RFC #25 intentionally removed.
+StubGenModel = GenModel
 
 
 # ---------------------------------------------------------------------------
@@ -48,12 +32,6 @@ def base_gen():
 def base_gen_no_limit():
     """GenModel without any concurrency limiter."""
     return StubGenModel(model="base-gen-unlimited", api_key="fake")
-
-
-@pytest.fixture
-def base_chat():
-    """ChatModel with a concurrency limiter (total_tokens=32)."""
-    return StubChatModel(model="base-chat", api_key="fake", concurrency_limit=32)
 
 
 # ===================================================================
@@ -72,6 +50,24 @@ class TestModelDerivation:
         assert child._limiter.total_tokens == 32
         # Parent's own limiter becomes the child's _parent_limiter
         assert child._parent_limiter is base_gen._limiter
+
+    def test_with_args_preserves_external_shared_parent_limiter(self):
+        """A derived local cap keeps an externally supplied shared quota visible."""
+        parent = anyio.CapacityLimiter(64)
+        base = StubGenModel(
+            model="base-gen-external-parent",
+            api_key="fake",
+            parent_limiter=parent,
+        )
+
+        child = base.with_args(concurrency_limit=32)
+
+        assert child.pool.shared_limiter is parent
+        assert child._parent_limiter is parent
+        assert child.get_quota_info()["parent"] == {
+            "available": 64,
+            "total": 64,
+        }
 
     def test_with_args_without_concurrency_limit_shares_limiters(self, base_gen):
         """with_args() without concurrency_limit keeps the same limiter refs."""
@@ -97,56 +93,45 @@ class TestModelDerivation:
 
         assert child._limiter.total_tokens == 16
 
-    # ------------------------------------------------------------------
-    # as_type — type conversion
-    # ------------------------------------------------------------------
+    def test_with_args_shares_transport(self, base_gen):
+        """Derived models reuse the same Transport (same client, same wire)."""
+        child = base_gen.with_args(temperature=0.7)
 
-    def test_as_type_conversion_chat_to_gen(self, base_chat):
-        """as_type(GenModel) returns a GenModel instance."""
-        gen = base_chat.as_type(GenModel)
+        assert child._transport is base_gen._transport
+        assert child.capabilities == base_gen.capabilities
 
-        assert isinstance(gen, GenModel)
-        assert not isinstance(gen, ChatModel)
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "api_base",
+            "api_key",
+            "authorization",
+            "base_url",
+            "connection_family",
+            "max_retries",
+            "service_role",
+            "transport",
+        ],
+    )
+    def test_with_args_rejects_binding_resource_keys(self, base_gen, key):
+        with pytest.raises(ValueError, match="cannot change binding resources"):
+            base_gen.with_args(**{key: "replacement"})
 
-    def test_as_type_conversion_gen_to_chat(self, base_gen):
-        """as_type(ChatModel) returns a ChatModel instance."""
-        chat = base_gen.as_type(ChatModel)
-
-        assert isinstance(chat, ChatModel)
-        assert not isinstance(chat, GenModel)
-
-    def test_as_type_preserves_parent_limiter(self, base_gen):
-        """as_type does not alter _parent_limiter."""
-        child = base_gen.with_args(concurrency_limit=8)
-        converted = child.as_type(ChatModel)
-
-        # The converted model must carry the same parent limiter reference
-        assert converted._parent_limiter is child._parent_limiter
-        assert converted._parent_limiter is base_gen._limiter
-
-    def test_as_type_preserves_own_limiter(self, base_gen):
-        """as_type does not alter _limiter."""
-        child = base_gen.with_args(concurrency_limit=8)
-        converted = child.as_type(ChatModel)
-
-        assert converted._limiter is child._limiter
-        assert converted._limiter.total_tokens == 8
-
-    def test_as_type_preserves_model_name(self, base_gen):
-        """as_type does not change the model name."""
-        chat = base_gen.as_type(ChatModel)
-
-        assert chat._model == base_gen._model
-
-    def test_as_type_invalid_type_raises(self, base_gen):
-        """as_type with a non-Model type raises TypeError."""
-        with pytest.raises(TypeError, match="Model subclass"):
-            base_gen.as_type(str)
-
-    def test_as_type_invalid_non_type_raises(self, base_gen):
-        """as_type with a non-type value raises TypeError."""
-        with pytest.raises(TypeError, match="Model subclass"):
-            base_gen.as_type(42)
+    @pytest.mark.parametrize(
+        ("container", "key"),
+        [
+            ("extra_body", "authorization"),
+            ("extra_wire_params", "connection_family"),
+        ],
+    )
+    def test_request_builder_rejects_resources_inside_wire_extensions(
+        self, base_gen, container, key
+    ):
+        with pytest.raises(ValueError, match="cannot contain binding resource"):
+            base_gen._build_generate_request(
+                "prompt",
+                **{container: {key: "secret-or-resource"}},
+            )
 
     # ------------------------------------------------------------------
     # Nested derivation
@@ -170,6 +155,50 @@ class TestModelDerivation:
 
         with pytest.raises(ValueError, match="multi-level"):
             child1.with_args(concurrency_limit=16)
+
+    def test_nested_derivation_with_new_limit_raises_from_unlimited_base(
+        self, base_gen_no_limit
+    ):
+        """A local cap remains a derivation even without a shared root cap."""
+        child1 = base_gen_no_limit.with_args(concurrency_limit=32)
+
+        assert child1.pool.shared_limiter is None
+        assert child1._parent_limiter is None
+        with pytest.raises(ValueError, match="multi-level"):
+            child1.with_args(concurrency_limit=16)
+
+    @pytest.mark.parametrize("concurrency_limit", [True, 0])
+    def test_with_args_rejects_invalid_concurrency_limit(
+        self, base_gen, concurrency_limit
+    ):
+        with pytest.raises(ValueError, match="positive integer"):
+            base_gen.with_args(concurrency_limit=concurrency_limit)
+
+    @pytest.mark.anyio
+    async def test_close_via_derived_wrapper_invalidates_compat_pool_sibling(
+        self, base_gen
+    ):
+        child = base_gen.with_args(concurrency_limit=32)
+        compat = base_gen.as_compat_type(GenModel)
+
+        await child.aclose()
+
+        assert base_gen.pool.is_closed
+        for sibling in (base_gen, child):
+            with pytest.raises(RuntimeError, match="ConnectionPool is closing"):
+                await sibling.__aenter__()
+            with pytest.raises(RuntimeError, match="ConnectionPool is closing"):
+                await sibling.agenerate("prompt")
+        with pytest.raises(RuntimeError, match="canonical model's ConnectionPool"):
+            await compat.__aenter__()
+        with pytest.raises(RuntimeError, match="ConnectionPool is closing"):
+            await compat.agenerate("prompt")
+        with pytest.raises(RuntimeError, match="canonical Model does not own"):
+            await compat.aclose()
+
+        # Closing through an owning sibling remains idempotent and does not revive it.
+        await child.aclose()
+        assert base_gen.pool.is_closed
 
     # ------------------------------------------------------------------
     # meta()
@@ -199,6 +228,18 @@ class TestModelDerivation:
         assert "default_params" in m
         assert m["default_params"]["temperature"] == 0.5
         assert m["default_params"]["top_p"] == 0.9
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_model_meta_rejects_non_finite_default_params(self, value):
+        model = StubGenModel(model="bad-param", api_key="fake", custom=value)
+
+        with pytest.raises(ValueError, match="non-finite"):
+            model.meta()
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_request_builder_rejects_non_finite_sampling_values(self, base_gen, value):
+        with pytest.raises(ValueError, match="finite"):
+            base_gen._build_generate_request("prompt", temperature=value)
 
     def test_model_meta_api_base_set(self):
         """meta() 'api_base' reflects the value passed at construction."""
@@ -289,13 +330,6 @@ class TestModelExtra:
         extra = {"sequence_wrappers": {"dna": "<dna>{seq}</dna>"}}
         model = StubGenModel(model="test", api_key="fake", extra=extra)
         assert "extra" not in model.meta()["default_params"]
-
-    def test_as_type_preserves_extra(self):
-        """as_type() must preserve extra."""
-        extra = {"sequence_wrappers": {"dna": "<dna>{seq}</dna>"}}
-        model = StubGenModel(model="test", api_key="fake", extra=extra)
-        chat = model.as_type(StubChatModel)
-        assert chat.extra == extra
 
     def test_with_args_extra_not_in_child_kwargs(self):
         """with_args(extra=...) must not leak into child _kwargs."""

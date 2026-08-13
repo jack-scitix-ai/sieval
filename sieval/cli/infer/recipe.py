@@ -15,7 +15,10 @@ import typer
 import yaml
 from loguru import logger
 
-from sieval.cli.resolution import derive_model_type
+from sieval.cli.resolution import (
+    ConfigModelTypeResolution,
+    resolve_config_model_types,
+)
 from sieval.infer.config import ParamValue
 from sieval.infer.introspect import (
     GPUInfo,
@@ -63,6 +66,8 @@ class ResolvedInferConfig(NamedTuple):
 async def resolve_infer_config(
     yaml_path: Path,
     model_name: str | None = None,
+    *,
+    model_type_resolution: ConfigModelTypeResolution | None = None,
 ) -> ResolvedInferConfig:
     """Load YAML and resolve a DeploymentPlan for a model.
 
@@ -114,9 +119,14 @@ async def resolve_infer_config(
     # Which capability layer to serve. Derived from the same config the eval
     # session reads, so a base checkpoint gets base capabilities even when the
     # config leaves `type` to task inference (the normal case).
-    capability = capability_model_type(
-        derive_model_type(model_name, mcfg.get("type"), cfg.get("tasks") or {})
-    )
+    type_resolution = model_type_resolution or resolve_config_model_types(cfg)
+    try:
+        resolved_model_type = type_resolution.model_types_by_config[model_name]
+    except KeyError as exc:
+        raise typer.BadParameter(
+            f"Model {model_name!r} has no normalized model-kind resolution"
+        ) from exc
+    capability = capability_model_type(resolved_model_type)
 
     # Recipe resolution
     recipe_params: dict[str, ParamValue] | None = None

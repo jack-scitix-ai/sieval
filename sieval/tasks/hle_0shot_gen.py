@@ -52,7 +52,8 @@ AI-Generated Code - Claude Opus 4.8 (Anthropic)
 """
 
 from collections.abc import Mapping
-from typing import override
+from dataclasses import replace
+from typing import cast, override
 
 from sieval.community.hle import (
     JUDGE_PROMPT,
@@ -64,12 +65,17 @@ from sieval.core.models import ChatModel, Model, ModelOutput
 from sieval.core.tasks import (
     GRADER_OUTPUT_KEY,
     EvalMode,
+    InputKind,
+    InputModality,
     JudgementRecord,
     PredictionRecord,
     PromptRecord,
     ReferenceImpl,
+    RequirementContext,
     RolloutJudgement,
     Task,
+    TaskModelRequirement,
+    TaskRequirements,
     build_judgement_record,
     build_prediction_record,
     build_prompt_record,
@@ -140,6 +146,39 @@ class HLEZeroShotGenTask(
         dict[str, float | str | None],
     ]
 ):
+    @classmethod
+    @override
+    def model_requirements_for(
+        cls, context: RequirementContext
+    ) -> tuple[TaskModelRequirement, ...]:
+        dataset_config = context.dataset_config
+        raw_text_only = dataset_config.get("text_only")
+        if raw_text_only is None:
+            raw_args = dataset_config.get("args")
+            if isinstance(raw_args, Mapping):
+                raw_args_mapping = cast(Mapping[str, object], raw_args)
+                raw_text_only = raw_args_mapping.get("text_only")
+        if raw_text_only is None:
+            text_only = True
+        elif isinstance(raw_text_only, bool):
+            text_only = raw_text_only
+        else:
+            raise TypeError("dataset_config.text_only must be a boolean")
+
+        candidate_requires = cls.requires
+        if not text_only:
+            candidate_requires = replace(
+                candidate_requires,
+                input_modalities=frozenset({InputModality.TEXT, InputModality.IMAGE}),
+            )
+        candidate = cls._bind_model_requirements(context, candidate_requires)
+        grader = cls._bind_role_requirement(
+            context,
+            "grader",
+            TaskRequirements(input=InputKind.CHAT),
+        )
+        return candidate + grader
+
     def __init__(
         self,
         dataset: HLEDataset,
@@ -147,13 +186,31 @@ class HLEZeroShotGenTask(
         name: str | None = None,
         grader: Mapping | Model | None = None,
         n: int = 1,
+        models_by_role: Mapping[str, Model] | None = None,
     ):
         super().__init__(dataset=dataset, model=model, name=name)
         self._n = n
         # Which subset was loaded is the dataset's decision; read it back so
         # `report()` can record it.
         self._text_only = dataset.text_only
-        self._grader = self._build_grader(grader)
+        self._grader = self._resolve_grader(grader, models_by_role)
+
+    @classmethod
+    def _resolve_grader(
+        cls,
+        grader: Mapping | Model | None,
+        models_by_role: Mapping[str, Model] | None,
+    ) -> Model:
+        if models_by_role is not None:
+            if grader is not None:
+                raise ValueError("grader and models_by_role cannot both be supplied")
+            try:
+                return models_by_role["grader"]
+            except KeyError as exc:
+                raise ValueError(
+                    "models_by_role is missing the 'grader' model"
+                ) from exc
+        return cls._build_grader(grader)
 
     @staticmethod
     def _build_grader(grader: Mapping | Model | None) -> Model:
