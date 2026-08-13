@@ -11,7 +11,7 @@ AI-Generated Code - GPT-5.6 (OpenAI)
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from sieval.core.types import JSONValue
 
@@ -87,7 +87,7 @@ class PreparedRequest:
     """Dialect-local wire preparation plus explicit audit evidence."""
 
     operation: str
-    body: Mapping[str, Any]
+    body: Mapping[str, JSONValue]
     consumed_paths: frozenset[str]
     passthrough: Mapping[str, PassthroughObservation]
     context: object | None = None
