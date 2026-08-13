@@ -840,6 +840,64 @@ class TestValidateTasks:
         assert not result.ok
         assert any("binding resources" in e and "api_key" in e for e in result.errors)
 
+    def test_model_role_unsupported_by_task_constructor_is_rejected(self):
+        # `sieval eval` must reject the same role config `sieval run --dry-run`
+        # rejects; the two entry points disagreeing is what let the missing
+        # `extractor` role ship.
+        cfg = {
+            "models": {"m": {"name": "gpt-4"}},
+            "datasets": {"d": {"class": "GSM8KDataset"}},
+            "tasks": {
+                "t": {
+                    "class": "GSM8KZeroShotGenTask",
+                    "dataset": "d",
+                    "model": "m",
+                    "args": {"grader": {"model": "gpt-4.1"}},
+                }
+            },
+        }
+        result = validate_eval_config(cfg)
+        assert not result.ok
+        assert any(
+            "grader" in e and "does not declare matching constructor" in e
+            for e in result.errors
+        )
+
+    def test_model_role_supported_by_task_constructor_is_accepted(self):
+        cfg = {
+            "models": {"m": {"name": "gpt-4"}},
+            "datasets": {"d": {"class": "InverseIFEvalDataset"}},
+            "tasks": {
+                "t": {
+                    "class": "InverseIFEvalZeroShotGenTask",
+                    "dataset": "d",
+                    "model": "m",
+                    "args": {"grader": {"model": "gpt-4.1"}},
+                }
+            },
+        }
+        result = validate_eval_config(cfg)
+        assert not any("constructor" in e for e in result.errors)
+
+    def test_unresolvable_task_class_still_checks_composition_owned_keys(self):
+        # Fail-soft: the import failure is reported by the class-import check,
+        # and the role-free half of the argument check must keep working.
+        cfg = {
+            "models": {"m": {"name": "gpt-4"}},
+            "datasets": {"d": {"class": "X"}},
+            "tasks": {
+                "t": {
+                    "class": "NoSuchTaskClass",
+                    "dataset": "d",
+                    "model": "m",
+                    "args": {"dataset": None},
+                }
+            },
+        }
+        result = validate_eval_config(cfg)
+        assert not result.ok
+        assert any("composition-owned" in e and "dataset" in e for e in result.errors)
+
     def test_task_missing_class(self):
         cfg = {
             "models": {"m": {"name": "gpt-4"}},

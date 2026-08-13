@@ -457,8 +457,18 @@ def _validate_tasks(cfg: dict, result: ValidationResult) -> None:
             if not isinstance(task_args, dict):
                 result.errors.append(f"Task '{name}': 'args' must be a dictionary")
             else:
+                # Resolve the class so the model-role check runs here too, not
+                # only in the pre-launch path. Fail-soft: an unresolvable spec is
+                # already reported by _validate_class_imports, and passing None
+                # keeps the composition-owned-key half of the check working.
+                task_class: type | None = None
+                if isinstance(class_spec, str) and class_spec:
+                    try:
+                        task_class = resolve_task_class(class_spec)
+                    except Exception:
+                        task_class = None
                 try:
-                    validate_task_config_args(name, task_args)
+                    validate_task_config_args(name, task_args, task_class=task_class)
                 except (TypeError, ValueError) as exc:
                     result.errors.append(str(exc))
 
