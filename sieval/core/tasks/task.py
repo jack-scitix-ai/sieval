@@ -5,7 +5,7 @@ AI-Generated Code - Claude Fable 5 (Anthropic)
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from typing import ClassVar, Literal, Protocol, cast
@@ -168,8 +168,6 @@ class Task[
     ) -> tuple[TaskModelRequirement, ...]:
         if not isinstance(context, RequirementContext):
             raise TypeError("context must be a RequirementContext")
-        if not isinstance(requires, TaskRequirements):
-            raise TypeError("requires must be TaskRequirements")
 
         bindings = context.model_bindings
         if not bindings:
@@ -208,8 +206,6 @@ class Task[
             raise TypeError("context must be a RequirementContext")
         if not isinstance(role, str) or not role:
             raise TypeError("role must be a non-empty string")
-        if not isinstance(requires, TaskRequirements):
-            raise TypeError("requires must be TaskRequirements")
         try:
             binding = context.model_bindings[role]
         except KeyError as exc:
@@ -227,6 +223,35 @@ class Task[
                 source_task=source_task,
             ),
         )
+
+    @classmethod
+    def _resolve_role_model[T](
+        cls,
+        role: str,
+        configured: T,
+        models_by_role: Mapping[str, Model] | None,
+        *,
+        build: Callable[[T], Model],
+    ) -> Model:
+        """Resolve one auxiliary model role to the Model the task will call.
+
+        ``models_by_role`` is the pooled path a YAML run takes; otherwise
+        ``build`` turns ``configured`` into the Model, so each task keeps its
+        own "you must supply one" message. Supplying both is an error rather
+        than a precedence question: silently preferring either would let a run
+        score against a model the config did not name.
+        """
+
+        if models_by_role is not None:
+            if configured is not None:
+                raise ValueError(f"{role} and models_by_role cannot both be supplied")
+            try:
+                return models_by_role[role]
+            except KeyError as exc:
+                raise ValueError(
+                    f"models_by_role is missing the {role!r} model"
+                ) from exc
+        return build(configured)
 
     @classmethod
     def _bind_top_logprobs_requirements(
