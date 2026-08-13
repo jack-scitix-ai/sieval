@@ -35,8 +35,11 @@ PILOT_NAMES = {
 
 JUDGE_TASK_NAMES = {
     "aa_lcr_0shot_gen",
+    "advanced_if_0shot_gen",
     "browsecomp_0shot_gen",
+    "complex_constraints_0shot_gen",
     "hle_0shot_gen",
+    "inverse_ifeval_0shot_gen",
     "simpleqa_verified_0shot_gen",
 }
 
@@ -115,6 +118,61 @@ def test_llm_judge_tasks_expose_grader_binding_before_construction():
         assert grader_requirement.binding is grader
 
     assert seen == JUDGE_TASK_NAMES
+
+
+def test_constructor_model_roles_have_matching_hooks_and_injection_support():
+    """Constructor roles independently agree with pre-construction hooks."""
+    from inspect import signature
+
+    from sieval.cli.resolution import TASK_MODEL_ROLES
+
+    import_all_tasks()
+    known_roles = frozenset(TASK_MODEL_ROLES)
+    expected = {
+        **{name: frozenset({"grader"}) for name in JUDGE_TASK_NAMES},
+        "agieval_0shot_gen": frozenset({"extractor"}),
+    }
+    observed: dict[str, frozenset[str]] = {}
+
+    for task_cls, meta in iter_task_entries():
+        parameters = signature(task_cls.__init__).parameters
+        constructor_roles = frozenset(parameters) & known_roles
+        if not constructor_roles:
+            continue
+
+        observed[meta.name] = constructor_roles
+        assert "models_by_role" in parameters, (
+            f"{meta.name} accepts model role(s) {sorted(constructor_roles)} but "
+            "cannot receive normalized models_by_role"
+        )
+
+        bindings = {
+            "candidate": NamedModelBinding(
+                "candidate", "candidate-root", "model", "model"
+            ),
+            **{
+                role: NamedModelBinding(
+                    role, f"{role}-root", f"{role}-model", f"{role}-config"
+                )
+                for role in constructor_roles
+            },
+        }
+        requirements = task_cls.model_requirements_for(
+            RequirementContext(model_bindings=bindings)
+        )
+        requirements_by_role = {item.role: item for item in requirements}
+        hook_roles = frozenset(requirements_by_role) & known_roles
+
+        assert hook_roles == constructor_roles, (
+            f"{meta.name} constructor roles {sorted(constructor_roles)} disagree "
+            f"with hook roles {sorted(hook_roles)}"
+        )
+        for role in constructor_roles:
+            requirement = requirements_by_role[role]
+            assert requirement.binding is bindings[role], (meta.name, role)
+            assert requirement.requires.input is InputKind.CHAT, (meta.name, role)
+
+    assert observed == expected
 
 
 def test_hle_full_dataset_adds_candidate_image_modality_requirement():

@@ -16,6 +16,7 @@ import anyio
 from sieval.core.types import JSONValue
 
 from .dialect import Dialect
+from .dialect_registry import _register_compat_model_type
 from .dialects.openai_chat import OpenAIChatDialect
 from .ir import ChatInput, ChatMessage, ModelInput, normalize_chat_input
 from .model import Model, build_legacy_openai_binding
@@ -87,3 +88,6 @@ class ChatModel(Model):
                 cast(Iterable[ChatMessage | Mapping[str, object]], prompt)
             )
         raise TypeError("ChatModel prompt must be text, ChatInput, or messages")
+
+
+_register_compat_model_type(ChatModel, "chat")

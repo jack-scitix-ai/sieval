@@ -61,6 +61,7 @@ from sieval.core.models.ir import (
 _OPENAI_REASONING_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
+_PREFILL_UNSUPPORTED_REASON = "Chat Completions has no assistant-prefill field"
 
 
 def _validate_reasoning_config(options: object) -> None:
@@ -152,7 +153,7 @@ CAPABILITY_DECISIONS: Mapping[str, DialectCapabilityDecision] = MappingProxyType
                 _config_validator=_validate_multimodal_config,
             )
         ),
-        "prefill": Unsupported("Chat Completions has no assistant-prefill field"),
+        "prefill": Unsupported(_PREFILL_UNSUPPORTED_REASON),
         "fim": Unsupported("Chat Completions has no completion suffix field"),
     }
 )
@@ -232,8 +233,6 @@ _CANONICAL_WIRE_KEYS = BINDING_RESOURCE_KEYS | frozenset(
         "previous_response_id",
         "session_id",
         "opaque_continuation",
-        "prefill",
-        "prefix",
         "suffix",
         "stream",
         "stream_options",
@@ -581,7 +580,9 @@ class OpenAIChatDialect:
                 )
             elif path.startswith("dialect_options."):
                 key = path.removeprefix("dialect_options.")
-                if key in _CANONICAL_WIRE_KEYS:
+                if key in {"prefill", "prefix"}:
+                    audit.rejected(path, _PREFILL_UNSUPPORTED_REASON)
+                elif key in _CANONICAL_WIRE_KEYS:
                     audit.rejected(
                         path,
                         f"{key!r} must use its canonical provider-neutral field",

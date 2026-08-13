@@ -13,6 +13,7 @@ import anyio
 from sieval.core.types import JSONValue
 
 from .dialect import Dialect
+from .dialect_registry import _register_compat_model_type
 from .dialects.openai_completions import OpenAICompletionsDialect
 from .ir import CompletionInput, ModelInput
 from .model import Model, build_legacy_openai_binding
@@ -76,3 +77,6 @@ class GenModel(Model):
         if isinstance(prompt, str):
             return CompletionInput(prompt)
         raise TypeError("GenModel prompt must be text or CompletionInput")
+
+
+_register_compat_model_type(GenModel, "completion")

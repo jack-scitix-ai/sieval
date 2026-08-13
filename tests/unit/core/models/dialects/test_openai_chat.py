@@ -455,6 +455,21 @@ class TestPreflightRejections:
 
         create.assert_not_awaited()
 
+    @pytest.mark.parametrize("key", ["prefill", "prefix"])
+    def test_prefill_option_reports_actual_protocol_limitation(self, key: str) -> None:
+        req = Request(
+            input=_chat(),
+            dialect_options=DialectOptions("openai_chat", {key: "assistant text"}),
+        )
+        dialect, create = _dialect()
+        audit = RequestAudit(active_request_leaves(req))
+
+        dialect.validate_request(req, audit, SimpleNamespace())
+        with pytest.raises(RequestAuditError, match="no assistant-prefill field"):
+            audit.raise_rejections()
+
+        create.assert_not_awaited()
+
     def test_prepare_rejects_completion_input_defensively(self) -> None:
         dialect, _ = _dialect()
         req = Request(input=CompletionInput("prompt"))

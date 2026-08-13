@@ -1235,6 +1235,9 @@ class TestPrelaunchReconciliation:
     class ChatTask:
         model_type = "chat"
 
+        def __init__(self, *, grader=None, models_by_role=None):
+            del grader, models_by_role
+
         @classmethod
         def model_requirements_for(cls, context):
             return (
@@ -1282,6 +1285,9 @@ class TestPrelaunchReconciliation:
     class JudgeTask:
         model_type = "chat"
 
+        def __init__(self, *, grader=None, models_by_role=None):
+            del grader, models_by_role
+
         @classmethod
         def model_requirements_for(cls, context):
             return (
@@ -1302,6 +1308,9 @@ class TestPrelaunchReconciliation:
     class ExtractorTask:
         model_type = "chat"
 
+        def __init__(self, *, extractor=None, models_by_role=None):
+            del extractor, models_by_role
+
         @classmethod
         def model_requirements_for(cls, context):
             return (
@@ -1321,6 +1330,9 @@ class TestPrelaunchReconciliation:
 
     class ScoringJudgeTask:
         model_type = "chat"
+
+        def __init__(self, *, grader=None, models_by_role=None):
+            del grader, models_by_role
 
         @classmethod
         def model_requirements_for(cls, context):
@@ -1444,6 +1456,138 @@ tasks:
             pytest.raises(ValueError, match="changed the normalized binding"),
         ):
             session.prepare_prelaunch()
+
+    def test_configured_role_missing_from_hook_fails_before_model_io(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  incomplete:
+    class: fake.ChatTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      grader:
+        model: org/grader
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ChatTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI"
+            ) as client_factory,
+            pytest.raises(
+                ValueError,
+                match=(
+                    r"ChatTask\.model_requirements_for\(\) did not declare "
+                    r"normalized model role\(s\): 'grader'"
+                ),
+            ),
+        ):
+            session.prepare_prelaunch()
+
+        client_factory.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("key", "yaml_value"),
+        [
+            ("name", "null"),
+            ("dataset", "{}"),
+            ("model", "null"),
+            ("models_by_role", "{}"),
+        ],
+    )
+    def test_composition_owned_task_args_fail_before_model_io(
+        self, tmp_path: Path, key: str, yaml_value: str
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            f"""
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  invalid:
+    class: fake.ChatTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      {key}: {yaml_value}
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.ChatTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI"
+            ) as client_factory,
+            pytest.raises(ValueError, match=rf"composition-owned.*{key}"),
+        ):
+            session.prepare_prelaunch()
+
+        client_factory.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("role", "yaml_value"),
+        [
+            ("grader", "null"),
+            ("extractor", "null"),
+            ("extractor", "self"),
+            ("extractor", "{model: org/extractor}"),
+        ],
+    )
+    def test_non_owner_model_role_fails_before_model_io(
+        self, tmp_path: Path, role: str, yaml_value: str
+    ) -> None:
+        from sieval.tasks.gsm8k_0shot_gen import GSM8KZeroShotGenTask
+
+        config_path = self._config(
+            tmp_path,
+            f"""
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  invalid:
+    class: fake.GSM8KTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      {role}: {yaml_value}
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=GSM8KZeroShotGenTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI"
+            ) as client_factory,
+            pytest.raises(ValueError, match=rf"model role.*{role}"),
+        ):
+            session.prepare_prelaunch()
+
+        client_factory.assert_not_called()
 
     def test_derived_binding_evidence_is_resolved_once_for_shared_root(
         self, tmp_path: Path
@@ -2349,6 +2493,161 @@ tasks:
             grader.binding_id,
         }
 
+    def test_nested_inline_secret_is_redacted_from_stable_binding_identity(
+        self, tmp_path: Path
+    ) -> None:
+        bindings: list[InlineModelBinding] = []
+        plan_fingerprints: list[str] = []
+
+        with patch(
+            "sieval.core.models.connection_factory.AsyncOpenAI"
+        ) as client_factory:
+            for secret in ("SECRET-A", "SECRET-B"):
+                config_path = self._config(
+                    tmp_path,
+                    f"""
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      grader:
+        model: org/grader
+        args:
+          api_key: {secret}
+          temperature: 0
+""",
+                )
+                session = EvalSession(config_path)
+                with patch(
+                    "sieval.cli.leaderboard.session.resolve_task_class",
+                    return_value=self.JudgeTask,
+                ):
+                    result = session.prepare_prelaunch()
+
+                binding = session._task_requirement_contexts["judged"].model_bindings[
+                    "grader"
+                ]
+                assert isinstance(binding, InlineModelBinding)
+                bindings.append(binding)
+                plan_fingerprints.append(
+                    result.binding_plans[binding.binding_id].fingerprint
+                )
+                source = session._task_role_model_sources["judged"]["grader"]
+                assert secret in repr(source)
+
+        first, second = bindings
+        assert first.binding_id == second.binding_id
+        assert first.config == second.config
+        assert first.config["args"] == {"temperature": 0}
+        assert "SECRET-A" not in repr(first.config)
+        assert "SECRET-B" not in repr(second.config)
+        assert plan_fingerprints[0] == plan_fingerprints[1]
+        client_factory.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("nested", "expected_path"),
+        [(False, "helper"), (True, "settings.helper")],
+    )
+    def test_unregistered_model_task_arg_fails_before_model_io(
+        self,
+        tmp_path: Path,
+        nested: bool,
+        expected_path: str,
+    ) -> None:
+        class HelperTask(self.ChatTask):
+            def __init__(self, *, helper=None, settings=None):
+                del helper, settings
+
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  hidden:
+    class: fake.HelperTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args: {}
+""",
+        )
+        hidden_model = MockChatModel()
+        session = EvalSession(config_path)
+        tasks = session.config["tasks"]
+        assert isinstance(tasks, dict)
+        task = tasks["hidden"]
+        args = task["args"]
+        assert isinstance(args, dict)
+        if nested:
+            args["settings"] = {"helper": hidden_model}
+        else:
+            args["helper"] = hidden_model
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=HelperTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI"
+            ) as client_factory,
+            pytest.raises(
+                ValueError,
+                match=rf"outside registered model roles: {re.escape(expected_path)}",
+            ),
+        ):
+            session.prepare_prelaunch()
+
+        client_factory.assert_not_called()
+
+    def test_inline_sglang_legacy_role_fails_during_prelaunch(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            """
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      grader:
+        model: org/grader
+        dialect: sglang_legacy
+""",
+        )
+        session = EvalSession(config_path)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.JudgeTask,
+            ),
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI"
+            ) as client_factory,
+            pytest.raises(
+                ValueError,
+                match=r"inline grader.*sglang_legacy.*named model",
+            ),
+        ):
+            session.prepare_prelaunch()
+
+        client_factory.assert_not_called()
+
     @pytest.mark.anyio
     async def test_postlaunch_binds_pool_per_identity_and_shares_root_limiter(
         self, tmp_path: Path
@@ -3056,6 +3355,99 @@ tasks:
         await external._client.close()
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("order", [("a", "b"), ("b", "a")])
+    async def test_external_roles_with_one_binding_keep_each_source_derivation(
+        self, tmp_path: Path, order: tuple[str, str]
+    ) -> None:
+        from sieval.core.models import ChatModel
+
+        task_blocks = "\n".join(
+            f"""  {name}:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args: {{}}"""
+            for name in order
+        )
+        config_path = self._config(
+            tmp_path,
+            f"""
+models:
+  candidate:
+    name: org/candidate
+    api_base: https://candidate.example/v1
+    api_key: candidate-key
+tasks:
+{task_blocks}
+""",
+        )
+        base = ChatModel(
+            model="org/external-grader",
+            api_base="https://external.example/v1",
+            api_key="external-key",
+            concurrency_limit=8,
+        )
+        derived = {
+            "a": base.with_args(
+                temperature=0,
+                extra={"source": "a"},
+                concurrency_limit=2,
+            ),
+            "b": base.with_args(
+                temperature=1,
+                extra={"source": "b"},
+                concurrency_limit=3,
+            ),
+        }
+        assert derived["a"].runtime_plan is derived["b"].runtime_plan
+
+        session = EvalSession(config_path)
+        tasks = cast(dict, session.config["tasks"])
+        for name in order:
+            task = cast(dict, tasks[name])
+            cast(dict, task["args"])["grader"] = derived[name]
+
+        candidate_close = AsyncMock()
+        candidate_connection = types.SimpleNamespace(close=candidate_close)
+        external_close = AsyncMock()
+        try:
+            with (
+                patch(
+                    "sieval.cli.leaderboard.session.resolve_task_class",
+                    return_value=self.JudgeTask,
+                ),
+                patch(
+                    "sieval.core.models.connection_factory.AsyncOpenAI",
+                    return_value=candidate_connection,
+                ),
+                patch.object(base.pool, "aclose", external_close),
+            ):
+                session._setup_prelaunch_reconciliation()
+                session._setup_postlaunch_reconciliation()
+                session._setup_models()
+
+                postlaunch = session.postlaunch_reconcile_result
+                assert postlaunch is not None
+                assert base.runtime_plan is not None
+                rebound_plan = postlaunch.runtime_plans[base.runtime_plan.binding_id]
+                for name in ("a", "b"):
+                    rebound = session._bound_task_role_models[name]["grader"]
+                    assert rebound._kwargs == {"temperature": 0 if name == "a" else 1}
+                    assert rebound.extra == {"source": name}
+                    assert rebound._limiter is derived[name]._limiter
+                    assert rebound.pool is base.pool
+                    assert rebound.runtime_plan is rebound_plan
+
+                assert base.pool not in session._owned_pools.values()
+                await session._close_owned_model_resources()
+
+            candidate_close.assert_awaited_once()
+            external_close.assert_not_awaited()
+        finally:
+            await base.aclose()
+
+    @pytest.mark.anyio
     async def test_external_runtime_plan_preserves_request_safety_checks(
         self, tmp_path: Path
     ) -> None:
@@ -3728,6 +4120,33 @@ class TestInferArgs:
         runner.runner = MultiTaskRunner()
         return runner
 
+    @pytest.mark.parametrize("key", ["name", "dataset", "model", "models_by_role"])
+    def test_setup_tasks_defensively_rejects_composition_owned_arg(self, key):
+        mock_task_cls = MagicMock(return_value=MagicMock())
+        runner = self._make_runner(
+            {
+                "eval_task": {
+                    "class": "fake.Task",
+                    "dataset": "ds",
+                    "model": "m",
+                    "args": {key: None},
+                }
+            },
+            models={"m": MockChatModel()},
+            datasets={"ds": MagicMock()},
+        )
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=mock_task_cls,
+            ),
+            pytest.raises(ValueError, match=rf"composition-owned.*{key}"),
+        ):
+            runner._setup_tasks()
+
+        mock_task_cls.assert_not_called()
+
     def test_infer_args_override_model_kwargs(self):
         """infer_args should override model's default _kwargs via with_args()."""
         mock_model = MockChatModel(temperature=0.0, max_tokens=16384)
@@ -3914,6 +4333,67 @@ class TestInferArgs:
         assert task.model.pool is base_model.pool
         assert task.model._limiter is base_model._limiter
         assert task.model.runtime_plan is base_model.runtime_plan
+
+    @pytest.mark.parametrize(
+        "task_class_name",
+        [
+            "AdvancedIFZeroShotGenTask",
+            "ComplexConstraintsZeroShotGenTask",
+            "InverseIFEvalZeroShotGenTask",
+        ],
+    )
+    def test_bound_grader_is_injected_into_real_role_aware_task(
+        self, task_class_name: str
+    ) -> None:
+        from sieval.tasks.advanced_if_0shot_gen import AdvancedIFZeroShotGenTask
+        from sieval.tasks.complex_constraints_0shot_gen import (
+            ComplexConstraintsZeroShotGenTask,
+        )
+        from sieval.tasks.inverse_ifeval_0shot_gen import (
+            InverseIFEvalZeroShotGenTask,
+        )
+
+        task_classes = {
+            task_class.__name__: task_class
+            for task_class in (
+                AdvancedIFZeroShotGenTask,
+                ComplexConstraintsZeroShotGenTask,
+                InverseIFEvalZeroShotGenTask,
+            )
+        }
+        task_class = task_classes[task_class_name]
+        candidate = MockChatModel()
+        grader = MockChatModel()
+        runner = self._make_runner(
+            {
+                "judged": {
+                    "class": f"fake.{task_class_name}",
+                    "dataset": "ds",
+                    "model": "candidate",
+                    "args": {"grader": {"model": "raw-inline-grader"}},
+                }
+            },
+            models={"candidate": candidate},
+            datasets={"ds": MagicMock()},
+        )
+        runner._bound_task_role_models = {"judged": {"grader": grader}}
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=task_class,
+            ),
+            patch(
+                "sieval.tasks.advanced_if_0shot_gen.load_judge_prompts",
+                return_value=None,
+            ),
+        ):
+            runner._setup_tasks()
+
+        assert runner.runner is not None
+        task = runner.runner._runners[0]._task
+        assert isinstance(task, task_class)
+        assert task._grader is grader
 
     def test_infer_args_e2e_yaml(self, tmp_path):
         """Full YAML E2E: infer_args overrides model defaults in task config."""

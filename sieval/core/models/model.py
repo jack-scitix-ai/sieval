@@ -53,6 +53,7 @@ from .dialect import (
     validate_runtime_binding_plan,
 )
 from .dialect_registry import (
+    _compat_model_input_kind,
     bind_dialect,
     capability_decisions_for,
     get_dialect_spec,
@@ -648,14 +649,8 @@ class Model:
         lifecycle ownership.
         """
 
-        from .chat_model import ChatModel
-        from .gen_model import GenModel
-
-        if model_type is ChatModel:
-            expected_input_kind = "chat"
-        elif model_type is GenModel:
-            expected_input_kind = "completion"
-        else:
+        expected_input_kind = _compat_model_input_kind(model_type)
+        if expected_input_kind is None:
             raise TypeError("model_type must be exactly ChatModel or GenModel")
 
         dialect_spec = get_dialect_spec(self.dialect_id)

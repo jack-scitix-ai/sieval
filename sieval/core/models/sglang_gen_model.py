@@ -105,12 +105,13 @@ def _validate_legacy_request_leaves(req: Request) -> None:
         if key not in SGLANG_LEGACY_DIALECT_OPTION_KEYS:
             rejected.append(path)
             continue
+        owner = _SGLANG_LEGACY_CANONICAL_OPTION_OWNERS.get(key)
+        if owner is not None:
+            rejected.append(f"{path} (use canonical request leaf {owner})")
+            continue
         if value is None:
             rejected.append(f"{path} (null values are not lowered)")
             continue
-        owner = _SGLANG_LEGACY_CANONICAL_OPTION_OWNERS.get(key)
-        if owner is not None and owner in active:
-            rejected.append(f"{path} (duplicates {owner})")
 
     if options is not None and {"prefill", "prefix"} <= set(options.values):
         rejected.append("dialect_options.prefix (duplicates dialect_options.prefill)")

@@ -54,6 +54,10 @@ from sieval.core.models.ir import (
 )
 from sieval.core.types import JSONValue
 
+_PREFILL_UNSUPPORTED_REASON = (
+    "assistant prefill is a chat input operation, not a completion operation"
+)
+
 
 def _decisions() -> Mapping[CapabilityKey, DialectCapabilityDecision]:
     decisions: dict[CapabilityKey, DialectCapabilityDecision] = {
@@ -99,9 +103,7 @@ def _decisions() -> Mapping[CapabilityKey, DialectCapabilityDecision]:
         "multimodal_input": Unsupported(
             "the completions endpoint accepts text prompts only"
         ),
-        "prefill": Unsupported(
-            "assistant prefill is a chat input operation, not a completion operation"
-        ),
+        "prefill": Unsupported(_PREFILL_UNSUPPORTED_REASON),
         "fim": Supported(
             DialectCapabilityBinding("fim", request_leaves=("input.completion.suffix",))
         ),
@@ -198,8 +200,6 @@ _IR_OWNED_BODY_KEYS = BINDING_RESOURCE_KEYS | frozenset(
         "previous_response_id",
         "session_id",
         "opaque_continuation",
-        "prefill",
-        "prefix",
         "stream",
         "stream_options",
         "extra_body",
@@ -383,7 +383,9 @@ class OpenAICompletionsDialect:
                 continue
             if path.startswith("dialect_options."):
                 key = path.removeprefix("dialect_options.")
-                if key in _IR_OWNED_BODY_KEYS:
+                if key in {"prefill", "prefix"}:
+                    audit.rejected(path, _PREFILL_UNSUPPORTED_REASON)
+                elif key in _IR_OWNED_BODY_KEYS:
                     audit.rejected(
                         path,
                         f"{key!r} is owned by a first-class request field",

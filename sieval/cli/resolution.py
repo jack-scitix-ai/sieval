@@ -17,6 +17,7 @@ AI-Generated Code - Claude Opus 5 (1M context) (Anthropic)
 import copy
 import hashlib
 import importlib
+import inspect
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from typing import Any, Literal, cast
 
 from loguru import logger
 
+from sieval.core.models.deployment import BINDING_RESOURCE_KEYS
 from sieval.core.models.requirements import (
     AggregatedTaskRequirements,
     InlineModelBinding,
@@ -40,6 +42,229 @@ from sieval.core.types import JSONValue
 # Registry for simple name lookups
 DATASET_MODULE = "sieval.datasets"
 TASK_MODULE = "sieval.tasks"
+
+# Task arguments that describe a model binding rather than ordinary task data.
+# Keep the pre-session config adapter and EvalSession composition root on this
+# single role vocabulary so a newly supported role cannot work in only one CLI
+# entry point.
+TASK_MODEL_ROLES = ("grader", "extractor")
+_TASK_MODEL_ROLE_SENTINELS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {"extractor": frozenset({"self"})}
+)
+COMPOSITION_OWNED_TASK_ARGS = frozenset({"dataset", "model", "models_by_role", "name"})
+_INLINE_SECRET_KEYS = frozenset({"api_key", "authorization"})
+
+
+def is_task_model_role_sentinel(role: str, source: object) -> bool:
+    """Return whether ``source`` is an explicit sentinel admitted for ``role``."""
+
+    return isinstance(source, str) and source in _TASK_MODEL_ROLE_SENTINELS.get(
+        role, ()
+    )
+
+
+def validate_task_config_args(
+    task_name: str,
+    task_args: Mapping[str, object],
+    *,
+    task_class: type[Any] | None = None,
+) -> None:
+    """Reject composition-owned keys and role arguments a task cannot receive."""
+
+    reserved = sorted(COMPOSITION_OWNED_TASK_ARGS & set(task_args))
+    if reserved:
+        raise ValueError(
+            f"Task '{task_name}' args cannot set composition-owned constructor "
+            "argument(s): " + ", ".join(reserved)
+        )
+    if task_class is None:
+        return
+
+    configured_roles = set(TASK_MODEL_ROLES) & set(task_args)
+    if not configured_roles:
+        return
+
+    try:
+        constructor_parameters = inspect.signature(task_class.__init__).parameters
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"Cannot inspect {task_class.__name__}.__init__ for model-role arguments"
+        ) from exc
+    unsupported_roles = sorted(
+        role for role in configured_roles if role not in constructor_parameters
+    )
+    if unsupported_roles:
+        formatted = ", ".join(repr(role) for role in unsupported_roles)
+        raise ValueError(
+            f"Task '{task_name}' config supplies model role(s) {formatted}, but "
+            f"{task_class.__name__} does not declare matching constructor arguments"
+        )
+
+
+def binding_resource_argument_paths(
+    arguments: Mapping[str, object],
+    *,
+    allowed: frozenset[str] = frozenset(),
+) -> tuple[str, ...]:
+    """Return binding-resource names misplaced on a request/default surface."""
+
+    paths = {
+        str(key)
+        for key in arguments
+        if isinstance(key, str) and key in BINDING_RESOURCE_KEYS and key not in allowed
+    }
+    for container_name in ("extra_body", "extra_wire_params"):
+        nested = arguments.get(container_name)
+        if not isinstance(nested, Mapping):
+            continue
+        paths.update(
+            f"{container_name}.{key}"
+            for key in nested
+            if isinstance(key, str) and key in BINDING_RESOURCE_KEYS
+        )
+    return tuple(sorted(paths))
+
+
+def _safe_inline_model_config(
+    config: Mapping[str, object],
+) -> dict[str, JSONValue]:
+    """Copy an inline binding without putting raw credentials in setup data."""
+
+    safe: dict[str, JSONValue] = {}
+    for key, value in config.items():
+        if not isinstance(key, str):
+            raise TypeError("inline model config keys must be strings")
+        if key in _INLINE_SECRET_KEYS:
+            continue
+        if key == "args" and isinstance(value, Mapping):
+            value = {
+                nested_key: nested_value
+                for nested_key, nested_value in value.items()
+                if nested_key not in _INLINE_SECRET_KEYS
+            }
+        safe[key] = cast(JSONValue, copy.deepcopy(value))
+    return safe
+
+
+def normalize_inline_model_binding(
+    task_name: str,
+    role: str,
+    raw_config: Mapping[str, object],
+) -> InlineModelBinding:
+    """Normalize one inline role binding identically before and inside a session."""
+
+    allowed_inline = frozenset(
+        {
+            "api_base",
+            "api_key",
+            "capabilities",
+            "dialect",
+            "engine",
+            "max_retries",
+            "model",
+            "service_role",
+        }
+    )
+    misplaced = binding_resource_argument_paths(
+        raw_config,
+        allowed=allowed_inline,
+    )
+    raw_args = raw_config.get("args", {})
+    if not isinstance(raw_args, Mapping):
+        raise ValueError(f"Task '{task_name}' inline {role} args must be a mapping")
+    nested = binding_resource_argument_paths(
+        cast(Mapping[str, object], raw_args),
+        allowed=frozenset({"api_base", "api_key", "max_retries"}),
+    )
+    paths = (*misplaced, *(f"args.{path}" for path in nested))
+    if paths:
+        raise ValueError(
+            f"Task '{task_name}' inline {role} places binding resource(s) "
+            f"on an unsupported surface: {', '.join(paths)}"
+        )
+
+    requested_model_id = raw_config.get("model")
+    if not isinstance(requested_model_id, str) or not requested_model_id:
+        raise ValueError(
+            f"Task '{task_name}' inline {role} model requires a non-empty 'model'"
+        )
+    safe_config = _safe_inline_model_config(raw_config)
+    encoded = json.dumps(
+        safe_config,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    binding_id = f"inline:{task_name}:{role}:{digest}"
+    dialect = raw_config.get("dialect", "openai_chat")
+    if not isinstance(dialect, str) or not dialect:
+        raise ValueError(
+            f"Task '{task_name}' inline {role} dialect must be a non-empty string"
+        )
+    if dialect == "sglang_legacy":
+        raise ValueError(
+            f"Task '{task_name}' inline {role} cannot use the named-model-only "
+            "sglang_legacy bypass; configure a named model or use a bindable dialect"
+        )
+    return InlineModelBinding(
+        binding_id=binding_id,
+        root_deployment_key=f"deployment:{binding_id}",
+        requested_model_id=requested_model_id,
+        config=safe_config,
+        dialect_id=dialect,
+    )
+
+
+def validate_task_model_requirements(
+    task_class: type[Any],
+    context: RequirementContext,
+    raw_records: object,
+) -> tuple[TaskModelRequirement, ...]:
+    """Validate one task hook's complete projection of normalized bindings.
+
+    The hook may describe each binding's requirements, but it may neither
+    replace a normalized binding nor omit one supplied by configuration.  Both
+    pre-session config resolution and :class:`EvalSession` call this function
+    so dry-run and execution reject the same incomplete role projection.
+    """
+
+    hook_name = f"{task_class.__name__}.model_requirements_for()"
+    if not isinstance(raw_records, tuple):
+        raise TypeError(f"{hook_name} must return a tuple")
+
+    records: list[TaskModelRequirement] = []
+    declared_roles: set[str] = set()
+    for record in raw_records:
+        if not isinstance(record, TaskModelRequirement):
+            raise TypeError(f"{hook_name} returned a non-TaskModelRequirement value")
+        expected = context.model_bindings.get(record.role)
+        if expected is None:
+            raise ValueError(f"{hook_name} declared unknown model role {record.role!r}")
+        if record.binding != expected:
+            raise ValueError(
+                f"{hook_name} changed the normalized binding for role {record.role!r}"
+            )
+        records.append(record)
+        declared_roles.add(record.role)
+
+    undeclared_roles = sorted(set(context.model_bindings) - declared_roles)
+    if undeclared_roles:
+        formatted_roles = ", ".join(repr(role) for role in undeclared_roles)
+        raise ValueError(
+            f"{hook_name} did not declare normalized model role(s): {formatted_roles}"
+        )
+
+    auxiliary_roles = declared_roles - {"candidate", "model"}
+    if auxiliary_roles:
+        constructor_parameters = inspect.signature(task_class.__init__).parameters
+        if "models_by_role" not in constructor_parameters:
+            raise ValueError(
+                f"{hook_name} declares auxiliary model role(s) "
+                f"{', '.join(sorted(auxiliary_roles))}, but "
+                f"{task_class.__name__}.__init__ does not accept models_by_role"
+            )
+    return tuple(records)
 
 
 def load_class_from_path(class_path: str) -> type:
@@ -325,35 +550,19 @@ def resolve_config_model_types(
         context = _config_requirement_context(
             task_name,
             task_config,
+            task_class,
             candidate,
             datasets,
         )
         requirement_hook = getattr(task_class, "model_requirements_for", None)
         if not callable(requirement_hook):
             continue
-        task_records = requirement_hook(context)
-        if not isinstance(task_records, tuple):
-            raise TypeError(
-                f"{task_class.__name__}.model_requirements_for() must return a tuple"
-            )
-        for record in task_records:
-            if not isinstance(record, TaskModelRequirement):
-                raise TypeError(
-                    f"{task_class.__name__}.model_requirements_for() returned a "
-                    "non-TaskModelRequirement value"
-                )
-            expected = context.model_bindings.get(record.role)
-            if expected is None:
-                raise ValueError(
-                    f"{task_class.__name__}.model_requirements_for() declared "
-                    f"unknown model role {record.role!r}"
-                )
-            if record.binding != expected:
-                raise ValueError(
-                    f"{task_class.__name__}.model_requirements_for() changed the "
-                    f"normalized binding for role {record.role!r}"
-                )
-            records.append(record)
+        task_records = validate_task_model_requirements(
+            task_class,
+            context,
+            requirement_hook(context),
+        )
+        records.extend(task_records)
 
     by_root_bindings: dict[str, list[NamedModelBinding]] = {}
     for binding in bindings.values():
@@ -470,24 +679,45 @@ def _config_task_model_name(
 def _config_requirement_context(
     task_name: str,
     task_config: Mapping[str, Any],
+    task_class: type[Any],
     candidate: NamedModelBinding,
     datasets: Mapping[str, dict[str, Any]],
 ) -> RequirementContext:
-    raw_args = task_config.get("args") or {}
+    raw_args = task_config.get("args")
+    if raw_args is None:
+        raw_args = {}
     if not isinstance(raw_args, Mapping):
         raise ValueError(f"Task '{task_name}' args must be a dictionary")
+    validate_task_config_args(task_name, raw_args, task_class=task_class)
     task_args = copy.deepcopy(dict(raw_args))
     model_bindings: dict[str, NamedModelBinding | InlineModelBinding] = {
         "candidate": candidate
     }
 
-    grader = task_args.pop("grader", None)
-    if grader is not None:
-        if not isinstance(grader, Mapping):
+    for role in TASK_MODEL_ROLES:
+        role_source = task_args.get(role)
+        if is_task_model_role_sentinel(role, role_source):
+            # Preserve the sentinel as task data. The task requirement hook
+            # projects only the candidate, and task construction resolves the
+            # extractor after candidate ``infer_args`` have been applied.
+            continue
+        task_args.pop(role, None)
+        if role_source is None:
+            continue
+        if not isinstance(role_source, Mapping):
             raise ValueError(
-                f"Task '{task_name}' grader must be an inline mapping before launch"
+                f"Task '{task_name}' {role} must be "
+                + (
+                    "'self' or an inline mapping before launch"
+                    if role == "extractor"
+                    else "an inline mapping before launch"
+                )
             )
-        model_bindings["grader"] = _config_inline_binding(task_name, "grader", grader)
+        model_bindings[role] = normalize_inline_model_binding(
+            task_name,
+            role,
+            role_source,
+        )
 
     dataset_ref = task_config.get("dataset")
     if isinstance(dataset_ref, str):
@@ -499,51 +729,22 @@ def _config_requirement_context(
         # normal config validator reports the missing dataset later.
         dataset_config = {}
 
-    infer_args = task_config.get("infer_args") or {}
+    infer_args = task_config.get("infer_args")
+    if infer_args is None:
+        infer_args = {}
     if not isinstance(infer_args, Mapping):
         raise ValueError(f"Task '{task_name}' infer_args must be a dictionary")
+    misplaced_resources = binding_resource_argument_paths(infer_args)
+    if misplaced_resources:
+        raise ValueError(
+            f"Task '{task_name}' infer_args cannot change binding resources: "
+            + ", ".join(misplaced_resources)
+        )
     return RequirementContext(
         model_bindings=model_bindings,
         task_args=cast(Mapping[str, JSONValue], task_args),
         dataset_config=cast(Mapping[str, JSONValue], copy.deepcopy(dataset_config)),
         infer_args=cast(Mapping[str, JSONValue], copy.deepcopy(dict(infer_args))),
-    )
-
-
-def _config_inline_binding(
-    task_name: str,
-    role: str,
-    raw_config: Mapping[str, Any],
-) -> InlineModelBinding:
-    requested = raw_config.get("model")
-    if not isinstance(requested, str) or not requested:
-        raise ValueError(
-            f"Task '{task_name}' inline {role} model requires a non-empty 'model'"
-        )
-    safe_config = {
-        str(key): copy.deepcopy(value)
-        for key, value in raw_config.items()
-        if key not in {"api_key", "authorization"}
-    }
-    encoded = json.dumps(
-        safe_config,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    digest = hashlib.sha256(encoded).hexdigest()[:16]
-    dialect = raw_config.get("dialect", "openai_chat")
-    if not isinstance(dialect, str) or not dialect:
-        raise ValueError(
-            f"Task '{task_name}' inline {role} dialect must be a non-empty string"
-        )
-    binding_id = f"inline:{task_name}:{role}:{digest}"
-    return InlineModelBinding(
-        binding_id=binding_id,
-        root_deployment_key=f"deployment:{binding_id}",
-        requested_model_id=requested,
-        config=cast(Mapping[str, JSONValue], safe_config),
-        dialect_id=dialect,
     )
 
 

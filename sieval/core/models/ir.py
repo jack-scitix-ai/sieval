@@ -15,7 +15,7 @@ from typing import Literal, cast
 from sieval.core.types import JSONValue
 from sieval.core.utils.serialization import sieval_record
 
-from .deployment import EngineSource
+from ._engine_source import EngineSource
 
 # ---------------------------------------------------------------------------
 # Typed input

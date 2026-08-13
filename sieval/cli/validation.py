@@ -19,7 +19,12 @@ from typing import Any, NotRequired, TypedDict, cast
 import yaml
 
 from sieval.cli.leaderboard.session import RootConfigDict
-from sieval.cli.resolution import resolve_dataset_class, resolve_task_class
+from sieval.cli.resolution import (
+    binding_resource_argument_paths,
+    resolve_dataset_class,
+    resolve_task_class,
+    validate_task_config_args,
+)
 from sieval.core.models.capabilities import (
     CAPABILITY_KEYS,
     CapabilityConfigError,
@@ -446,6 +451,30 @@ def _validate_tasks(cfg: dict, result: ValidationResult) -> None:
             result.errors.append(
                 f"Task '{name}': 'model' required when multiple models are defined"
             )
+
+        task_args = tcfg.get("args")
+        if task_args is not None:
+            if not isinstance(task_args, dict):
+                result.errors.append(f"Task '{name}': 'args' must be a dictionary")
+            else:
+                try:
+                    validate_task_config_args(name, task_args)
+                except (TypeError, ValueError) as exc:
+                    result.errors.append(str(exc))
+
+        infer_args = tcfg.get("infer_args")
+        if infer_args is not None:
+            if not isinstance(infer_args, dict):
+                result.errors.append(
+                    f"Task '{name}': 'infer_args' must be a dictionary"
+                )
+            else:
+                misplaced = binding_resource_argument_paths(infer_args)
+                if misplaced:
+                    result.errors.append(
+                        f"Task '{name}' infer_args cannot change binding resources: "
+                        + ", ".join(misplaced)
+                    )
 
 
 def _validate_runner_config(cfg: dict, result: ValidationResult) -> None:

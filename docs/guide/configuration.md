@@ -15,7 +15,7 @@ runner_config:
 
 models:
     base_model:
-        name: "gpt-4o"
+        name: "gpt-3.5-turbo-instruct"
         type: "gen"
         args:
             max_retries: 3

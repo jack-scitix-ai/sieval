@@ -12,17 +12,15 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from types import MappingProxyType, TracebackType
-from typing import Any, Literal, Self, cast
+from typing import Any, Self, cast
 from urllib.parse import urlsplit
 
 import anyio
 
 from sieval.core.utils.concurrency import CompositeLimiter
 
+from ._engine_source import EngineSource
 from ._fingerprint import fingerprint_mapping
-
-EngineSource = Literal["deployment", "config", "unknown"]
-
 
 # These names select or mutate binding resources; they are never provider wire
 # extensions.  Composition layers and the legacy ``Model`` bridge share this

@@ -213,8 +213,9 @@ class Task[
         try:
             binding = context.model_bindings[role]
         except KeyError as exc:
+            article = "an" if role[0].lower() in "aeiou" else "a"
             raise ValueError(
-                f"{cls.__name__} requires a {role!r} model binding"
+                f"{cls.__name__} requires {article} {role!r} model binding"
             ) from exc
         meta = cls.__dict__.get("_sieval_task_meta")
         source_task = getattr(meta, "name", cls.__name__)

@@ -65,9 +65,11 @@ FORBIDDEN: dict[str, set[str]] = {
 # dotted sub-package -> sub-packages it must NOT import. FORBIDDEN is keyed on a
 # single segment, so it cannot express an edge *inside* a layer: `cli/` depends
 # on every layer, which says nothing about its own sub-packages reaching into
-# each other. `sieval.cli.resolution` exists to remove the edge below.
+# each other. `sieval.cli.resolution` removes the first edge below; the second
+# keeps provider wire lowering independent of runtime-plan reconciliation.
 FORBIDDEN_SUBPACKAGE: dict[str, set[str]] = {
     "sieval.cli.infer": {"sieval.cli.leaderboard"},
+    "sieval.core.models.dialects": {"sieval.core.models.reconcile"},
 }
 
 # Guard: a non-dotted entry can never match a resolved module, so the rule would

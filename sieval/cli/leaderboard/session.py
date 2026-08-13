@@ -27,10 +27,16 @@ from packaging.version import InvalidVersion, Version
 from sieval import __version__
 from sieval.cli.leaderboard.card import AlignmentCard, load_card
 from sieval.cli.resolution import (
+    TASK_MODEL_ROLES,
+    binding_resource_argument_paths,
     derive_model_type,
+    is_task_model_role_sentinel,
+    normalize_inline_model_binding,
     resolve_dataset_class,
     resolve_task_class,
     validate_named_config_map,
+    validate_task_config_args,
+    validate_task_model_requirements,
 )
 from sieval.core.datasets import Dataset
 from sieval.core.models import ChatModel, GenModel, Model, SglangGenModel
@@ -50,7 +56,6 @@ from sieval.core.models.connection_factory import (
     ConnectionRequest,
 )
 from sieval.core.models.deployment import (
-    BINDING_RESOURCE_KEYS,
     ConnectionPool,
     Deployment,
     DeploymentPlanProjection,
@@ -111,6 +116,41 @@ _PR1_REQUEST_VERIFIERS = {
     "sampled_logprobs": "validate_response_channel",
     "top_logprobs": "validate_response_channel",
 }
+
+
+def _model_value_paths(value: object) -> tuple[str, ...]:
+    """Return paths to Models hidden below an ordinary task-argument surface."""
+
+    found: list[str] = []
+    pending: list[tuple[str, object]] = [("", value)]
+    visited: set[int] = set()
+    while pending:
+        path, current = pending.pop()
+        if isinstance(current, Model):
+            found.append(path or "<root>")
+            continue
+        if isinstance(current, Mapping):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            pending.extend(
+                (
+                    f"{path}.{key}" if path else str(key),
+                    nested,
+                )
+                for key, nested in current.items()
+            )
+            continue
+        if isinstance(current, list | tuple):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            pending.extend(
+                (f"{path}[{index}]", nested) for index, nested in enumerate(current)
+            )
+    return tuple(sorted(found))
 
 
 class _PR1CompatibilityServingReconciler:
@@ -1358,32 +1398,6 @@ class EvalSession:
             dialect_id = "openai_chat" if model_type == "chat" else "openai_completions"
         return dataclasses.replace(binding, dialect_id=dialect_id)
 
-    @staticmethod
-    def _resource_argument_paths(
-        arguments: Mapping[str, object],
-        *,
-        allowed: frozenset[str] = frozenset(),
-    ) -> tuple[str, ...]:
-        """Return binding-resource names misplaced on a request surface."""
-
-        paths = {
-            str(key)
-            for key in arguments
-            if isinstance(key, str)
-            and key in BINDING_RESOURCE_KEYS
-            and key not in allowed
-        }
-        for container_name in ("extra_body", "extra_wire_params"):
-            nested = arguments.get(container_name)
-            if not isinstance(nested, Mapping):
-                continue
-            paths.update(
-                f"{container_name}.{key}"
-                for key in nested
-                if isinstance(key, str) and key in BINDING_RESOURCE_KEYS
-            )
-        return tuple(sorted(paths))
-
     def _validate_named_resource_config(
         self,
         model_name: str,
@@ -1407,7 +1421,7 @@ class EvalSession:
             if is_root
             else frozenset({"capabilities", "dialect", "service_role"})
         )
-        misplaced = self._resource_argument_paths(
+        misplaced = binding_resource_argument_paths(
             config,
             allowed=allowed_top_level,
         )
@@ -1419,7 +1433,7 @@ class EvalSession:
             if is_root
             else frozenset()
         )
-        nested = self._resource_argument_paths(
+        nested = binding_resource_argument_paths(
             cast(Mapping[str, object], raw_args),
             allowed=allowed_args,
         )
@@ -1430,87 +1444,6 @@ class EvalSession:
                 f"{kind} model '{model_name}' places binding resource(s) on an "
                 f"unsupported surface: {', '.join(paths)}"
             )
-
-    @staticmethod
-    def _safe_inline_config(config: Mapping[str, object]) -> dict[str, JSONValue]:
-        """Copy an inline binding without putting raw credentials in setup data."""
-
-        safe: dict[str, JSONValue] = {}
-        for key, value in config.items():
-            if not isinstance(key, str):
-                raise TypeError("inline model config keys must be strings")
-            if key in {"api_key", "authorization"}:
-                continue
-            if key == "args" and isinstance(value, Mapping):
-                value = {
-                    nested_key: nested_value
-                    for nested_key, nested_value in value.items()
-                    if nested_key not in {"api_key", "authorization"}
-                }
-            safe[key] = cast(JSONValue, copy.deepcopy(value))
-        return safe
-
-    def _normalized_inline_binding(
-        self,
-        task_name: str,
-        role: str,
-        raw_config: Mapping[str, object],
-    ) -> InlineModelBinding:
-        allowed_inline = frozenset(
-            {
-                "api_base",
-                "api_key",
-                "capabilities",
-                "dialect",
-                "engine",
-                "max_retries",
-                "model",
-                "service_role",
-            }
-        )
-        misplaced = self._resource_argument_paths(
-            raw_config,
-            allowed=allowed_inline,
-        )
-        raw_args = raw_config.get("args", {})
-        if not isinstance(raw_args, Mapping):
-            raise ValueError(f"Task '{task_name}' inline {role} args must be a mapping")
-        nested = self._resource_argument_paths(
-            cast(Mapping[str, object], raw_args),
-            allowed=frozenset({"api_base", "api_key", "max_retries"}),
-        )
-        paths = (*misplaced, *(f"args.{path}" for path in nested))
-        if paths:
-            raise ValueError(
-                f"Task '{task_name}' inline {role} places binding resource(s) "
-                f"on an unsupported surface: {', '.join(paths)}"
-            )
-        requested_model_id = raw_config.get("model")
-        if not isinstance(requested_model_id, str) or not requested_model_id:
-            raise ValueError(
-                f"Task '{task_name}' inline {role} model requires a non-empty 'model'"
-            )
-        safe_config = self._safe_inline_config(raw_config)
-        encoded = json.dumps(
-            safe_config,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
-        digest = hashlib.sha256(encoded).hexdigest()[:16]
-        binding_id = f"inline:{task_name}:{role}:{digest}"
-        dialect = raw_config.get("dialect", "openai_chat")
-        if not isinstance(dialect, str) or not dialect:
-            raise ValueError(
-                f"Task '{task_name}' inline {role} dialect must be a non-empty string"
-            )
-        return InlineModelBinding(
-            binding_id=binding_id,
-            root_deployment_key=f"deployment:{binding_id}",
-            requested_model_id=requested_model_id,
-            config=safe_config,
-            dialect_id=dialect,
-        )
 
     def _normalized_external_binding(
         self,
@@ -1555,22 +1488,24 @@ class EvalSession:
         self,
         task_name: str,
         task_cfg: Mapping[str, Any],
+        task_class: type[Any],
         candidate: NamedModelBinding,
     ) -> RequirementContext:
         raw_task_args = self._normalize_dict(
             task_cfg.get("args"), f"Task '{task_name}' args"
         )
+        validate_task_config_args(
+            task_name,
+            raw_task_args,
+            task_class=task_class,
+        )
         json_task_args = dict(raw_task_args)
         bindings: dict[str, NormalizedModelBinding] = {"candidate": candidate}
         sources: dict[str, object] = {"candidate": candidate.config_name}
 
-        for role in ("grader", "extractor"):
+        for role in TASK_MODEL_ROLES:
             role_source = json_task_args.get(role)
-            if (
-                role == "extractor"
-                and isinstance(role_source, str)
-                and role_source == "self"
-            ):
+            if is_task_model_role_sentinel(role, role_source):
                 # Keep the sentinel in task_args. Task construction resolves it
                 # against the candidate only after task infer_args are applied.
                 continue
@@ -1582,7 +1517,7 @@ class EvalSession:
                     task_name, role, role_source
                 )
             elif isinstance(role_source, Mapping):
-                role_binding = self._normalized_inline_binding(
+                role_binding = normalize_inline_model_binding(
                     task_name, role, role_source
                 )
             else:
@@ -1600,14 +1535,18 @@ class EvalSession:
                 role_binding.binding_id, role_binding
             )
 
-        for key, value in tuple(json_task_args.items()):
-            if isinstance(value, Model):
-                json_task_args.pop(key)
+        hidden_model_paths = _model_value_paths(json_task_args)
+        if hidden_model_paths:
+            raise ValueError(
+                f"Task '{task_name}' args contain Model value(s) outside registered "
+                f"model roles: {', '.join(hidden_model_paths)}. Use one of: "
+                + ", ".join(TASK_MODEL_ROLES)
+            )
 
         infer_args = self._normalize_dict(
             task_cfg.get("infer_args"), f"Task '{task_name}' infer_args"
         )
-        misplaced_resources = self._resource_argument_paths(infer_args)
+        misplaced_resources = binding_resource_argument_paths(infer_args)
         if misplaced_resources:
             raise ValueError(
                 f"Task '{task_name}' infer_args cannot change binding resources: "
@@ -1645,6 +1584,28 @@ class EvalSession:
                 if plan is not None and plan.binding_id == binding_id:
                     return source
         return None
+
+    def _external_model_for_task_role(
+        self,
+        task_name: str,
+        role: str,
+        binding_id: str,
+    ) -> Model:
+        """Return the exact caller-owned source attached to one task role."""
+
+        source = self._task_role_model_sources.get(task_name, {}).get(role)
+        if not isinstance(source, Model) or source.runtime_plan is None:
+            raise ValueError(
+                f"External binding '{binding_id}' lost the model source for "
+                f"task {task_name!r} role {role!r}"
+            )
+        if source.runtime_plan.binding_id != binding_id:
+            raise ValueError(
+                f"External model source for task {task_name!r} role {role!r} "
+                f"changed binding identity from '{binding_id}' to "
+                f"'{source.runtime_plan.binding_id}'"
+            )
+        return source
 
     def _external_runtime_plans_for_root(
         self, root_deployment_key: str
@@ -2212,7 +2173,10 @@ class EvalSession:
             task_class = resolve_task_class(task_spec)
             model_name = self._task_model_config_name(task_name, task_cfg, models_cfg)
             context = self._requirement_context_for_task(
-                task_name, task_cfg, named_by_config[model_name]
+                task_name,
+                task_cfg,
+                task_class,
+                named_by_config[model_name],
             )
             self._task_requirement_contexts[task_name] = context
             requirement_hook = getattr(task_class, "model_requirements_for", None)
@@ -2220,29 +2184,12 @@ class EvalSession:
                 raise TypeError(
                     f"{task_class.__name__} has no model_requirements_for() hook"
                 )
-            task_records = requirement_hook(context)
-            if not isinstance(task_records, tuple):
-                raise TypeError(
-                    f"{task_class.__name__}.model_requirements_for() must "
-                    "return a tuple"
-                )
+            task_records = validate_task_model_requirements(
+                task_class,
+                context,
+                requirement_hook(context),
+            )
             for record in task_records:
-                if not isinstance(record, TaskModelRequirement):
-                    raise TypeError(
-                        f"{task_class.__name__}.model_requirements_for() returned "
-                        "a non-TaskModelRequirement value"
-                    )
-                expected_binding = context.model_bindings.get(record.role)
-                if expected_binding is None:
-                    raise ValueError(
-                        f"{task_class.__name__}.model_requirements_for() declared "
-                        f"unknown model role {record.role!r}"
-                    )
-                if record.binding != expected_binding:
-                    raise ValueError(
-                        f"{task_class.__name__}.model_requirements_for() changed "
-                        f"the normalized binding for role {record.role!r}"
-                    )
                 existing = self._normalized_model_bindings.get(
                     record.binding.binding_id
                 )
@@ -2948,11 +2895,11 @@ class EvalSession:
                 if role in {"candidate", "model"}:
                     continue
                 if isinstance(binding, ExternalModelBinding):
-                    live_model = self._external_model_for_binding(binding.binding_id)
-                    if live_model is None:
-                        raise ValueError(
-                            f"External binding '{binding.binding_id}' lost its model"
-                        )
+                    live_model = self._external_model_for_task_role(
+                        task_name,
+                        role,
+                        binding.binding_id,
+                    )
                     runtime_plan = result.runtime_plans[binding.binding_id]
                     rebound = live_model.with_dialect(
                         runtime_plan.dialect_id, runtime_plan
@@ -3249,6 +3196,16 @@ class EvalSession:
 
             task_class = resolve_task_class(task_spec)
 
+            task_args = self._normalize_dict(
+                task_cfg.get("args", {}),
+                f"Task '{task_name}' args",
+            )
+            validate_task_config_args(
+                task_name,
+                task_args,
+                task_class=task_class,
+            )
+
             # Resolve dataset
             dataset = self._resolve_task_dataset(task_cfg, task_name)
 
@@ -3269,10 +3226,6 @@ class EvalSession:
                 )
 
             # Create task instance
-            task_args = self._normalize_dict(
-                task_cfg.get("args", {}),
-                f"Task '{task_name}' args",
-            )
             models_by_role = getattr(self, "_bound_task_role_models", {}).get(task_name)
             if models_by_role is not None:
                 # Role-aware tasks reject two competing sources. Post-launch

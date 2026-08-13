@@ -24,6 +24,7 @@ from sieval.cli.resolution import (
 )
 from sieval.core.models.requirements import (
     AggregatedTaskRequirements,
+    InlineModelBinding,
     InputKind,
     TaskModelRequirement,
     TaskRequirements,
@@ -248,6 +249,9 @@ class TestResolveConfigModelTypes:
     class MisleadingCompletionTask:
         model_type = "chat"  # Legacy metadata must not be consulted.
 
+        def __init__(self, *, grader=None, models_by_role=None):
+            del grader, models_by_role
+
         @classmethod
         def model_requirements_for(cls, context):
             return (
@@ -256,6 +260,45 @@ class TestResolveConfigModelTypes:
                     binding=context.model_bindings["candidate"],
                     requires=TaskRequirements(input=InputKind.COMPLETION),
                     source_task="normalized_completion",
+                ),
+            )
+
+    class CompletionWithExtractorTask:
+        def __init__(self, *, extractor=None, models_by_role=None):
+            del extractor, models_by_role
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            assert "extractor" not in context.task_args
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.COMPLETION),
+                    source_task="completion_with_extractor",
+                ),
+                TaskModelRequirement(
+                    role="extractor",
+                    binding=context.model_bindings["extractor"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="completion_with_extractor",
+                ),
+            )
+
+    class CompletionWithSelfExtractorTask:
+        def __init__(self, *, extractor=None, models_by_role=None):
+            del extractor, models_by_role
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            assert context.task_args["extractor"] == "self"
+            assert "extractor" not in context.model_bindings
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.COMPLETION),
+                    source_task="completion_with_self_extractor",
                 ),
             )
 
@@ -287,6 +330,270 @@ class TestResolveConfigModelTypes:
                 return_value=self.MisleadingCompletionTask,
             ),
             pytest.raises(ValueError, match="checked assertion"),
+        ):
+            resolve_config_model_types(config)
+
+    def test_inline_extractor_is_available_to_requirement_hook(self):
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {
+                        "extractor": {
+                            "model": "org/extractor",
+                            "api_key": "secret",
+                        }
+                    },
+                }
+            },
+        }
+        with patch(
+            "sieval.cli.resolution.resolve_task_class",
+            return_value=self.CompletionWithExtractorTask,
+        ):
+            result = resolve_config_model_types(config)
+
+        assert result.model_types_by_config == {"m": "gen"}
+
+    def test_inline_sglang_legacy_role_is_rejected_during_resolution(self):
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {
+                        "extractor": {
+                            "model": "org/extractor",
+                            "dialect": "sglang_legacy",
+                        }
+                    },
+                }
+            },
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.CompletionWithExtractorTask,
+            ),
+            pytest.raises(
+                ValueError,
+                match=r"inline extractor.*sglang_legacy.*named model",
+            ),
+        ):
+            resolve_config_model_types(config)
+
+    def test_configured_role_must_be_declared_by_requirement_hook(self):
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {"grader": {"model": "org/grader"}},
+                }
+            },
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.MisleadingCompletionTask,
+            ),
+            pytest.raises(
+                ValueError,
+                match=(
+                    r"MisleadingCompletionTask\.model_requirements_for\(\) "
+                    r"did not declare normalized model role\(s\): 'grader'"
+                ),
+            ),
+        ):
+            resolve_config_model_types(config)
+
+    def test_self_extractor_remains_task_arg_and_reuses_candidate(self):
+        from sieval.tasks.agieval_0shot_gen import AGIEvalZeroShotGenTask
+
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {"extractor": "self"},
+                }
+            },
+        }
+        with patch(
+            "sieval.cli.resolution.resolve_task_class",
+            return_value=AGIEvalZeroShotGenTask,
+        ):
+            result = resolve_config_model_types(config)
+
+        assert result.model_types_by_config == {"m": "chat"}
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("name", None),
+            ("dataset", {}),
+            ("model", None),
+            ("models_by_role", {}),
+        ],
+    )
+    def test_composition_owned_task_args_are_rejected_by_presence(self, key, value):
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {key: value},
+                }
+            },
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.MisleadingCompletionTask,
+            ),
+            pytest.raises(ValueError, match=rf"composition-owned.*{key}"),
+        ):
+            resolve_config_model_types(config)
+
+    @pytest.mark.parametrize(
+        ("role", "source"),
+        [
+            ("grader", None),
+            ("extractor", None),
+            ("extractor", "self"),
+            ("extractor", {"model": "org/extractor"}),
+        ],
+    )
+    def test_non_owner_task_cannot_configure_model_role(self, role, source):
+        from sieval.tasks.gsm8k_0shot_gen import GSM8KZeroShotGenTask
+
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {role: source},
+                }
+            },
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=GSM8KZeroShotGenTask,
+            ),
+            pytest.raises(ValueError, match=rf"model role.*{role}"),
+        ):
+            resolve_config_model_types(config)
+
+    def test_nested_inline_secret_is_absent_and_does_not_change_binding_id(self):
+        captured: list[InlineModelBinding] = []
+
+        class CapturingJudgeTask:
+            def __init__(self, *, grader=None, models_by_role=None):
+                del grader, models_by_role
+
+            @classmethod
+            def model_requirements_for(cls, context):
+                candidate = TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="capturing_judge",
+                )
+                grader = TaskModelRequirement(
+                    role="grader",
+                    binding=context.model_bindings["grader"],
+                    requires=TaskRequirements(input=InputKind.CHAT),
+                    source_task="capturing_judge",
+                )
+                assert isinstance(grader.binding, InlineModelBinding)
+                captured.append(grader.binding)
+                return (candidate, grader)
+
+        configs = []
+        for secret in ("SECRET-A", "SECRET-B"):
+            config = {
+                "models": {"m": {"name": "org/candidate"}},
+                "tasks": {
+                    "task": {
+                        "model": "m",
+                        "class": "fake.Task",
+                        "args": {
+                            "grader": {
+                                "model": "org/grader",
+                                "args": {
+                                    "api_key": secret,
+                                    "temperature": 0,
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+            configs.append(config)
+            with patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=CapturingJudgeTask,
+            ):
+                resolve_config_model_types(config)
+
+        first, second = captured
+        assert first.binding_id == second.binding_id
+        assert first.config == second.config
+        assert "SECRET-A" not in repr(first.config)
+        assert "SECRET-B" not in repr(second.config)
+        assert first.config["args"] == {"temperature": 0}
+        assert "SECRET-A" in repr(configs[0])
+
+    @pytest.mark.parametrize(
+        ("field", "value", "match"),
+        [
+            ("args", [], "args must be a dictionary"),
+            ("infer_args", [], "infer_args must be a dictionary"),
+            ("infer_args", {"api_key": "secret"}, "binding resources.*api_key"),
+        ],
+    )
+    def test_config_adapter_rejects_invalid_task_argument_surfaces(
+        self, field, value, match
+    ):
+        task = {"model": "m", "class": "fake.Task", field: value}
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {"task": task},
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.MisleadingCompletionTask,
+            ),
+            pytest.raises(ValueError, match=match),
+        ):
+            resolve_config_model_types(config)
+
+    def test_non_self_extractor_string_is_rejected(self):
+        config = {
+            "models": {"m": {"name": "org/candidate"}},
+            "tasks": {
+                "task": {
+                    "model": "m",
+                    "class": "fake.Task",
+                    "args": {"extractor": "itself"},
+                }
+            },
+        }
+        with (
+            patch(
+                "sieval.cli.resolution.resolve_task_class",
+                return_value=self.CompletionWithSelfExtractorTask,
+            ),
+            pytest.raises(ValueError, match="extractor must be 'self'"),
         ):
             resolve_config_model_types(config)
 

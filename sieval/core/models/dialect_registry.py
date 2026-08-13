@@ -3,7 +3,9 @@
 Descriptors are serializable symbol metadata.  Binders are ordinary functions
 and exist only for dialect packages that are executable in the current delivery
 step.  Keeping those registries separate makes a reserved dialect visible
-without pretending that it can be bound.
+without pretending that it can be bound.  Legacy wrapper identities also
+register here so ``Model`` can recognize their exact classes without importing
+those wrappers back and recreating a runtime dependency cycle.
 
 AI-Generated Code - GPT-5.6 (OpenAI)
 """
@@ -50,6 +52,21 @@ from .ir import (
 
 if TYPE_CHECKING:
     from .reconcile import RuntimeBindingPlan
+
+
+_COMPAT_MODEL_INPUT_KINDS: dict[type[Any], str] = {}
+
+
+def _register_compat_model_type(model_type: type[Any], input_kind: str) -> None:
+    """Register one exact legacy wrapper class and its provider-neutral input kind."""
+
+    _COMPAT_MODEL_INPUT_KINDS[model_type] = input_kind
+
+
+def _compat_model_input_kind(model_type: type[Any]) -> str | None:
+    """Return the input kind registered for an exact legacy wrapper class."""
+
+    return _COMPAT_MODEL_INPUT_KINDS.get(model_type)
 
 
 class DialectRegistryError(ValueError):

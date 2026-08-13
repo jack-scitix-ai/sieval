@@ -352,6 +352,23 @@ class TestValidationAndAudit:
 
         create.assert_not_awaited()
 
+    @pytest.mark.parametrize("key", ["prefill", "prefix"])
+    def test_prefill_option_reports_actual_protocol_limitation(self, key: str) -> None:
+        req = Request(
+            input=CompletionInput("x"),
+            dialect_options=DialectOptions(
+                "openai_completions", {key: "assistant text"}
+            ),
+        )
+        dialect, create = _dialect(_response())
+        audit = RequestAudit(active_request_leaves(req))
+
+        dialect.validate_request(req, audit, _Plan())
+        with pytest.raises(RequestAuditError, match="chat input operation"):
+            audit.raise_rejections()
+
+        create.assert_not_awaited()
+
 
 class TestWirePreparation:
     @pytest.mark.anyio

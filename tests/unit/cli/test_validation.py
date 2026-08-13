@@ -787,6 +787,59 @@ class TestValidateTasks:
         assert not result.ok
         assert any("'model' must be a string" in e for e in result.errors)
 
+    @pytest.mark.parametrize("field", ["args", "infer_args"])
+    def test_task_argument_container_must_be_dictionary(self, field):
+        cfg = {
+            "models": {"m": {"name": "gpt-4"}},
+            "datasets": {"d": {"class": "X"}},
+            "tasks": {
+                "t": {
+                    "class": "X",
+                    "dataset": "d",
+                    "model": "m",
+                    field: [],
+                }
+            },
+        }
+        result = validate_eval_config(cfg)
+        assert not result.ok
+        assert any(f"'{field}' must be a dictionary" in e for e in result.errors)
+
+    @pytest.mark.parametrize("key", ["name", "dataset", "model", "models_by_role"])
+    def test_composition_owned_task_arg_is_rejected_by_presence(self, key):
+        cfg = {
+            "models": {"m": {"name": "gpt-4"}},
+            "datasets": {"d": {"class": "X"}},
+            "tasks": {
+                "t": {
+                    "class": "X",
+                    "dataset": "d",
+                    "model": "m",
+                    "args": {key: None},
+                }
+            },
+        }
+        result = validate_eval_config(cfg)
+        assert not result.ok
+        assert any("composition-owned" in e and key in e for e in result.errors)
+
+    def test_task_infer_args_cannot_contain_binding_resource(self):
+        cfg = {
+            "models": {"m": {"name": "gpt-4"}},
+            "datasets": {"d": {"class": "X"}},
+            "tasks": {
+                "t": {
+                    "class": "X",
+                    "dataset": "d",
+                    "model": "m",
+                    "infer_args": {"api_key": "secret"},
+                }
+            },
+        }
+        result = validate_eval_config(cfg)
+        assert not result.ok
+        assert any("binding resources" in e and "api_key" in e for e in result.errors)
+
     def test_task_missing_class(self):
         cfg = {
             "models": {"m": {"name": "gpt-4"}},

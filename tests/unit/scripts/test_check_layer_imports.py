@@ -1027,3 +1027,35 @@ class TestCheckSubpackageImports:
         for root, targets in FORBIDDEN_SUBPACKAGE.items():
             assert root.startswith("sieval.")
             assert all(t.startswith("sieval.") for t in targets)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "from sieval.core.models.reconcile import RuntimeBindingPlan\n",
+            "import sieval.core.models.reconcile\n",
+            "from sieval.core.models import reconcile\n",
+            "from ..reconcile import RuntimeBindingPlan\n",
+        ],
+    )
+    def test_wire_dialects_cannot_import_reconciliation(
+        self, tmp_path: Path, body: str
+    ):
+        f = self._write(
+            tmp_path,
+            "sieval/core/models/dialects/provider.py",
+            body,
+        )
+        errors = _check_subpackage_imports(f, ast.parse(body))
+        assert len(errors) == 1
+        assert (
+            "sieval.core.models.dialects must not import sieval.core.models.reconcile"
+        ) in errors[0]
+
+    def test_wire_dialects_can_import_neutral_model_records(self, tmp_path: Path):
+        body = "from sieval.core.models.ir import Request, Response\n"
+        f = self._write(
+            tmp_path,
+            "sieval/core/models/dialects/provider.py",
+            body,
+        )
+        assert _check_subpackage_imports(f, ast.parse(body)) == []

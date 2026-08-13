@@ -84,7 +84,7 @@ class PassthroughObservation:
 
 @dataclass(frozen=True)
 class PreparedRequest:
-    """Dialect-local wire preparation plus independently auditable evidence."""
+    """Dialect-local wire preparation plus explicit audit evidence."""
 
     operation: str
     body: Mapping[str, Any]

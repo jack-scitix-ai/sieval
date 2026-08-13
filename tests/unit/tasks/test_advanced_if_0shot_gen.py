@@ -148,6 +148,33 @@ def test_build_grader_accepts_mapping_and_model():
     assert AdvancedIFZeroShotGenTask._build_grader(existing) is existing
 
 
+def test_constructor_accepts_composed_grader_model():
+    base, grader = _task()
+    task = AdvancedIFZeroShotGenTask(
+        base.dataset,
+        base.model,
+        models_by_role={"grader": grader},
+    )
+    assert task._grader is grader
+
+
+def test_constructor_rejects_missing_composed_grader_role():
+    base, _ = _task()
+    with pytest.raises(ValueError, match="missing the 'grader'"):
+        AdvancedIFZeroShotGenTask(base.dataset, base.model, models_by_role={})
+
+
+def test_constructor_rejects_ambiguous_grader_sources():
+    base, grader = _task()
+    with pytest.raises(ValueError, match="cannot both be supplied"):
+        AdvancedIFZeroShotGenTask(
+            base.dataset,
+            base.model,
+            grader=grader,
+            models_by_role={"grader": grader},
+        )
+
+
 # --- preprocess ---
 
 

@@ -281,6 +281,45 @@ class TestLegacyRequestGate:
         await model.aclose()
 
     @pytest.mark.anyio
+    async def test_canonical_owned_dialect_option_is_always_rejected(self) -> None:
+        transport = _ImmediateTransport()
+        model, _ = _legacy_model(transport)
+        req = Request(
+            input=CompletionInput("prompt"),
+            dialect_options=DialectOptions("sglang_legacy", {"max_tokens": 3}),
+        )
+
+        with pytest.raises(
+            RequestAuditError,
+            match=r"dialect_options\.max_tokens.*sampling\.max_tokens",
+        ):
+            await model.arun(req)
+
+        assert transport.requests == []
+        await model.aclose()
+
+    @pytest.mark.anyio
+    async def test_prefill_aliases_cannot_both_be_supplied(self) -> None:
+        transport = _ImmediateTransport()
+        model, _ = _legacy_model(transport)
+        req = Request(
+            input=CompletionInput("prompt"),
+            dialect_options=DialectOptions(
+                "sglang_legacy",
+                {"prefill": "first", "prefix": "second"},
+            ),
+        )
+
+        with pytest.raises(
+            RequestAuditError,
+            match=r"dialect_options\.prefix.*dialect_options\.prefill",
+        ):
+            await model.arun(req)
+
+        assert transport.requests == []
+        await model.aclose()
+
+    @pytest.mark.anyio
     async def test_lowered_leaves_and_stream_noop_reach_transport(self) -> None:
         transport = _ImmediateTransport()
         model, _ = _legacy_model(transport)
