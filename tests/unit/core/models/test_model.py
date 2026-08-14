@@ -564,6 +564,11 @@ class TestBuildGenerateRequest:
         req = self._model()._build_generate_request("p", stop=["\n\n", "Q:"])
         assert req.sampling.stop == ("\n\n", "Q:")
 
+    def test_stop_tuple_becomes_tuple(self):
+        """Bind time stores a tuple default unconverted, so this path sees one."""
+        req = self._model()._build_generate_request("p", stop=("\n\n", "Q:"))
+        assert req.sampling.stop == ("\n\n", "Q:")
+
     def test_top_k_kwarg_is_sampling_top_k(self):
         """`top_k` is the vLLM/sglang sampling knob, not the logprobs count."""
         req = self._model()._build_generate_request("p", top_k=40)
@@ -644,6 +649,45 @@ class TestBuilderValidation:
     def _model(self):
         return GenModel(model="m", api_key="k")
 
+    @pytest.mark.parametrize(
+        "default",
+        [{"a", "b"}, (item for item in ["a", "b"])],
+        ids=["set", "generator"],
+    )
+    def test_binding_rejects_default_params_that_cannot_round_trip(self, default):
+        """``default_params`` is persisted: a ``set`` reorders, a generator empties."""
+        with pytest.raises(
+            TypeError, match="default_params.stop must be JSON-compatible"
+        ):
+            GenModel(model="m", api_key="k", stop=default)
+
+    def test_with_args_rejects_default_params_that_cannot_round_trip(self):
+        model = GenModel(model="m", api_key="k")
+
+        with pytest.raises(
+            TypeError, match="default_params.stop must be JSON-compatible"
+        ):
+            model.with_args(stop={"a", "b"})
+
+    def test_meta_keeps_tuple_default_params(self):
+        model = GenModel(model="m", api_key="k", stop=("a", "b"))
+
+        assert model.meta()["default_params"]["stop"] == ["a", "b"]
+
+    @pytest.mark.parametrize(
+        "stop",
+        [{"a", "b"}, (item for item in ["a", "b"])],
+        ids=["set", "generator"],
+    )
+    def test_call_time_stop_is_refused_on_the_same_terms_as_a_default(self, stop):
+        """``stop`` lands in the persisted ``request_params``, so it needs an order.
+
+        The builder pops ``stop`` before the JSON check runs, so narrowing that
+        check alone left this path taking any iterable.
+        """
+        with pytest.raises(TypeError, match="stop must be a string, list, or tuple"):
+            self._model()._build_generate_request("p", stop=stop)
+
     def test_n_must_be_int(self):
         with pytest.raises(TypeError, match="n must be an int"):
             self._model()._build_generate_request("p", n="3")
@@ -691,7 +735,7 @@ class TestBuilderValidation:
             ({"temperature": True}, TypeError, "temperature must be a number"),
             ({"top_k": True}, TypeError, "top_k must be an integer"),
             ({"stop": ["ok", 1]}, TypeError, "only strings"),
-            ({"stop": 3}, TypeError, "string or iterable"),
+            ({"stop": 3}, TypeError, "string, list, or tuple"),
             ({"return_logprobs": "yes"}, TypeError, "must be a bool"),
             ({"logprobs": "five"}, TypeError, "bool or integer"),
             ({"top_logprobs": True}, TypeError, "must be an integer"),
@@ -733,6 +777,8 @@ class TestBuilderValidation:
         [
             ({1: "bad-key"}, "keys must be strings"),
             (object(), "JSON-compatible"),
+            ({"a", "b"}, "JSON-compatible"),
+            ((item for item in ["a"]), "JSON-compatible"),
         ],
     )
     def test_tool_choice_must_be_json_compatible(self, tool_choice, match):

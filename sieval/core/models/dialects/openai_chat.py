@@ -256,9 +256,15 @@ class _LegacyPlan:
 
 
 def _chat_usage_stats(raw: Any) -> UsageStats | None:
+    """Build usage from the reply's prompt and completion counts.
+
+    ``total_tokens`` is computed, not read: a reported total that does not
+    decompose is a bookkeeping quirk, and rejecting the reply would discard
+    tokens already generated and billed.
+    """
     if raw is None:
         return None
-    names = ("prompt_tokens", "completion_tokens", "total_tokens")
+    names = ("prompt_tokens", "completion_tokens")
     values: list[int] = []
     for name in names:
         value = getattr(raw, name, None)
@@ -267,14 +273,10 @@ def _chat_usage_stats(raw: Any) -> UsageStats | None:
                 f"chat usage.{name} must be a non-negative integer"
             )
         values.append(value)
-    if values[2] != values[0] + values[1]:
-        raise OutputContractError(
-            "chat usage.total_tokens must equal prompt_tokens + completion_tokens"
-        )
     return UsageStats(
         input_tokens=values[0],
         output_tokens=values[1],
-        total_tokens=values[2],
+        total_tokens=values[0] + values[1],
     )
 
 

@@ -183,6 +183,12 @@ _REMOVED_SUBCLASS_HOOKS = frozenset({"_agenerate_impl", "_alogprobs_impl"})
 
 
 def _named_json_value(value: object, name: str) -> JSONValue:
+    """Validate and detach a JSON value, naming the offending leaf on failure.
+
+    Sequences are ``list``/``tuple`` only: the result is persisted, and a
+    ``set`` would serialize in hash order while a generator would serialize
+    as ``[]`` once consumed.
+    """
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError(f"{name} must not contain a non-finite float")
@@ -196,9 +202,21 @@ def _named_json_value(value: object, name: str) -> JSONValue:
                 raise TypeError(f"{name} keys must be strings")
             result[key] = _named_json_value(item, f"{name}.{key}")
         return result
-    if isinstance(value, Iterable) and not isinstance(value, str | bytes):
+    if isinstance(value, list | tuple):
         return [_named_json_value(item, name) for item in value]
     raise TypeError(f"{name} must be JSON-compatible, got {type(value).__name__}")
+
+
+def _checked_builder_defaults(values: Mapping[str, object]) -> dict[str, object]:
+    """Reject builder defaults that ``meta()`` could not persist.
+
+    ``meta()`` runs once per response, so an unpersistable default would
+    otherwise raise only after a call had been billed. Values are stored
+    unconverted -- the request builders need them as given.
+    """
+    for key, value in values.items():
+        _named_json_value(value, f"default_params.{key}")
+    return dict(values)
 
 
 def _optional_float(value: object, name: str) -> float | None:
@@ -542,7 +560,7 @@ class Model:
         self._transport = dialect  # one-cycle private compatibility alias
         self._model = runtime_plan.requested_model_id
         self._api_base = api_base
-        self._kwargs = dict(builder_defaults)
+        self._kwargs = _checked_builder_defaults(builder_defaults)
         self._extra = dict(extra) if extra is not None else None
         self._limiter = local_limiter
         self._parent_limiter = parent_limiter
@@ -592,7 +610,7 @@ class Model:
             raise ValueError("concurrency_limit must be a positive integer")
 
         new_model = copy.copy(self)
-        new_model._kwargs = {**self._kwargs, **kwargs}
+        new_model._kwargs = _checked_builder_defaults({**self._kwargs, **kwargs})
         if extra is not None:
             new_model._extra = dict(extra)
         if concurrency_limit is not None:
@@ -936,13 +954,16 @@ class Model:
         if stop is not None:
             if isinstance(stop, str):
                 stop_value = (stop,)
-            elif isinstance(stop, Iterable):
+            elif isinstance(stop, list | tuple):
                 values = tuple(stop)
                 if not all(isinstance(item, str) for item in values):
                     raise TypeError("stop must contain only strings")
                 stop_value = cast(tuple[str, ...], values)
             else:
-                raise TypeError("stop must be a string or iterable of strings")
+                # ``list``/``tuple`` only, matching ``_named_json_value``: this
+                # value is echoed into the persisted ``request_params``, and a
+                # ``set`` would land there in hash order.
+                raise TypeError("stop must be a string, list, or tuple of strings")
         sampling = SamplingParams(
             temperature=_optional_float(temperature_value, "temperature"),
             top_p=_optional_float(top_p_value, "top_p"),
