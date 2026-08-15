@@ -19,11 +19,14 @@ decoding via the model config, not in this task.
 Infra: scoring lazily fetches the NLTK corpora it needs (punkt, stopwords,
 averaged_perceptron_tagger_eng) on first use if absent — an eval-time network
 dependency. The Docker image pre-bakes them; offline runs must pre-stage them
-(see SIEVAL_IFBENCH_NLTK_DATA in sieval.community.ifbench).
+(see SIEVAL_IFBENCH_NLTK_DATA in sieval.community.ifbench). That fetch cannot
+report its own failure (see ``_ensure_nltk_resources``), so this task verifies
+it before grading.
 
 AI-Generated Code - GPT-5 (OpenAI)
 """
 
+from functools import cache
 from typing import Any, override
 
 from sieval.core.models import ModelOutput
@@ -51,6 +54,65 @@ from sieval.datasets import IFBenchDatasetSample
 # `score` is loose prompt-level accuracy) -- the opposite of IFEval, where strict
 # is the headline; the shape is otherwise identical.
 _GRADES = ("strict", "loose")
+
+# Upstream's download list -- what `download_nltk_resources()` stages at import of
+# the vendored `instructions_util` -- as ``nltk.data.find`` lookup paths. Nothing
+# here downloads; this only *verifies* that staging, and a test drives upstream's
+# helper with every lookup failing to pin the two sets equal.
+#
+# Deliberately upstream's list, not the narrower set grading needs: on nltk >= 3.9
+# `tokenizers/punkt` is dead weight -- every call site resolves through punkt_tab,
+# including the explicit `nltk.data.load("nltk:tokenizers/punkt/english.pickle")`.
+# Keeping it holds the pin at equality, so a corpus added upstream cannot slip in
+# unverified; the price is refusing a box staged with only what grading needs.
+_NLTK_RESOURCES = (
+    "tokenizers/punkt",
+    "tokenizers/punkt_tab",
+    "corpora/stopwords",
+    "taggers/averaged_perceptron_tagger_eng",
+)
+
+
+@cache
+def _ensure_nltk_resources() -> None:
+    """Stop loudly if the corpora the vendored checkers need are not staged.
+
+    Upstream's `download_nltk_resources()` calls `nltk.download(..., quiet=True)`,
+    which defaults to ``raise_on_error=False``, and never re-checks -- so offline
+    the import completes as if the data were there, and the absence surfaces one
+    `LookupError` at a time, only in the checkers that reach NLTK.
+
+    That is not a failed run but a *wrong* one: those samples land in `fails` while
+    `report()`'s judged denominator scores the remainder -- the subset whose
+    constraints never touched NLTK, published under the full benchmark's name.
+    Checking all four up front makes the failure total instead: `fails` equals the
+    set size and the report's rates are all `0.0`, which only `fails` tells apart
+    from a model that followed no constraint.
+
+    Verification only -- upstream already spent the download attempt. The Multi-IF
+    sibling *does* download, in `_ensure_punkt_tab`, because its upstream ships no
+    such helper; the shapes differ because the two upstreams do.
+
+    `ifbench_0shot_gen_fixed` overrides only the checker registry, so it inherits
+    this. `functools.cache` stores return values only: success costs one pass over
+    `nltk.data.path`, and a failing box keeps raising per sample rather than being
+    marked done by the first.
+    """
+    import nltk
+
+    missing = []
+    for resource in _NLTK_RESOURCES:
+        try:
+            nltk.data.find(resource)
+        except LookupError:
+            missing.append(resource)
+    if missing:
+        raise LookupError(
+            "IFBench grading needs NLTK data that is not staged: "
+            f"{', '.join(missing)}. The vendored checkers fetch it on import, so "
+            "this means the download failed -- most likely no network access. "
+            "Pre-stage the corpora and point SIEVAL_IFBENCH_NLTK_DATA at them."
+        )
 
 
 @sieval_task(
@@ -150,6 +212,11 @@ class IFBenchZeroShotGenTask(
             test_instruction_following_loose,
             test_instruction_following_strict,
         )
+
+        # After the import, not before: importing the vendored fork is what
+        # triggers upstream's staging attempt, so there is nothing to verify
+        # until it has run.
+        _ensure_nltk_resources()
 
         graders = {
             "strict": test_instruction_following_strict,
