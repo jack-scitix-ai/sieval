@@ -18,6 +18,7 @@ import anyio
 import pytest
 import yaml
 
+from sieval.cli._filter_spec import VALUES_DIGEST_KEY, compute_values_digest
 from sieval.cli.leaderboard.session import (
     _NONMATCH_RUNNER_KEYS,
     _STRICT_RUNNER_KEYS,
@@ -44,6 +45,7 @@ from sieval.cli.leaderboard.session import (
     unwrap_proxies,
 )
 from sieval.cli.resolution import derive_model_type
+from sieval.cli.validation import _VALID_OPERATIONS
 from sieval.core.models.model import Model
 from sieval.core.models.reconcile import CheckStage, Configured, DeferredCheck
 from sieval.core.models.requirements import (
@@ -57,6 +59,14 @@ from sieval.core.models.requirements import (
 from sieval.core.runners import TaskRunnerConfig
 from sieval.core.runners.multi_runner import MultiTaskRunner
 from tests.conftest import MockChatModel
+
+
+def example_row_key(row: dict) -> str:
+    """A stand-in for a real key function, referenced by dotted path below."""
+    return f"{row.get('subset')}::{row.get('key')}"
+
+
+NOT_CALLABLE = "I am a string, not a function"
 
 
 def _write_yaml_config(tmp_path: Path, filename: str, content: str) -> Path:
@@ -125,14 +135,14 @@ class TestDatasetOperations:
                 {"by": "subset", "value": "gsm8k"},
                 "filter",
                 ("subset", "gsm8k"),
-                {"split": "test"},
+                {"require_all": False, "split": "test"},
             ),
             (
                 "filter",
                 {"by": "subset", "value": ["gsm8k", "svamp"]},
                 "filter",
                 ("subset", ["gsm8k", "svamp"]),
-                {"split": "test"},
+                {"require_all": False, "split": "test"},
             ),
         ],
     )
@@ -184,7 +194,11 @@ class TestDatasetOperations:
             ("slice", {}, "'slice' requires 'num'"),
             ("repeat", {}, "'repeat' requires 'times'"),
             ("filter", {}, "'filter' requires 'by'"),
-            ("filter", {"by": "subset"}, "'filter' requires 'value'"),
+            (
+                "filter",
+                {"by": "subset"},
+                "'filter' requires exactly one of 'value' or 'values_file'",
+            ),
         ],
     )
     def test_operation_required_args(self, op, missing_args, error_match):
@@ -205,7 +219,223 @@ class TestDatasetOperations:
         runner._apply_dataset_operations(
             ds, [{"filter": {"by": "n", "value": value}}], "test_ds"
         )
-        ds.filter.assert_called_once_with("n", value, split="test")
+        ds.filter.assert_called_once_with("n", value, require_all=False, split="test")
+
+    def test_the_unknown_operation_message_lists_every_valid_operation(self):
+        # This message omitted 'filter' for as long as 'filter' had existed, so
+        # a user who mistyped an operation was told it was not among four when
+        # it was among five. Derived from the validator's set rather than
+        # restated by hand, because a hand-written list is what drifted.
+        runner = self._make_runner()
+        with pytest.raises(ValueError, match="Unknown operation") as excinfo:
+            runner._apply_dataset_operations(MagicMock(), [{"nope": {}}], "test_ds")
+        listed = str(excinfo.value).split("Valid operations:")[1]
+        assert {op.strip() for op in listed.split(",")} == _VALID_OPERATIONS
+
+    # -- `by` in its three config forms -----------------------------------
+
+    def test_filter_by_a_list_of_columns_is_passed_through(self):
+        runner = self._make_runner()
+        ds = MagicMock()
+        ds.filter.return_value = ds
+
+        runner._apply_dataset_operations(
+            ds, [{"filter": {"by": ["a", "b"], "value": [["x", "y"]]}}], "test_ds"
+        )
+        ds.filter.assert_called_once_with(
+            ["a", "b"], [["x", "y"]], require_all=False, split="test"
+        )
+
+    def test_filter_by_a_callable_reference_resolves_to_the_function(self):
+        # The parity claim at its narrowest: what YAML names, `filter` receives
+        # as the very object a Python caller would have passed.
+        runner = self._make_runner()
+        ds = MagicMock()
+        ds.filter.return_value = ds
+
+        by = {"callable": f"{__name__}.example_row_key"}
+        runner._apply_dataset_operations(
+            ds, [{"filter": {"by": by, "value": "k"}}], "test_ds"
+        )
+        assert ds.filter.call_args.args[0] is example_row_key
+
+    @pytest.mark.parametrize(
+        "by,error_match",
+        [
+            ({"callable": "no_dots_here"}, "could not be resolved"),
+            ({"callable": ".relative"}, "could not be resolved"),
+            ({"callable": f"{__name__}.does_not_exist"}, "could not be resolved"),
+            ({"callable": f"{__name__}.NOT_CALLABLE"}, "not a callable"),
+            ({"callable": "x.y", "extra": 1}, "exactly one key, 'callable'"),
+            (42, "must be a column name"),
+            ([], "must name one or more columns"),
+            (["a", 2], "must name one or more columns"),
+        ],
+    )
+    def test_filter_by_rejects_a_reference_it_cannot_use(self, by, error_match):
+        runner = self._make_runner()
+        with pytest.raises(ValueError, match=error_match):
+            runner._apply_dataset_operations(
+                MagicMock(), [{"filter": {"by": by, "value": "k"}}], "test_ds"
+            )
+
+    def test_filter_by_callable_failure_names_the_dataset(self):
+        # Same obligation the other operation errors carry: a config with many
+        # datasets has to say which one is wrong.
+        runner = self._make_runner()
+        with pytest.raises(ValueError, match="Dataset 'ds7'"):
+            runner._apply_dataset_operations(
+                MagicMock(),
+                [{"filter": {"by": {"callable": "no_such_pkg.fn"}, "value": "k"}}],
+                "ds7",
+            )
+
+    # -- `values_file` ----------------------------------------------------
+
+    def _runner_at(self, config_dir):
+        runner = self._make_runner()
+        runner.config_path = Path(config_dir) / "eval.yaml"
+        return runner
+
+    def _filtered_values(self, tmp_path, filename, text):
+        (tmp_path / filename).write_text(text, encoding="utf-8")
+        runner = self._runner_at(tmp_path)
+        ds = MagicMock()
+        ds.filter.return_value = ds
+        runner._apply_dataset_operations(
+            ds, [{"filter": {"by": "id", "values_file": filename}}], "test_ds"
+        )
+        return ds.filter.call_args.args[1]
+
+    def test_values_file_reads_a_json_list(self, tmp_path):
+        assert self._filtered_values(tmp_path, "k.json", '["a", "b"]') == ["a", "b"]
+
+    def test_values_file_reads_a_json_object_as_its_keys(self, tmp_path):
+        # A selection usually arrives as a map from id to whatever justified
+        # picking it. Requiring it be stripped to a bare list first would mean
+        # the file that is kept is not the file the config reads.
+        assert self._filtered_values(
+            tmp_path, "k.json", '{"a": {"why": "x"}, "b": {"why": "y"}}'
+        ) == ["a", "b"]
+
+    def test_values_file_reads_one_value_per_line(self, tmp_path):
+        assert self._filtered_values(
+            tmp_path, "k.txt", "# picked by hand\na\n\n  b  \n"
+        ) == ["a", "b"]
+
+    def test_values_file_resolves_against_the_config_directory(self, tmp_path):
+        # The same rule `alignment.card` follows: stored verbatim, resolved
+        # relative to the config that named it.
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "k.json").write_text('["a"]', encoding="utf-8")
+        runner = self._runner_at(tmp_path)
+        ds = MagicMock()
+        ds.filter.return_value = ds
+
+        runner._apply_dataset_operations(
+            ds, [{"filter": {"by": "id", "values_file": "sub/k.json"}}], "test_ds"
+        )
+        assert ds.filter.call_args.args[1] == ["a"]
+
+    def test_values_file_accepts_an_absolute_path(self, tmp_path):
+        target = tmp_path / "elsewhere.json"
+        target.write_text('["a"]', encoding="utf-8")
+        runner = self._runner_at(tmp_path / "cfg")
+        ds = MagicMock()
+        ds.filter.return_value = ds
+
+        runner._apply_dataset_operations(
+            ds, [{"filter": {"by": "id", "values_file": str(target)}}], "test_ds"
+        )
+        assert ds.filter.call_args.args[1] == ["a"]
+
+    @pytest.mark.parametrize(
+        "filename,text,error_match",
+        [
+            ("k.json", "{not json", "not valid JSON"),
+            ("k.json", '"a string"', "must hold a JSON list"),
+        ],
+    )
+    def test_values_file_rejects_a_file_it_cannot_read_as_values(
+        self, tmp_path, filename, text, error_match
+    ):
+        (tmp_path / filename).write_text(text, encoding="utf-8")
+        runner = self._runner_at(tmp_path)
+        with pytest.raises(ValueError, match=error_match):
+            runner._apply_dataset_operations(
+                MagicMock(),
+                [{"filter": {"by": "id", "values_file": filename}}],
+                "test_ds",
+            )
+
+    def test_values_file_missing_raises(self, tmp_path):
+        runner = self._runner_at(tmp_path)
+        with pytest.raises(ValueError, match="'values_file' not found"):
+            runner._apply_dataset_operations(
+                MagicMock(),
+                [{"filter": {"by": "id", "values_file": "gone.json"}}],
+                "test_ds",
+            )
+
+    def test_filter_rejects_both_value_and_values_file(self):
+        runner = self._make_runner()
+        with pytest.raises(ValueError, match="exactly one of 'value' or"):
+            runner._apply_dataset_operations(
+                MagicMock(),
+                [{"filter": {"by": "id", "value": "a", "values_file": "k.json"}}],
+                "test_ds",
+            )
+
+    # -- `require_all` ----------------------------------------------------
+
+    def test_require_all_is_passed_through(self):
+        runner = self._make_runner()
+        ds = MagicMock()
+        ds.filter.return_value = ds
+
+        runner._apply_dataset_operations(
+            ds,
+            [{"filter": {"by": "id", "value": ["a"], "require_all": True}}],
+            "test_ds",
+        )
+        assert ds.filter.call_args.kwargs["require_all"] is True
+
+    def test_require_all_must_be_a_boolean(self):
+        # `require_all: "no"` is truthy in Python, so a string would arm the
+        # check while reading as if it turned it off.
+        runner = self._make_runner()
+        with pytest.raises(ValueError, match="'require_all' must be a boolean"):
+            runner._apply_dataset_operations(
+                MagicMock(),
+                [{"filter": {"by": "id", "value": "a", "require_all": "no"}}],
+                "test_ds",
+            )
+
+    # -- key names --------------------------------------------------------
+
+    def test_a_misspelled_optional_key_is_rejected_rather_than_ignored(self):
+        # The failure this closes: `require_all_keys` reads as `require_all`
+        # left at its default, so the run proceeds with the assertion silently
+        # disarmed — and reports a plausible number on a partial selection.
+        runner = self._make_runner()
+        with pytest.raises(
+            ValueError, match=r"unknown key\(s\) \['require_all_keys'\]"
+        ):
+            runner._apply_dataset_operations(
+                MagicMock(),
+                [{"filter": {"by": "id", "value": "a", "require_all_keys": True}}],
+                "test_ds",
+            )
+
+    def test_split_must_be_a_split_name(self):
+        # A non-string `split` matches no split, which keeps every row.
+        runner = self._make_runner()
+        with pytest.raises(ValueError, match="'split' must be a split name"):
+            runner._apply_dataset_operations(
+                MagicMock(),
+                [{"filter": {"by": "id", "value": "a", "split": ["test"]}}],
+                "test_ds",
+            )
 
     def test_chained_operations(self):
         runner = self._make_runner()
@@ -948,6 +1178,106 @@ class TestEvalSessionConfigLoading:
             runner._init_runner()
 
         assert multi_runner_cls.call_args.kwargs["deterministic"] is True
+
+
+# ===================================================================
+# filter values_file: pinned into the config the resume gate compares
+# ===================================================================
+class TestFilterValuesFilePinning:
+    """The selection lives outside the config, so the config must pin it.
+
+    ``effective_config.yaml`` records ``values_file`` as a path. Without a
+    digest beside it two runs whose persisted configs compare equal can score
+    different sample sets, and ``--resume`` accepts the second — the failure is
+    silent, which is what makes it worth a test at this level rather than a
+    unit test of the digest helper alone.
+    """
+
+    CONFIG = """
+result_dir: {result_dir}
+datasets:
+  curated:
+    class: fake.Dataset
+    operations:
+      - filter: {{by: id, values_file: picked.json}}
+"""
+
+    def _session(self, tmp_path, contents, *, result_dir="out"):
+        (tmp_path / "picked.json").write_text(contents, encoding="utf-8")
+        config_path = _write_yaml_config(
+            tmp_path,
+            "eval.yaml",
+            self.CONFIG.format(result_dir=str(tmp_path / result_dir)),
+        )
+        return EvalSession(config_path=str(config_path))
+
+    def _op(self, session):
+        return session._reified_config["datasets"]["curated"]["operations"][0]["filter"]
+
+    def test_the_digest_reaches_the_persisted_config(self, tmp_path):
+        # _reified_config is what _persist_effective_config dumps, so this is
+        # the view the resume gate compares.
+        session = self._session(tmp_path, '["a", "b"]')
+        assert self._op(session)[VALUES_DIGEST_KEY] == (
+            compute_values_digest(b'["a", "b"]')
+        )
+
+    def test_the_path_is_still_stored_verbatim(self, tmp_path):
+        # Portability is why the path is not resolved: effective_config.yaml
+        # has to stay meaningful on another machine.
+        session = self._session(tmp_path, '["a"]')
+        assert self._op(session)["values_file"] == "picked.json"
+
+    def test_editing_the_file_changes_the_persisted_config(self, tmp_path):
+        # The gate compares config bodies. Before this pin both bodies were
+        # byte-identical while the selection differed.
+        before = self._op(self._session(tmp_path, '["a", "b"]'))
+        after = self._op(self._session(tmp_path, '["a"]'))
+        assert before != after
+        assert before[VALUES_DIGEST_KEY] != after[VALUES_DIGEST_KEY]
+
+    def test_resume_aborts_when_the_values_file_changed(self, tmp_path):
+        # End to end through the real gate: persist, edit the file, resume.
+        session = self._session(tmp_path, '["a", "b"]')
+        anyio.run(session._persist_effective_config)
+
+        resumed = self._session(tmp_path, '["a"]')
+        resumed.resume_override = True
+        with pytest.raises(RuntimeError, match="does not match current invocation"):
+            anyio.run(resumed._persist_effective_config)
+
+    def test_resume_is_accepted_when_the_values_file_is_untouched(self, tmp_path):
+        # The other half: an unchanged file must not start failing resumes.
+        session = self._session(tmp_path, '["a", "b"]')
+        anyio.run(session._persist_effective_config)
+
+        resumed = self._session(tmp_path, '["a", "b"]')
+        resumed.resume_override = True
+        anyio.run(resumed._persist_effective_config)
+
+    def test_rerunning_a_persisted_config_verifies_its_own_digest(self, tmp_path):
+        # `sieval run effective_config.yaml` after the values file moved: the
+        # digest it carries is checked rather than silently re-pinned.
+        session = self._session(tmp_path, '["a", "b"]')
+        anyio.run(session._persist_effective_config)
+        persisted = Path(str(tmp_path / "out")) / "effective_config.yaml"
+        (tmp_path / "out" / "picked.json").write_text('["a"]', encoding="utf-8")
+
+        with pytest.raises(ValueError, match="has changed since this config"):
+            EvalSession(config_path=str(persisted))
+
+    def test_a_missing_values_file_is_reported_at_load(self, tmp_path):
+        config_path = _write_yaml_config(
+            tmp_path, "eval.yaml", self.CONFIG.format(result_dir=str(tmp_path / "out"))
+        )
+        with pytest.raises(ValueError, match="'values_file' not found"):
+            EvalSession(config_path=str(config_path))
+
+    def test_the_read_rechecks_the_digest(self, tmp_path):
+        # Closes the window between the load-time read and the apply-time one.
+        session = self._session(tmp_path, '["a"]')
+        with pytest.raises(ValueError, match="changed while the run was starting"):
+            session._read_filter_values("picked.json", "curated", "sha256:" + "0" * 64)
 
 
 # ===================================================================

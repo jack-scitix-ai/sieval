@@ -25,6 +25,18 @@ from loguru import logger
 from packaging.version import InvalidVersion, Version
 
 from sieval import __version__
+from sieval.cli._filter_spec import (
+    VALUES_DIGEST_KEY,
+    check_arg_names,
+    check_by,
+    check_by_digest,
+    check_values_source,
+    compute_values_digest,
+    key_function_spec,
+    pin_filter_digests,
+    relative_values_files,
+    resolve_values_path,
+)
 from sieval.cli.leaderboard.card import AlignmentCard, load_card
 from sieval.cli.resolution import (
     TASK_MODEL_ROLES,
@@ -33,12 +45,13 @@ from sieval.cli.resolution import (
     is_task_model_role_sentinel,
     normalize_inline_model_binding,
     resolve_dataset_class,
+    resolve_key_function,
     resolve_task_class,
     validate_named_config_map,
     validate_task_config_args,
     validate_task_model_requirements,
 )
-from sieval.core.datasets import Dataset
+from sieval.core.datasets import Dataset, TFilterKey
 from sieval.core.models import ChatModel, GenModel, Model, SglangGenModel
 from sieval.core.models.capabilities import (
     CAPABILITY_KEYS,
@@ -1121,6 +1134,11 @@ class EvalSession:
             model=model_override,
             result_dir=result_dir_override,
         )
+        # Before the copy, so the digests reach both the persisted view (and
+        # therefore --resume) and the runtime view below. Not where the
+        # operation runs: `arun` persists before `_prepare_execution`, so by
+        # then the comparison the digests exist for has already been made.
+        pin_filter_digests(reified, self.config_path.parent)
         self._reified_config: dict[str, Any] = copy.deepcopy(reified)
 
         # Runtime view = reified + the legacy external adapter (mutates
@@ -3088,22 +3106,34 @@ class EvalSession:
                     logger.debug("Dataset '{}': repeated {} times", dataset_name, times)
 
                 case "filter":
-                    by = op_args.get("by")
+                    by_spec = op_args.get("by")
                     split = op_args.get("split", "test")
-                    if by is None:
-                        raise ValueError(
-                            f"Dataset '{dataset_name}': 'filter' requires 'by'"
+                    by = self._resolve_filter_by(by_spec, dataset_name)
+                    problems = (
+                        check_arg_names(op_args)
+                        + check_values_source(op_args)
+                        + check_by_digest(op_args)
+                    )
+                    if problems:
+                        raise ValueError(f"Dataset '{dataset_name}': {problems[0]}")
+                    values_file = op_args.get("values_file")
+                    if values_file is not None:
+                        value = self._read_filter_values(
+                            values_file, dataset_name, op_args.get(VALUES_DIGEST_KEY)
                         )
-                    # Presence, not truthiness: `value: 0` and `value: false` are
-                    # legitimate column values and must not read as "omitted".
-                    if "value" not in op_args:
-                        raise ValueError(
-                            f"Dataset '{dataset_name}': 'filter' requires 'value'"
-                        )
-                    value = op_args["value"]
-                    dataset = dataset.filter(by, value, split=split)
+                    else:
+                        value = op_args["value"]
+                    require_all = op_args.get("require_all", False)
+                    dataset = dataset.filter(
+                        by, value, require_all=require_all, split=split
+                    )
                     logger.debug(
-                        "Dataset '{}': filtered to {}={}", dataset_name, by, value
+                        "Dataset '{}': filtered to {}={}",
+                        dataset_name,
+                        by_spec,
+                        f"<{len(value)} keys from {values_file}>"
+                        if values_file is not None
+                        else value,
                     )
 
                 case "stratified_sample":
@@ -3171,13 +3201,113 @@ class EvalSession:
                     )
 
                 case _:
+                    # Kept in step with `validation._VALID_OPERATIONS` by
+                    # `test_the_unknown_operation_message_lists_every_valid_operation`.
                     raise ValueError(
                         f"Dataset '{dataset_name}': Unknown operation '{op_name}'. "
-                        f"Valid operations: slice, shuffle, repeat, "
+                        f"Valid operations: filter, repeat, shuffle, slice, "
                         f"stratified_sample"
                     )
 
         return dataset
+
+    def _resolve_filter_by(self, by_spec: object, dataset_name: str) -> TFilterKey:
+        """A ``filter`` operation's ``by``, in any of its three config forms.
+
+        ``by: tag`` is a column, ``by: [tag, lang]`` a composite key, and
+        ``by: {callable: 'pkg.module.fn'}`` a derived one — the config spelling
+        of the callable a Python caller passes directly.
+
+        The shape check is :func:`~sieval.cli._filter_spec.check_by`, shared with
+        ``cli.validation``; only the resolution below is this surface's own.
+        """
+        problem = check_by(by_spec)
+        if problem is not None:
+            raise ValueError(f"Dataset '{dataset_name}': {problem}")
+        if isinstance(by_spec, str):
+            return by_spec
+        if isinstance(by_spec, list):
+            # cast, not a rebuild: `check_by` above has already established
+            # every element is a `str`, which the checker cannot see.
+            return cast(list[str], by_spec)
+        # `check_by` passed and the two column forms are out, so this is the
+        # callable form; `key_function_spec` is what read it there too.
+        spec = key_function_spec(by_spec)
+        assert spec is not None
+        try:
+            return resolve_key_function(spec)
+        except (ValueError, ImportError, AttributeError) as exc:
+            raise ValueError(
+                f"Dataset '{dataset_name}': 'filter' 'by' callable "
+                f"{spec!r} could not be resolved: {exc}"
+            ) from exc
+
+    def _read_filter_values(
+        self, values_file: object, dataset_name: str, expected_digest: object = None
+    ) -> list:
+        """The accepted values a ``filter`` operation's ``values_file`` names.
+
+        Reading happens here rather than in :meth:`Dataset.filter` so the
+        transform never learns where a config lives: the same selection stays
+        expressible from Python by passing the list directly.
+
+        A ``.json`` file is a list of values, or an object whose *keys* are the
+        values (so a map from id to whatever metadata produced the selection can
+        be used as-is). Anything else is one value per line, blanks and ``#``
+        comments skipped.
+
+        Only the JSON *list* form carries a type: lines are strings, and so are
+        an object's keys, so a numeric id column needs the list. A mismatch
+        raises rather than passing silently, but reads ``id=['0', '1']`` against
+        ``present values: [0, 1]`` — the difference is one pair of quotes.
+
+        *expected_digest* is the ``values_digest`` pinned at load time.
+        Re-checking it here closes the window between that read and this one, so
+        the digest stored beside the results describes the bytes the run
+        selected on, not the bytes that were there when the config was parsed.
+        """
+        if not isinstance(values_file, str):
+            raise ValueError(
+                f"Dataset '{dataset_name}': 'filter' 'values_file' must be a "
+                f"path; got {values_file!r}"
+            )
+        path = resolve_values_path(values_file, self.config_path.parent)
+        if not path.is_file():
+            raise ValueError(
+                f"Dataset '{dataset_name}': 'filter' 'values_file' not found: {path}"
+            )
+        data = path.read_bytes()
+        if expected_digest is not None:
+            digest = compute_values_digest(data)
+            if digest != expected_digest:
+                raise ValueError(
+                    f"Dataset '{dataset_name}': 'filter' 'values_file' {path} "
+                    f"changed while the run was starting ({VALUES_DIGEST_KEY} pinned "
+                    f"{expected_digest}, the file is now {digest})"
+                )
+        text = data.decode("utf-8")
+        if path.suffix == ".json":
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Dataset '{dataset_name}': 'filter' 'values_file' {path} is "
+                    f"not valid JSON: {exc}"
+                ) from exc
+            if isinstance(payload, dict):
+                return list(payload)
+            if not isinstance(payload, list):
+                raise ValueError(
+                    f"Dataset '{dataset_name}': 'filter' 'values_file' {path} "
+                    f"must hold a JSON list of values or an object keyed by "
+                    f"them; got {type(payload).__name__}"
+                )
+            return payload
+        return [
+            stripped
+            for line in text.splitlines()
+            if (stripped := line.strip()) and not stripped.startswith("#")
+        ]
 
     def _setup_tasks(self) -> None:
         """Initialize all tasks from config."""
@@ -3525,17 +3655,25 @@ class EvalSession:
             allow_unicode=True,
             sort_keys=False,
         )
+        extra_lines = [
+            "Reproduce:",
+            "  sieval run <this file>",
+            "    — universal; re-launches auto-served models",
+            "  sieval eval <this file>",
+            "    — only when every model already has api_base",
+        ]
+        if relative := relative_values_files(self._reified_config):
+            extra_lines += [
+                "",
+                "Relative filter values_file: " + ", ".join(relative),
+                "  resolves against the config being run, so reproduce from",
+                "  beside the source config above, or make the path absolute.",
+            ]
         header = _format_comment_header(
             title="Persisted by",
             source_config=str(self.config_path.resolve()),
             invocation=self.invocation,
-            extra_lines=[
-                "Reproduce:",
-                "  sieval run <this file>",
-                "    — universal; re-launches auto-served models",
-                "  sieval eval <this file>",
-                "    — only when every model already has api_base",
-            ],
+            extra_lines=extra_lines,
         )
         await self._persist_yaml_with_strict_resume(
             target_name="effective_config.yaml",

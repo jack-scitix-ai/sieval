@@ -18,6 +18,12 @@ from typing import Any, NotRequired, TypedDict, cast
 
 import yaml
 
+from sieval.cli._filter_spec import (
+    check_arg_names,
+    check_by,
+    check_by_digest,
+    check_values_source,
+)
 from sieval.cli.leaderboard.session import RootConfigDict
 from sieval.cli.resolution import (
     binding_resource_argument_paths,
@@ -402,6 +408,28 @@ def _validate_operations(
                 f"Dataset '{dataset_name}': operation '{op_name}' "
                 f"args must be a dict or null"
             )
+        elif op_name == "filter" and isinstance(op_args, dict):
+            _validate_filter_args(op_args, dataset_name, result)
+
+
+def _validate_filter_args(
+    op_args: dict, dataset_name: str, result: ValidationResult
+) -> None:
+    """Shape-check a ``filter`` operation.
+
+    The checks are :mod:`sieval.cli._filter_spec`'s, which says what each one
+    answers and what it leaves to the session. What is worth catching *here* is
+    a config that could not run whatever the data turned out to be.
+    """
+    problem = check_by(op_args.get("by"))
+    if problem is not None:
+        result.errors.append(f"Dataset '{dataset_name}': {problem}")
+    result.errors.extend(
+        f"Dataset '{dataset_name}': {problem}"
+        for problem in check_arg_names(op_args)
+        + check_values_source(op_args)
+        + check_by_digest(op_args)
+    )
 
 
 def _validate_tasks(cfg: dict, result: ValidationResult) -> None:
