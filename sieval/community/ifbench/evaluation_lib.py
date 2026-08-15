@@ -15,6 +15,13 @@
 
 """Binary of evaluating instruction following. See README.md."""
 
+# Local adaptation: the two graders take a keyword-only `instruction_dict`,
+# defaulting to the vendored registry, so `ifbench_0shot_gen_fixed` can grade
+# through the repaired checkers in `sieval.tasks._ifbench_fixed_checkers`
+# without mutating a global that concurrently-graded samples share. Omitting the
+# argument reproduces upstream's behaviour exactly, which is what the
+# unqualified task does.
+
 import collections
 import dataclasses
 import json
@@ -75,14 +82,18 @@ def write_outputs(output_jsonl_filename, outputs):
 def test_instruction_following_strict(
     inp,
     prompt_to_response,
+    *,
+    instruction_dict=None,
 ):
   """Tests response to see if instrutions are followed."""
+  if instruction_dict is None:
+    instruction_dict = instructions_registry.INSTRUCTION_DICT
   response = prompt_to_response[inp.prompt]
   instruction_list = inp.instruction_id_list
   is_following_list = []
 
   for index, instruction_id in enumerate(instruction_list):
-    instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
+    instruction_cls = instruction_dict[instruction_id]
     instruction = instruction_cls(instruction_id)
     inp.kwargs[index] = {key: value for key, value in inp.kwargs[index].items() if value is not None}
     instruction.build_description(**inp.kwargs[index])
@@ -107,8 +118,12 @@ def test_instruction_following_strict(
 def test_instruction_following_loose(
     inp,
     prompt_to_response,
+    *,
+    instruction_dict=None,
 ):
   """Tests response for an upper bound for following instructions."""
+  if instruction_dict is None:
+    instruction_dict = instructions_registry.INSTRUCTION_DICT
   response = prompt_to_response[inp.prompt]
   if response is None:
       return OutputExample(
@@ -141,7 +156,7 @@ def test_instruction_following_loose(
   is_following_list = []
 
   for index, instruction_id in enumerate(instruction_list):
-    instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
+    instruction_cls = instruction_dict[instruction_id]
     instruction = instruction_cls(instruction_id)
 
     instruction.build_description(**inp.kwargs[index])
