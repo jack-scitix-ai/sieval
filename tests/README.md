@@ -1,6 +1,6 @@
 # SiEval Test Suite
 
-**~1200 tests** | **95%+ core coverage** | pytest + anyio
+**~5500 tests** | **95%+ core coverage** | pytest + anyio + xdist
 
 ---
 
@@ -14,10 +14,12 @@ The mirror is **directory-level**; four file layouts are in use within a directo
 | --- | --- | --- |
 | `test_<module>.py` | Default: one file per source module. | `core/tasks/test_saver.py` |
 | `<module>/test_<topic>.py` | One large module split by topic. | `core/tasks/loader/` for `loader.py` |
-| `test_<subject>_family.py` | One contract over near-identical modules, where a fix landing in one and drifting in the others is the failure mode. | `tasks/test_sampling_family.py` (8 tasks, one sampling contract) |
+| `test_<subject>_family.py` | One contract over near-identical modules, where a fix landing in one and drifting in the others is the failure mode. | `tasks/test_sampling_family.py` (8 tasks, one sampling contract); `tasks/test_import_discipline_family.py` (24 tasks, one lazy-import contract) |
 | `test_<concern>.py` | A concern belonging to no single module. | `test_lazy_exports.py`, `cli/test_shortcut_parity.py` |
 
 Prefer a per-module file whenever one will do; a family file that merely *collects* unrelated tests is the anti-pattern. Not machine-checked — three of the four layouts are legitimate, so placement is a review concern.
+
+A family file owns its members, so a task covered by one **has no per-module file of its own for that contract** — the directory mirror still holds, the file mirror does not. Onboarding a task into an existing family means adding a row to that family's manifest (`FORBIDDEN` in `test_import_discipline_family.py`, `CASES` in `test_sampling_family.py`), not creating `test_<task>.py` to hold a copy of the contract. Nothing fails if you create the file instead: the manifest silently lacks the task, and the family stops being the whole family.
 
 ```text
 tests/
@@ -137,9 +139,9 @@ python -m pytest tests/acceptance/ -v -s
 SIEVAL_BENCHMARK_ARTIFACT_DIR=./outputs/benchmarks \
 python -m pytest tests/acceptance/ -v -s
 
-# What CI runs: everything deterministic, benchmarks deselected
+# What CI runs: everything deterministic, benchmarks deselected, in parallel
 python -m pytest tests/unit tests/integration tests/acceptance \
-  -m "not stress and not benchmark" --cov -q
+  -m "not stress and not benchmark" -n auto --cov -q
 
 # Performance diagnostic benchmarks (default excludes stress)
 python -m pytest tests/performance/ -v
@@ -162,6 +164,70 @@ python -m pytest -m benchmark -v -s
 | `benchmark` | Wall-clock throughput gates, calibrated on a dedicated box. A plain local `pytest` runs them; **CI deselects them** (a shared runner cannot hold the thresholds, and `--cov` skews the latency they measure), so `/sieval-release` is where they are enforced. |
 
 Because these assert on *time*, treat a failure as "re-run idle" before calling it a regression. `tests/acceptance/` holds one (`test_benchmark_scenarios`); its other nine are deterministic and do run in CI.
+
+### Parallelism
+
+CI runs the deterministic suite under `pytest-xdist` (`-n auto`), which is what
+keeps it near a minute rather than near five. Two rules keep that sound.
+
+**A test that asserts on wall-clock time must carry `benchmark` or `stress`.**
+Otherwise workers competing for cores will eventually fail it for reasons that
+have nothing to do with the code, and CI deselects both markers.
+
+**Do not run more workers than you have cores free.** This is the sharper rule,
+because the tests it breaks assert nothing about time. The math tasks grade
+through a 30s in-code timeout (`GRADE_TIMEOUT`), and a starved grading call
+trips it and *scores the sample wrong* — so oversubscription surfaces as
+`assert False is True` in a dozen unrelated-looking grading tests, not as a
+timeout error. Measured: 4 workers on 4 cores is green; 128 workers on the same
+4 cores fails 16 tests.
+
+`-n auto` reads `os.cpu_count()`, which **ignores CPU affinity and cgroup
+quotas** — on a big shared box, `taskset`, a container limit, or simply other
+work running will leave `auto` far above what you actually have. Pass an
+explicit `-n <cores you have>` there.
+
+**On a cold machine, warm the NLTK corpora first.** The vendored IFBench
+graders download them at module scope, so parallel workers race to unzip into
+one shared `NLTK_DATA` and the losers read a half-written archive
+(`FileExistsError` / `EOFError` / `LookupError`, surfacing as a *collection*
+error). One serial import is enough, and CI does it in its own step:
+
+```bash
+python -c "import sieval.community.ifbench.instructions"
+```
+
+That import sets `NLTK_DATA` before it imports `nltk`, so what it warms is
+`~/.cache/sieval/ifbench_nltk_data` — **not** the `~/nltk_data` a bare `import
+nltk` resolves to. The other two fetchers (`multi_if`'s `_ensure_punkt_tab()`
+and the `ruler` dataset's `_ensure_punkt()`) are find-guarded and search the
+whole `nltk.data.path`, so they reuse the warmed copy in any process that
+imported the IFBench module — which, running the full suite, is every xdist
+worker, because each one collects the whole suite. **Narrow the selection and
+that stops being true:** `pytest tests/unit/tasks/test_multi_if_0shot_gen.py -n
+4` never imports it, so each worker misses, and they race to download into
+`~/nltk_data` instead. Warm that path too before a narrowed parallel run:
+
+```bash
+python -c "import nltk; nltk.download('punkt_tab')"
+```
+
+Otherwise nothing in the suite depends on execution order or a shared writable
+path. The one thing that costs more under parallelism is
+`tests/unit/tasks/test_import_discipline_family.py`: its probe interpreter is a
+session fixture, so a worker that receives one of its tests starts its own
+(~2.6s). In practice `--dist load` keeps that to one or two: the first test to
+land pays for the probe while the other workers stay busy elsewhere, and the
+remaining 23 are then instant for whoever holds it. Either way it is an order
+cheaper than the 23 per-task subprocesses it replaced.
+
+Pinning all 24 to one worker with `@pytest.mark.xdist_group` + `--dist
+loadgroup` looks like the obvious next step and **is not worth taking** —
+measured on this suite at `-n 4`, it does cut the run to exactly one probe, but
+group-granular scheduling costs the other ~5,450 tests more balance than the
+saved probe returns: 43.9s -> 46.5s on CI's selection, and 16.9s -> 20.3s on
+`tests/unit/tasks` alone, where `load` was already landing all 24 on one worker
+unaided. Left as `load` deliberately.
 
 ```bash
 # Single file
