@@ -7,7 +7,18 @@ from packaging.version import InvalidVersion, Version
 
 from sieval import __version__
 from sieval.core.models import ModelCallMeta, ModelOutput
+from sieval.core.tasks.consts import TaskStage
 from sieval.core.tasks.context import TaskStageMeta
+
+#: Finish reasons that mean the generation stopped before the model chose to.
+#:
+#: Every spelling, not one canonical name: the IR does not normalize these, so a
+#: set holding only ``length`` (OpenAI-compatible) would read zero against
+#: ``max_tokens`` (Anthropic). ``content_filter`` is in because the output is cut
+#: short the same way; separating causes is what the raw ``finish_reasons`` are
+#: for. Shared with :func:`sieval.core.tasks.anomaly.detect_truncated_output` so
+#: the rule and the report key cannot drift apart.
+TRUNCATION_FINISH_REASONS = frozenset({"length", "max_tokens", "content_filter"})
 
 
 def build_model_call_meta(output: ModelOutput) -> ModelCallMeta:
@@ -135,3 +146,91 @@ def report_versions(
     if has_unstamped_final:
         versions.append("unknown")
     return versions
+
+
+def _scored_rollout_indices(
+    stage_meta: Mapping[str, list],
+) -> tuple[set[int], set[int]] | None:
+    """``(every rollout index, the truncated ones)`` for one scored record.
+
+    Both counts come off this one index space, so ``n_truncated <=
+    n_scored_rollouts`` holds by construction rather than by two walks agreeing.
+
+    **INFERRED only:** a judged task's FEEDBACK stage carries the GRADER's calls,
+    and a grader that hit its own budget is a fact about a different model
+    (already reported as ``n_grader_unparsed``).
+
+    **Last entry only:** a retried or re-iterated sample was scored on its last
+    attempt, so an earlier truncation no longer affects any number in the report.
+    The opposite choice from :func:`collect_versions`, which unions the whole
+    history because provenance is about everything that ran.
+
+    ``None`` means no INFERRED history, so nothing here is measurable. A fresh run
+    cannot hit it -- stage meta is built in memory whatever ``record_meta`` says
+    -- but a **resume under** ``record_meta=False`` can: nothing was persisted, so
+    the loader hydrates a final without it, and reducing that to ``0`` would
+    report a clean run for samples whose finish reasons were never recorded.
+    :func:`report_versions` says this in band with ``"unknown"``; a count has no
+    such value, hence the option.
+    """
+    entries = stage_meta.get(TaskStage.INFERRED.value)
+    if not entries:
+        return None
+    scored: set[int] = set()
+    truncated: set[int] = set()
+    for call in entries[-1].get("model_calls") or ():
+        for index, reason in enumerate(call.get("finish_reasons") or ()):
+            scored.add(index)
+            if reason in TRUNCATION_FINISH_REASONS:
+                truncated.add(index)
+    return scored, truncated
+
+
+def count_truncated_rollouts(
+    stage_metas: Iterable[Mapping[str, list]],
+) -> int | None:
+    """Rollouts whose generation was cut short, over a report's scored records.
+
+    A truncated rollout scores as wrong without the model being wrong -- it ran
+    out of budget mid-answer, and the fix is ``max_tokens``. Reported so a score
+    a truncation rate explains is distinguishable from one capability explains.
+
+    Counted per rollout, not per sample -- one truncated draw in four is a
+    different fact from four (RFC #74 C) -- and deduplicated by rollout index, so
+    a multi-turn task whose second turn truncated counts that rollout once. That
+    is the same union :func:`sieval.core.tasks.anomaly.detect_truncated_output`
+    takes over one stage's calls, so the report and the anomaly file agree by
+    construction.
+
+    Scoping and the ``None`` case are :func:`_scored_rollout_indices`; ``None``
+    propagates, since a count skipping an unmeasurable record reads low with
+    nothing to say so.
+    """
+    total = 0
+    for stage_meta in stage_metas:
+        indices = _scored_rollout_indices(stage_meta)
+        if indices is None:
+            return None
+        total += len(indices[1])
+    return total
+
+
+def count_scored_rollouts(stage_metas: Iterable[Mapping[str, list]]) -> int | None:
+    """Rollouts a report's scored records actually drew -- ``n_truncated``'s base.
+
+    Without it the numerator is unreadable: ``26`` is a different fact at 600
+    rollouts than at 30, and the rule lanes publish rates plus ``fails`` and no
+    sample total, so nothing in ``report.json`` was divisible into it.
+
+    The *observed* draw, not ``n * len(finals)``: a short sample drew fewer
+    rollouts than its budget asked for, and the share a reader wants is over what
+    ran. Not the rate itself -- what threshold should warn, fail or annotate a
+    score is a policy call left to the reader.
+    """
+    total = 0
+    for stage_meta in stage_metas:
+        indices = _scored_rollout_indices(stage_meta)
+        if indices is None:
+            return None
+        total += len(indices[0])
+    return total

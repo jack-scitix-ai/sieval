@@ -35,7 +35,7 @@ from sieval.core.tasks.context import (
     TaskStageOutput,
 )
 from sieval.core.tasks.loader import TaskLoader
-from sieval.core.tasks.meta import get_task_run_identity
+from sieval.core.tasks.meta import EvalMode, get_task_run_identity
 from sieval.core.tasks.profiler import TaskProfiler
 from sieval.core.tasks.progress import TaskProgress
 from sieval.core.tasks.records import iter_grader_outputs
@@ -46,6 +46,8 @@ from sieval.core.utils.concurrency import CompositeLimiter
 from sieval.core.utils.meta import (
     build_model_call_meta_from_mapping,
     build_stage_meta,
+    count_scored_rollouts,
+    count_truncated_rollouts,
     report_versions,
 )
 
@@ -603,7 +605,7 @@ class TaskRunner:
                 finals, fails = self._final_and_failed()
                 report = await self._task.report(finals, fails)
                 # Always save report on completion
-                await self._save_report_with_versions(report, finals, fails)
+                await self._save_report_with_diagnostics(report, finals, fails)
                 return report
 
             # 6. Setup Progress Tracker
@@ -675,7 +677,7 @@ class TaskRunner:
             finals, fails = self._final_and_failed()
             report = await self._task.report(finals, fails)
             # Always save report on completion
-            await self._save_report_with_versions(report, finals, fails)
+            await self._save_report_with_diagnostics(report, finals, fails)
             # Backstop: create-if-absent, normally a no-op (written at run start).
             await self._saver.write_run_meta()
             # Generate anomaly report
@@ -1010,25 +1012,50 @@ class TaskRunner:
         fails = [c for c in self._contexts.values() if c.stage == TaskStage.FAILED]
         return finals, fails
 
-    async def _save_report_with_versions(
+    async def _save_report_with_diagnostics(
         self,
         report: JSONValue,
         finals: list[TaskContext],
         fails: list[TaskContext],
     ) -> None:
-        """Inject the distinct producing-version list into a dict report, then save.
+        """Inject the run-level diagnostics into a dict report, then save.
 
-        Aggregates over the in-memory terminal contexts' ``stage_meta`` at zero
-        extra I/O; :func:`report_versions` owns the ``"unknown"`` sentinel rule.
+        All aggregate over the in-memory terminal contexts' ``stage_meta`` at zero
+        extra I/O -- :func:`report_versions` owns the ``"unknown"`` sentinel rule,
+        the rollout counters :func:`_scored_rollout_indices`. Injected here rather
+        than per task because none is a fact about a task's metric: every task
+        would have to remember, and the ones that forgot would look clean.
+
+        ``n_truncated`` and its denominator ``n_scored_rollouts`` go in for ``gen``
+        tasks only, and are omitted rather than zeroed elsewhere -- ``ppl``/``clp``
+        infer at ``max_tokens=1`` and so finish every call with ``length``, which
+        would make the count equal the total and mean nothing. The anomaly rule is
+        ``gen``-scoped for the same reason. They go in as a **pair or not at all**:
+        a count whose base is missing is not a share of anything, and both drop out
+        when any scored record is unmeasurable (see the ``record_meta=False`` resume
+        case on ``_scored_rollout_indices``).
+
+        Only finals are counted, matching both the anomaly detector (which runs on
+        FINAL) and ``n_unextracted``: a FAILED sample has no score for a truncation
+        to explain.
+
         Non-dict reports are saved unchanged; ``None`` skips the save.
         """
         if report is None:
             return
         if isinstance(report, dict):
-            cast(dict[str, JSONValue], report)["sieval_versions"] = report_versions(
+            as_dict = cast(dict[str, JSONValue], report)
+            as_dict["sieval_versions"] = report_versions(
                 (c.stage_meta for c in finals),
                 (c.stage_meta for c in fails),
             )
+            if EvalMode.GEN.value in self._task.tags:
+                metas = [c.stage_meta for c in finals]
+                truncated = count_truncated_rollouts(metas)
+                scored = count_scored_rollouts(metas)
+                if truncated is not None and scored is not None:
+                    as_dict["n_truncated"] = truncated
+                    as_dict["n_scored_rollouts"] = scored
         await self._saver.save_report(report)
 
     def _resolve_result_dir(

@@ -79,6 +79,38 @@ at **every** budget, `n = 1` included, and by the single-draw tasks below that
 have no `n` at all. It measures the parser, not the draw, and `n = 1` is where a
 silently-stopped extractor survives longest: no second rollout to disagree with.
 
+`n_truncated` — **rollouts** whose generation stopped because it ran out of
+tokens rather than because the model was done — and `n_scored_rollouts`, the
+rollouts scored in total, are reported by **every `gen` task**, on the same terms
+as `n_unextracted`: they describe the generation rather than the draw, so neither
+is confined to `n > 1`. Unlike every other key here the *runner* injects them, so
+a task cannot report zero truncation by having forgotten to look.
+
+They arrive as a **pair or not at all**. The count alone says nothing about how
+much of a score it explains — `26` is a different fact at 600 rollouts than at 30
+— and the rule lanes that most need it publish rates plus `fails` and no sample
+total, so nothing here was divisible into it. `n_scored_rollouts` is the
+**observed** draw, not `n × samples`: a short sample drew fewer rollouts than its
+budget asked for. Deriving the rate, and deciding what threshold should warn,
+fail or annotate a score, is left to the reader.
+
+Both are omitted rather than zeroed in two cases: outside `gen`, where `ppl`/`clp`
+infer at `max_tokens=1` and finish every call the way a truncation does, so the
+count would equal the total and mean nothing; and when the reasons were never
+recorded, since resuming a run written with `record_meta=False` hydrates its
+finals without per-stage metadata and a `0` would claim a clean run rather than an
+unmeasured one. `sieval_versions` reports that state in band as `"unknown"`; a
+count has no such value.
+
+Read `n_truncated` as a **bound on how much of a score is budget, not
+capability** — a truncated rollout is scored wrong whether or not the model was
+on its way to the right answer, and the fix is `max_tokens`. It is independent of
+`n_unextracted`: an answer can be cut short and still parse (the truncation lands
+after the boxed answer), or parse cleanly and be wrong for reasons of its own.
+The two are worth reading together only in the direction where they coincide — a
+rollout that is both truncated *and* unextracted is the case where raising the
+budget is most likely to move the score.
+
 ### Pairs that must be read together
 
 **`pass@k` with `pass^k`.** `pass@k` is an upper bound, so a model whose sampling
