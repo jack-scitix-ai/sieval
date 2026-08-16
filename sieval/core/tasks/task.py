@@ -10,7 +10,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from typing import ClassVar, Literal, Protocol, cast
 
-from sieval.core.datasets import Dataset
+from sieval.core.datasets import Dataset, repeat_index_of
 from sieval.core.models import Model
 from sieval.core.models.requirements import (
     InputKind,
@@ -352,6 +352,12 @@ class Task[
 
         If *raw* is ``None`` and *sample_id* is a valid integer index into
         the dataset's test set, the raw sample is fetched on demand.
+
+        A ``repeat_index`` column left by :meth:`~sieval.core.datasets.Dataset.repeat`
+        is read onto the context here — every context is built through this method, so
+        no task opts in and a resume re-derives the same value from the same row. The
+        runner's resume backfill stamps it too, through the same
+        :func:`~sieval.core.datasets.repeat_index_of`.
         """
         # If raw not supplied and integer index available, attempt lazy fetch
         if (
@@ -361,7 +367,7 @@ class Task[
             and 0 <= sample_id < len(self._dataset.test_set)
         ):
             raw = cast(TRawSample, self._dataset.test_set[sample_id])
-        return TaskContext(sample_id, raw)
+        return TaskContext(sample_id, raw, repeat_index=repeat_index_of(raw))
 
     @abstractmethod
     async def preprocess(

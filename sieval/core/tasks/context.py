@@ -101,6 +101,17 @@ class TaskContext[TRawSample, TPreprocessed, TInferred, TPostprocessed, TFeedbac
     Attributes:
         sample_id: Unique identifier for this sample (string key or integer index).
         raw_sample: The original sample from the dataset (may be ``None``).
+        repeat_index: Which copy of a repeated split this sample came from (0-based),
+            or ``None`` if none was recorded — normally an unrepeated split; see
+            :meth:`serialize` for when absence means less than that. Read off the row
+            by :func:`~sieval.core.datasets.repeat_index_of` at both seams that
+            attach one: :meth:`~sieval.core.tasks.task.Task.make_context` and the
+            runner's resume backfill.
+            **A different axis from** ``iteration`` **and from a rollout index**:
+            ``iteration`` counts feedback-loop passes over one sample, a rollout
+            index counts the model's own samples within one request (``n``), and
+            this counts copies of the whole split. All three can be >0 at once, and
+            only this one distinguishes two rows that are otherwise identical.
         iteration: Current feedback-loop iteration (0-based).
         retry_count: Number of error retries consumed so far.
         stage: Current pipeline stage.
@@ -118,6 +129,8 @@ class TaskContext[TRawSample, TPreprocessed, TInferred, TPostprocessed, TFeedbac
 
     sample_id: str | int
     raw_sample: TRawSample | None = None
+
+    repeat_index: int | None = None
 
     iteration: int = 0
     retry_count: int = 0
@@ -247,6 +260,17 @@ class TaskContext[TRawSample, TPreprocessed, TInferred, TPostprocessed, TFeedbac
             "iteration": self.iteration,
             "stage": self.stage.value,
         }
+        # Emitted only when the split was repeated, in both modes. Omitted rather
+        # than written as null, so an archive from an unrepeated run stays
+        # byte-identical to one written before this field existed.
+        #
+        # Presence says "this row is a copy"; absence only says no copy number was
+        # recorded. A resume within one version series (`resume_version_verdict`)
+        # appends to shards whose older records predate the field, mixing a single
+        # archive — so read a missing key as unknown, not as copy 0 (`stage_meta`'s
+        # per-record version tells them apart wherever it was recorded).
+        if self.repeat_index is not None:
+            d["repeat_index"] = self.repeat_index
         if self._is_snapshot:
             field = STAGE_TO_RESULT_FIELD.get(self.stage)
             if field:

@@ -15,7 +15,7 @@ from datasets import Dataset as HFDataset
 from datasets import DatasetDict as HFDatasetDict
 from loguru import logger
 
-from sieval.core.datasets import Dataset
+from sieval.core.datasets import REPEAT_INDEX_COLUMN, Dataset, repeat_index_of
 
 
 def _capture_logs(fn) -> str:
@@ -169,6 +169,83 @@ class TestRepeat:
             _hf_dict=HFDatasetDict({"test": HFDataset.from_list([{"id": 0}])})
         )
         assert ds.repeat(2, split="train") is ds
+
+    def test_repeat_stamps_copy_major_index(self):
+        result = _make(3).repeat(3)
+        assert result.test_set[REPEAT_INDEX_COLUMN] == [0, 0, 0, 1, 1, 1, 2, 2, 2]
+        # Copy-major, so the stamp agrees with position *before* any reordering.
+        assert result.test_set["id"] == [0, 1, 2, 0, 1, 2, 0, 1, 2]
+
+    def test_repeat_once_still_stamps(self):
+        # The column's presence means "this split was repeated", not "repeated more
+        # than once" — one that appeared only sometimes needs guarding at every read.
+        assert _make(2).repeat(1).test_set[REPEAT_INDEX_COLUMN] == [0, 0]
+
+    def test_repeat_index_survives_shuffle(self):
+        # The reason the stamp exists: `i // n_rows` is right until something
+        # reorders the rows, and then it is wrong without ever failing.
+        shuffled = _make(4).repeat(3).shuffle(seed=7)
+        pairs = sorted(
+            zip(
+                shuffled.test_set["id"],
+                shuffled.test_set[REPEAT_INDEX_COLUMN],
+                strict=True,
+            )
+        )
+        assert pairs == sorted((i, c) for c in range(3) for i in range(4))
+        derived = [i // 4 for i in range(12)]
+        assert shuffled.test_set[REPEAT_INDEX_COLUMN] != derived
+
+    def test_repeat_index_survives_filter(self):
+        repeated = _make(3).repeat(2).filter("id", [1])
+        assert repeated.test_set[REPEAT_INDEX_COLUMN] == [0, 1]
+
+    def test_repeat_refuses_to_overwrite_existing_column(self):
+        already = _make(2).repeat(2)
+        # Wording only this guard uses: HF's `add_column` also raises ValueError
+        # quoting the column, so matching the column alone passes without the guard.
+        with pytest.raises(ValueError, match="composite index") as excinfo:
+            already.repeat(2)
+        assert REPEAT_INDEX_COLUMN in str(excinfo.value)
+
+    @pytest.mark.parametrize("times", [0, -1])
+    def test_repeat_rejects_times_below_one(self, times):
+        # HF empties the split instead, scoring zero samples without ever failing.
+        with pytest.raises(ValueError, match="at least 1"):
+            _make(3).repeat(times)
+
+    @pytest.mark.parametrize("times", [0, -1])
+    def test_repeat_rejects_times_before_looking_at_the_split(self, times):
+        # Checked ahead of the missing-split no-op, which would otherwise mask it.
+        ds = _BypassLoadDataset(
+            _hf_dict=HFDatasetDict({"test": HFDataset.from_list([{"id": 0}])})
+        )
+        with pytest.raises(ValueError, match="at least 1"):
+            ds.repeat(times, split="train")
+
+
+class TestRepeatIndexOf:
+    """The one definition both stamping seams share."""
+
+    def test_reads_the_column_repeat_stamped(self):
+        row = _make(2).repeat(2).test_set[2]
+        assert repeat_index_of(row) == 1
+
+    def test_absent_column_is_not_repeated(self):
+        assert repeat_index_of({"id": 0}) is None
+
+    def test_copy_zero_is_a_value_not_a_falsy_miss(self):
+        assert repeat_index_of({REPEAT_INDEX_COLUMN: 0}) == 0
+
+    @pytest.mark.parametrize("bad", [True, False, "1", 1.5, None, [1]])
+    def test_non_integer_reads_as_not_repeated(self, bad):
+        # Bools pass `isinstance(..., int)`; `True` would invent copy 1.
+        assert repeat_index_of({REPEAT_INDEX_COLUMN: bad}) is None
+
+    @pytest.mark.parametrize("raw", [None, "row", 7, [REPEAT_INDEX_COLUMN]])
+    def test_non_mapping_reads_as_not_repeated(self, raw):
+        # A raw sample is whatever the dataset yields, so this tolerates.
+        assert repeat_index_of(raw) is None
 
 
 # ===================================================================

@@ -16,6 +16,7 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 from loguru import logger
 
 from sieval import __version__
+from sieval.core.datasets import repeat_index_of
 from sieval.core.models import ModelOutput
 from sieval.core.tasks.anomaly import TaskAnomalyDetector
 from sieval.core.tasks.concurrency import (
@@ -1004,7 +1005,10 @@ class TaskRunner:
         sid = ctx.sample_id
         test_set = self._task.dataset.test_set
         if test_set and isinstance(sid, int) and 0 <= sid < len(test_set):
-            return replace(ctx, raw_sample=test_set[sid])
+            raw = test_set[sid]
+            # Stamped here too: this is the second seam that attaches a row, and one
+            # attaching it without the copy number serializes as never-repeated.
+            return replace(ctx, raw_sample=raw, repeat_index=repeat_index_of(raw))
         return ctx
 
     def _final_and_failed(self) -> tuple[list[TaskContext], list[TaskContext]]:
