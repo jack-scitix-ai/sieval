@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Literal, Self
 
 import anyio
+from loguru import logger
 
 from sieval.core.tasks.concurrency import prepare_limiters
 from sieval.core.tasks.context import TaskAction
@@ -93,7 +94,15 @@ class MultiTaskRunner:
         return anyio.run(self.arun)
 
     async def arun(self) -> dict[str, Any]:
-        """Run all registered tasks concurrently with shared limiters."""
+        """Run all registered tasks concurrently with shared limiters.
+
+        Raises:
+            ExceptionGroup: If any task raised.  A failing task does not cancel
+                its siblings, which run to completion and write their own
+                ``report.json``; the message names the tasks that failed.
+                Nothing is returned in this case, so the successful tasks'
+                results are on disk only.
+        """
         # 1. Prepare Shared Limiters
         norm_stage_limits = {}
         if self._stage_limits_cfg:
@@ -118,13 +127,47 @@ class MultiTaskRunner:
 
         # 3. Run in Parallel
         results: dict[str, Any] = {}
+        failures: dict[str, Exception] = {}
 
         async def _run_wrapper(r: TaskRunner) -> None:
-            res = await r.arun()
-            results[r._task.name] = res
+            name = r._task.name
+            try:
+                results[name] = await r.arun()
+            except Exception as exc:
+                # Hold, do not propagate: raising into the task group cancels every
+                # sibling mid-flight, and a cancelled runner flushes its shards but
+                # never writes `report.json`.
+                #
+                # `Exception`, deliberately not `BaseException` -- cancellation and
+                # `KeyboardInterrupt` are BaseException-only, so an interrupt still
+                # tears the batch down through `TaskRunner.arun`'s own save path.
+                #
+                # Logged with its traceback here because the re-raise below is now
+                # as far away as the rest of the batch is long.
+                logger.opt(exception=exc).error("Task '{}' failed: {!r}", name, exc)
+                failures[name] = exc
 
         async with anyio.create_task_group() as tg:
             for runner in self._runners:
                 tg.start_soon(_run_wrapper, runner)
+
+        # Isolated, not swallowed: returning a partial dict would let the caller's
+        # exit code read success while a task is missing from it. `ExceptionGroup`
+        # is the shape an uncaught failure already had, so callers keep working.
+        if failures:
+            # The survivors appear in neither the group nor a return value, so
+            # their only other trace is a `report.json` you would have to know to
+            # look for. Guarded, because "0 task(s) completed" reads as reassurance.
+            if results:
+                logger.info(
+                    "{} task(s) completed and saved their reports: {}",
+                    len(results),
+                    ", ".join(sorted(results)),
+                )
+            raise ExceptionGroup(
+                f"{len(failures)} of {len(self._runners)} task(s) failed: "
+                + ", ".join(sorted(failures)),
+                [failures[name] for name in sorted(failures)],
+            )
 
         return results
