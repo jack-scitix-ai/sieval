@@ -382,17 +382,37 @@ class TEvalBeforeCallingZeroShotGenTask(
         return keys
 
     def _post_process(self, results_list: list[dict]) -> dict[str, float]:
-        # list of dict to dict of list
-        results = {}
-        for key in self._metric_keys():
-            results[key] = np.mean([result[key] for result in results_list]) * 100
+        """Macro-average each recorded axis over the samples behind it.
 
-        # The *_parsed variants are reported in every mode, including the str modes
-        # that never score args at all -- so read defensively rather than assuming
-        # these axes are among the ones recorded.
+        An axis with an empty denominator is OMITTED, not averaged: `np.mean([])`
+        is `nan`, `orjson` writes a nan as `null`, and a `null` says nothing about
+        whether the axis was measured. Omission is the
+        :mod:`sieval.core.tasks.metrics` convention.
+
+        Both denominators report unconditionally, 0.0 included -- an absent axis
+        cannot be read without the count behind it. `n_graded` backs the axes,
+        `n_parsed` the `*_parsed` triple; the two differ when a reply fails to
+        parse.
+        """
+        scored = self._metric_keys()
+        # list of dict to dict of list
+        results: dict[str, float] = {"n_graded": float(len(results_list))}
+        if results_list:
+            for key in scored:
+                results[key] = float(
+                    np.mean([result[key] for result in results_list]) * 100
+                )
+
+        # The `*_parsed` triple narrows the args axes to the parsed samples -- a
+        # sieval addition, no upstream counterpart. Gated on what the mode
+        # scores: `args_precision_parsed` beside an omitted `args_precision`
+        # would call one axis both unmeasured and zero.
         success_samples = [r for r in results_list if r.get("parse_rate", 0) == 1]
-        for key in ("args_precision", "args_recall", "args_f1_score"):
-            results[f"{key}_parsed"] = (
-                np.mean([r.get(key, 0.0) for r in success_samples]) * 100
-            )
+        results["n_parsed"] = float(len(success_samples))
+        if success_samples:
+            for key in ("args_precision", "args_recall", "args_f1_score"):
+                if key in scored:
+                    results[f"{key}_parsed"] = float(
+                        np.mean([r[key] for r in success_samples]) * 100
+                    )
         return results
