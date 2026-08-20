@@ -752,6 +752,62 @@ class TestDeriveModelType:
             derive_model_type("m", None, cast(Any, object()))
 
 
+class TestTaskModelConfigName:
+    """Task -> candidate model-name resolution.
+
+    This is the single surviving resolver: `_setup_tasks` reads the candidate
+    from the prelaunch-frozen `RequirementContext`, so these errors are the
+    only thing standing between a typo'd `model:` and a confusing failure
+    much deeper in binding.
+    """
+
+    def _session(self):
+        return object.__new__(EvalSession)
+
+    def test_explicit_model_ref_is_returned(self):
+        session = self._session()
+        models_cfg = {"my_model": {"name": "org/m"}, "other": {"name": "org/o"}}
+
+        assert (
+            session._task_model_config_name("t1", {"model": "my_model"}, models_cfg)
+            == "my_model"
+        )
+
+    def test_single_model_is_the_default_candidate(self):
+        session = self._session()
+
+        assert (
+            session._task_model_config_name("t1", {}, {"only": {"name": "org/m"}})
+            == "only"
+        )
+
+    def test_unknown_model_ref_is_rejected(self):
+        session = self._session()
+        with pytest.raises(ValueError, match="references unknown model 'bad_ref'"):
+            session._task_model_config_name(
+                "t1", {"model": "bad_ref"}, {"my_model": {"name": "org/m"}}
+            )
+
+    def test_no_models_defined_is_rejected(self):
+        session = self._session()
+        with pytest.raises(ValueError, match="no models defined in config"):
+            session._task_model_config_name("t1", {}, {})
+
+    def test_ambiguous_candidate_is_rejected(self):
+        session = self._session()
+        with pytest.raises(ValueError, match="'model' required when multiple models"):
+            session._task_model_config_name(
+                "t1", {}, {"a": {"name": "org/a"}, "b": {"name": "org/b"}}
+            )
+
+    def test_non_string_model_ref_is_rejected(self):
+        session = self._session()
+        with pytest.raises(ValueError, match="'model' must be a string reference"):
+            session._task_model_config_name(
+                "t1", {"model": 123}, {"my_model": {"name": "org/m"}}
+            )
+
+
 class TestResolveTaskDataset:
     def _make_runner(self, datasets=None):
         runner = object.__new__(EvalSession)
@@ -4441,6 +4497,81 @@ tasks:
             await session._close_owned_model_resources()
 
         close.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_deterministic_legacy_candidate_survives_task_setup(
+        self, tmp_path: Path
+    ) -> None:
+        """`_setup_tasks` applies the frozen decision to a `SglangGenModel`.
+
+        The legacy facade is the one candidate that reaches
+        `_apply_request_seed_decision_to_model` as a `Model` *subclass* whose
+        `with_dialect` raises, so the helper's dialect guard has to be
+        satisfied by `SglangGenModel.dialect_id` rather than a runtime plan.
+        """
+        from sieval.core.models import SglangGenModel
+        from tests.unit.core.runners.test_runner import MockTask
+
+        class LegacyGenTask(MockTask):
+            model_type = "gen"
+
+        config_path = self._config(
+            tmp_path,
+            """
+deterministic: true
+models:
+  m:
+    name: org/model
+    type: gen
+    engine: sglang
+    api_base: https://sglang.example/v1
+    api_key: local
+datasets:
+  ds:
+    class: fake.Dataset
+tasks:
+  completion:
+    class: fake.LegacyGenTask
+    dataset: ds
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+        close = AsyncMock()
+        connection = types.SimpleNamespace(
+            close=close,
+            base_url="https://sglang.example/v1",
+        )
+
+        try:
+            with (
+                patch(
+                    "sieval.cli.leaderboard.session.resolve_task_class",
+                    return_value=LegacyGenTask,
+                ),
+                patch(
+                    "sieval.core.models.sglang_gen_model.AsyncOpenAI",
+                    return_value=connection,
+                ),
+            ):
+                session._setup_prelaunch_reconciliation()
+                session._setup_postlaunch_reconciliation()
+                session._setup_models()
+                session._init_runner()
+                session.datasets["ds"] = MagicMock()
+                session._setup_tasks()
+
+            assert session.runner is not None
+            task_model = session.runner._runners[0]._task.model
+            assert isinstance(task_model, SglangGenModel)
+            assert task_model.dialect_id == "sglang_legacy"
+            assert "seed" not in task_model._kwargs
+            # The helper derives rather than mutates, so a distinct object is
+            # the evidence that it ran against the legacy facade at all.
+            assert task_model is not session.models["m"]
+            assert "seed" not in session.models["m"]._kwargs
+        finally:
+            await session._close_owned_model_resources()
 
 
 class TestEvalSessionWrappers:

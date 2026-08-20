@@ -231,23 +231,28 @@ def _resolve_deterministic_request_seed(
     )
 
 
-def _validated_request_seed(value: object) -> int | None:
-    """Return one typed request seed or reject an invalid explicit value."""
+def _validated_request_seed(value: object, subject: str) -> int | None:
+    """Return one typed request seed or reject an invalid explicit value.
+
+    ``subject`` names the config site being read so a rejected value is
+    locatable in a config that declares many models and tasks.
+    """
 
     if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-        raise TypeError("seed must be an integer")
+        raise TypeError(f"{subject} must be an integer")
     return cast(int | None, value)
 
 
 def _with_task_infer_seed(
     decision: _RequestSeedDecision,
     infer_args: Mapping[str, JSONValue],
+    subject: str,
 ) -> _RequestSeedDecision:
     """Overlay a task candidate's frozen ``infer_args.seed`` when present."""
 
     if "seed" not in infer_args:
         return decision
-    seed = _validated_request_seed(infer_args["seed"])
+    seed = _validated_request_seed(infer_args["seed"], subject)
     return dataclasses.replace(
         decision,
         seed_present=True,
@@ -2543,7 +2548,7 @@ class EvalSession:
                 )
         if not labels_by_binding:
             return
-        warned.update(labels_by_binding)
+        warned.update(labels_by_binding.keys())
         labels = sorted(
             label for values in labels_by_binding.values() for label in values
         )
@@ -2561,10 +2566,11 @@ class EvalSession:
     @staticmethod
     def _seed_from_mapping(
         values: Mapping[str, object],
+        subject: str,
     ) -> tuple[bool, int | None]:
         if "seed" not in values:
             return False, None
-        return True, _validated_request_seed(values["seed"])
+        return True, _validated_request_seed(values["seed"], subject)
 
     def _freeze_deterministic_request_seed_decisions(self) -> None:
         """Freeze every model request-default seed decision after prelaunch."""
@@ -2597,13 +2603,15 @@ class EvalSession:
                         raise ValueError(
                             f"Model '{binding.config_name}' args must be a dictionary"
                         )
-                    present, value = self._seed_from_mapping(raw_args)
+                    present, value = self._seed_from_mapping(
+                        raw_args, f"Model '{binding.config_name}' args.seed"
+                    )
                     if present:
                         explicit_seed_present = True
                         explicit_seed = value
             else:
                 explicit_seed_present, explicit_seed = self._seed_from_mapping(
-                    binding.config
+                    binding.config, f"Inline binding '{binding.binding_id}' seed"
                 )
                 raw_args = binding.config.get("args")
                 if raw_args is not None:
@@ -2613,7 +2621,10 @@ class EvalSession:
                             "a mapping"
                         )
                     nested_args = cast(Mapping[str, object], raw_args)
-                    nested_present, nested_seed = self._seed_from_mapping(nested_args)
+                    nested_present, nested_seed = self._seed_from_mapping(
+                        nested_args,
+                        f"Inline binding '{binding.binding_id}' args.seed",
+                    )
                     if nested_present:
                         explicit_seed_present = True
                         explicit_seed = nested_seed
@@ -2641,7 +2652,8 @@ class EvalSession:
                             f"External binding '{binding.binding_id}' has no dialect"
                         )
                     present, value = self._seed_from_mapping(
-                        source.meta()["default_params"]
+                        source.meta()["default_params"],
+                        f"Task '{task_name}' {role} model seed",
                     )
                     decision = _resolve_deterministic_request_seed(
                         dialect_id=dialect_id,
@@ -2659,7 +2671,9 @@ class EvalSession:
                     f"Task '{task_name}' candidate must be a named or inline binding"
                 )
             by_candidate[task_name] = _with_task_infer_seed(
-                by_binding[candidate.binding_id], context.infer_args
+                by_binding[candidate.binding_id],
+                context.infer_args,
+                f"Task '{task_name}' infer_args.seed",
             )
 
         self._request_seed_decisions_by_binding = by_binding
@@ -2672,6 +2686,27 @@ class EvalSession:
         decision: _RequestSeedDecision,
         binding: NormalizedModelBinding,
     ) -> dict[str, JSONValue]:
+        """Project one frozen decision into strict, human-auditable evidence.
+
+        This entry's key set IS the resume-invalidation surface: ``--resume``
+        compares the persisted config strictly, so adding or removing a field
+        here invalidates every in-flight deterministic result dir. Two fields
+        are deliberately kept despite being derivable from their siblings:
+
+        * ``seed_scope`` — implied by ``dialect_id`` only while
+          ``sglang_legacy`` is the one engine-scoped dialect; a registered
+          ``sglang_native`` binder decouples the two, and rotating the
+          contract then would be more expensive than carrying it now.
+        * ``explicit_seed_present`` — implied by ``seed_provenance``, and kept
+          so an audit can answer "did a human choose this seed?" without
+          knowing which provenance values count as explicit.
+
+        ``binding_id`` is omitted for external bindings: it carries a
+        per-process identity that would rotate the contract between runs that
+        differ only by endpoint. Their stable identity is the outer
+        ``task.role`` key plus ``requested_model_id`` and ``dialect_id``.
+        """
+
         entry: dict[str, JSONValue] = {
             "requested_model_id": binding.requested_model_id,
             "dialect_id": decision.dialect_id,
@@ -3185,8 +3220,6 @@ class EvalSession:
                     assert isinstance(base_name, str)
                     model = self.models[base_name]
                     args = self._normalize_dict(cfg.get("args"), f"Model '{name}' args")
-                    if self.deterministic:
-                        args.pop("seed", None)
                     concurrency_limit = args.pop("concurrency_limit", None)
                     model = model.with_args(concurrency_limit=concurrency_limit, **args)
                 else:
@@ -3234,8 +3267,6 @@ class EvalSession:
                                 )
 
                     args, extra = self._request_builder_args(cfg)
-                    if self.deterministic:
-                        args.pop("seed", None)
                     concurrency_limit = None
                     if not is_root:
                         raw_args = cfg.get("args", {})
@@ -3302,8 +3333,6 @@ class EvalSession:
             ):
                 direct_config.pop(key, None)
             extra = direct_config.pop("extra", None)
-            if self.deterministic:
-                direct_config.pop("seed", None)
             if direct_config or extra is not None:
                 model = model.with_args(
                     extra=cast(dict[str, JSONValue] | None, extra), **direct_config
@@ -3784,22 +3813,22 @@ class EvalSession:
                     f"'{candidate.config_name}' was not bound"
                 ) from exc
 
-            frozen_infer_args = dict(context.infer_args)
-            infer_args = dict(frozen_infer_args)
-            if self.deterministic:
-                infer_args.pop("seed", None)
+            infer_args = dict(context.infer_args)
             if infer_args:
                 model = model.with_args(**cast(dict[str, Any], infer_args))
             if self.deterministic:
+                # The frozen candidate decision already folded in this task's
+                # ``infer_args.seed``, so it is the single authority for the
+                # final seed and overrides whatever landed above.
                 model = _apply_request_seed_decision_to_model(
                     model,
                     self._request_seed_decisions_by_candidate[task_name],
                 )
-            if frozen_infer_args:
+            if infer_args:
                 logger.info(
                     "Task '{}': applied infer_args override {}",
                     task_name,
-                    frozen_infer_args,
+                    infer_args,
                 )
 
             # Create task instance
