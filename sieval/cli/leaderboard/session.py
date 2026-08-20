@@ -2617,7 +2617,8 @@ class EvalSession:
                             f"Inline binding '{binding.binding_id}' args must be "
                             "a mapping"
                         )
-                    nested_present, nested_seed = self._seed_from_mapping(raw_args)
+                    nested_args = cast(Mapping[str, object], raw_args)
+                    nested_present, nested_seed = self._seed_from_mapping(nested_args)
                     if nested_present:
                         explicit_seed_present = True
                         explicit_seed = nested_seed

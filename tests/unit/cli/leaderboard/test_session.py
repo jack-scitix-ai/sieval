@@ -88,10 +88,11 @@ def _task_requirement_context_for_setup_test(
 
     if not isinstance(task_cfg, dict):
         return RequirementContext()
-    infer_args = task_cfg.get("infer_args", {})
+    typed_task_cfg = cast(dict[str, Any], task_cfg)
+    infer_args = typed_task_cfg.get("infer_args", {})
     if not isinstance(infer_args, dict):
         infer_args = {}
-    model_name = task_cfg.get("model")
+    model_name = typed_task_cfg.get("model")
     if not model_name and len(models) == 1:
         model_name = next(iter(models))
     bindings = {}
