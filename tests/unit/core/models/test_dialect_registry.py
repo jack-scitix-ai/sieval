@@ -33,6 +33,8 @@ from sieval.core.models.dialect_registry import (
     DialectImplementationStatus,
     DialectNotImplemented,
     DialectRegistryError,
+    DialectSpec,
+    RequestSeedSupport,
     UnknownDialect,
     _normalized_symbols,
     _outcomes_from_decisions,
@@ -105,6 +107,26 @@ class TestDialectDescriptors:
         )
         assert "vllm_native" in encoded
         assert "openai_chat" in encoded
+        for value in dialect_registry_to_json().values():
+            assert isinstance(value, dict)
+            assert "request_seed_support" in value
+
+    def test_request_seed_support_is_required_and_explicit(self) -> None:
+        field = DialectSpec.__dataclass_fields__["request_seed_support"]
+        assert field.default is dataclasses.MISSING
+        assert field.default_factory is dataclasses.MISSING
+        assert {
+            dialect_id: spec.request_seed_support
+            for dialect_id, spec in DIALECT_SPECS.items()
+        } == {
+            "openai_chat": RequestSeedSupport.SUPPORTED,
+            "openai_completions": RequestSeedSupport.SUPPORTED,
+            "openai_responses": RequestSeedSupport.RESERVED,
+            "anthropic_messages": RequestSeedSupport.RESERVED,
+            "google_genai": RequestSeedSupport.RESERVED,
+            "sglang_native": RequestSeedSupport.RESERVED,
+            "vllm_native": RequestSeedSupport.RESERVED,
+        }
 
     def test_only_pr1_dialects_are_active_and_bindable(self) -> None:
         active = {
@@ -126,6 +148,11 @@ class TestDialectDescriptors:
             ({"dialect_id": ""}, "dialect_id"),
             ({"connection_family": ""}, "connection_family"),
             ({"implementation_status": "active"}, "implementation_status"),
+            ({"request_seed_support": "supported"}, "request_seed_support"),
+            (
+                {"request_seed_support": RequestSeedSupport.RESERVED},
+                "cannot reserve request-seed support",
+            ),
             (
                 {
                     "capability_outcomes": dict.fromkeys(

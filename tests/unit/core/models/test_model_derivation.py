@@ -87,6 +87,24 @@ class TestModelDerivation:
         assert child._limiter is None
         assert child._parent_limiter is None
 
+    def test_without_args_removes_default_without_mutating_parent(self, base_gen):
+        seeded = base_gen.with_args(seed=0, temperature=0.5)
+
+        child = seeded.without_args("seed")
+
+        assert seeded._kwargs["seed"] == 0
+        assert child._kwargs == {"temperature": 0.5}
+        assert "seed" not in child.meta()["default_params"]
+
+    @pytest.mark.parametrize("names", [(), ("",)])
+    def test_without_args_requires_non_empty_names(self, base_gen, names):
+        with pytest.raises(ValueError, match="non-empty"):
+            base_gen.without_args(*names)
+
+    def test_without_args_cannot_remove_binding_resources(self, base_gen):
+        with pytest.raises(ValueError, match="binding resources"):
+            base_gen.without_args("api_key")
+
     def test_with_args_new_limiter_total_tokens(self, base_gen):
         """Child limiter capacity equals the requested concurrency_limit."""
         child = base_gen.with_args(concurrency_limit=16)

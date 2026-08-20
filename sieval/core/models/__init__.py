@@ -37,7 +37,12 @@ from .deployment import (
     ServingFacts,
 )
 from .dialect import Dialect, DialectError
-from .dialect_registry import DialectSpec, bind_dialect, get_dialect_spec
+from .dialect_registry import (
+    DialectSpec,
+    RequestSeedSupport,
+    bind_dialect,
+    get_dialect_spec,
+)
 from .exceptions import CapabilityError
 from .gen_model import GenModel
 from .ir import (
@@ -152,6 +157,7 @@ __all__ = [
     "ReconcileResult",
     "Request",
     "RequestDefaults",
+    "RequestSeedSupport",
     "ResolvedRoute",
     "Response",
     "RouteIntent",

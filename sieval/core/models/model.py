@@ -313,6 +313,28 @@ class Model:
             )
         return new_model
 
+    def without_args(self, *names: str) -> Self:
+        """Derive a model with selected builder defaults removed.
+
+        This is intentionally distinct from ``with_args(name=None)``: ``None``
+        is a user-visible explicit default that belongs in model metadata,
+        whereas removing an inherited orchestration default must leave no
+        request leaf and no persisted ``default_params`` entry.
+        """
+
+        if not names or any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("without_args requires non-empty argument names")
+        reserved = sorted(BINDING_RESOURCE_KEYS & set(names))
+        if reserved:
+            raise ValueError(
+                "without_args cannot change binding resources: " + ", ".join(reserved)
+            )
+        new_model = copy.copy(self)
+        new_model._kwargs = {
+            key: value for key, value in self._kwargs.items() if key not in names
+        }
+        return new_model
+
     def with_dialect(
         self,
         dialect_id: str,
