@@ -28,6 +28,8 @@ from sieval.cli.leaderboard.session import (
     EvalSession,
     _append_resume_note,
     _apply_endpoint_injection,
+    _apply_request_seed_decision_to_args,
+    _apply_request_seed_decision_to_model,
     _brief_diff,
     _cross_version_resume_hint,
     _describe_order_change,
@@ -748,60 +750,6 @@ class TestDeriveModelType:
             derive_model_type("m", "other", empty)
         with pytest.raises(TypeError, match="AggregatedTaskRequirements"):
             derive_model_type("m", None, cast(Any, object()))
-
-
-# ===================================================================
-# Resolve task model / dataset helpers
-# ===================================================================
-class TestResolveTaskModel:
-    def _make_runner(self, models=None):
-        runner = object.__new__(EvalSession)
-        runner.models = models or {}
-        return runner
-
-    def test_explicit_model_ref(self):
-        m = MagicMock()
-        runner = self._make_runner({"my_model": m})
-        result = runner._resolve_task_model({"model": "my_model"}, "t1")
-        assert result is m
-
-    def test_single_model_default(self):
-        m = MagicMock()
-        runner = self._make_runner({"only": m})
-        result = runner._resolve_task_model({}, "t1")
-        assert result is m
-
-    def test_error_cases(self):
-        # (models_map, task_cfg, expected_error_pattern)
-        cases = [
-            # Explicit model reference does not exist.
-            (
-                {"my_model": MagicMock()},
-                {"model": "bad_ref"},
-                "unknown model",
-            ),
-            # No model available and no reference provided.
-            (
-                {},
-                {},
-                "no models defined",
-            ),
-            # Multiple models available but task doesn't choose one.
-            (
-                {"a": MagicMock(), "b": MagicMock()},
-                {},
-                "'model' required",
-            ),
-        ]
-        for models, task_cfg, error_match in cases:
-            runner = self._make_runner(models)
-            with pytest.raises(ValueError, match=error_match):
-                runner._resolve_task_model(task_cfg, "t1")
-
-    def test_model_ref_must_be_string(self):
-        runner = self._make_runner({"my_model": MagicMock()})
-        with pytest.raises(ValueError, match="'model' must be a string reference"):
-            runner._resolve_task_model({"model": 123}, "t1")
 
 
 class TestResolveTaskDataset:
@@ -1750,6 +1698,120 @@ class TestPrelaunchReconciliation:
     @staticmethod
     def _config(tmp_path: Path, body: str) -> Path:
         return _write_yaml_config(tmp_path, "prelaunch.yaml", body)
+
+    async def _external_seed_contract_entry(
+        self,
+        tmp_path: Path,
+        *,
+        requested_model_id: str = "org/external-grader",
+        api_base: str = "https://external.example:8000/v1",
+        completion: bool = False,
+        explicit_seed: int | None = None,
+    ) -> dict[str, Any]:
+        from sieval.core.models import ChatModel, GenModel
+
+        config_path = self._config(
+            tmp_path,
+            """
+deterministic: true
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args: {}
+""",
+        )
+        if completion:
+            if explicit_seed is None:
+                external: Model = GenModel(
+                    model=requested_model_id,
+                    api_base=api_base,
+                    api_key="external-key",
+                )
+            else:
+                external = GenModel(
+                    model=requested_model_id,
+                    api_base=api_base,
+                    api_key="external-key",
+                    seed=explicit_seed,
+                )
+        else:
+            if explicit_seed is None:
+                external = ChatModel(
+                    model=requested_model_id,
+                    api_base=api_base,
+                    api_key="external-key",
+                )
+            else:
+                external = ChatModel(
+                    model=requested_model_id,
+                    api_base=api_base,
+                    api_key="external-key",
+                    seed=explicit_seed,
+                )
+        session = EvalSession(config_path)
+        tasks = cast(dict[str, Any], session.config["tasks"])
+        task = cast(dict[str, Any], tasks["judged"])
+        cast(dict[str, Any], task["args"])["grader"] = external
+        task_class = self.ScoringJudgeTask if completion else self.JudgeTask
+
+        try:
+            with patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=task_class,
+            ):
+                session.prepare_prelaunch()
+                session._stamp_deterministic_seed_contract()
+            contract = cast(
+                dict[str, Any],
+                session._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY],
+            )
+            entry = cast(dict[str, Any], contract["external_roles"]["judged.grader"])
+            return dict(entry)
+        finally:
+            await external.aclose()
+
+    @pytest.mark.anyio
+    async def test_external_seed_contract_uses_stable_semantic_identity(
+        self, tmp_path: Path
+    ) -> None:
+        first = await self._external_seed_contract_entry(tmp_path)
+        reconstructed = await self._external_seed_contract_entry(tmp_path)
+        moved_endpoint = await self._external_seed_contract_entry(
+            tmp_path,
+            api_base="https://external.example:9000/v1",
+        )
+
+        assert first == reconstructed == moved_endpoint
+        assert "binding_id" not in first
+        assert "runtime_plan_fingerprint" not in first
+
+    @pytest.mark.anyio
+    async def test_external_seed_contract_retains_semantic_sensitivity(
+        self, tmp_path: Path
+    ) -> None:
+        baseline = await self._external_seed_contract_entry(tmp_path)
+        changed_model = await self._external_seed_contract_entry(
+            tmp_path,
+            requested_model_id="org/other-grader",
+        )
+        changed_dialect = await self._external_seed_contract_entry(
+            tmp_path,
+            completion=True,
+        )
+        changed_seed = await self._external_seed_contract_entry(
+            tmp_path,
+            explicit_seed=7,
+        )
+
+        assert changed_model != baseline
+        assert changed_dialect != baseline
+        assert changed_seed != baseline
 
     def test_implicit_single_model_completion_uses_normalized_hook_evidence(
         self, tmp_path: Path
@@ -5015,7 +5077,55 @@ class TestDeterministicRequestSeedPolicy:
         assert decision.seed_present is False
         assert decision.seed is None
         assert decision.provenance.value == "none"
-        assert decision.remove_inherited_seed is True
+
+    @pytest.mark.anyio
+    async def test_absent_decision_removes_existing_model_seed(self):
+        with patch(
+            "sieval.cli.leaderboard.session.get_dialect_spec",
+            return_value=types.SimpleNamespace(
+                request_seed_support=RequestSeedSupport.UNSUPPORTED
+            ),
+        ):
+            decision = _resolve_deterministic_request_seed(
+                dialect_id="openai_chat",
+                explicit_seed_present=False,
+            )
+
+        source = MockChatModel(seed=7)
+        try:
+            model = _apply_request_seed_decision_to_model(source, decision)
+            assert "seed" not in model.meta()["default_params"]
+        finally:
+            await source.aclose()
+
+    def test_absent_decision_removes_existing_argument_seed(self):
+        with patch(
+            "sieval.cli.leaderboard.session.get_dialect_spec",
+            return_value=types.SimpleNamespace(
+                request_seed_support=RequestSeedSupport.UNSUPPORTED
+            ),
+        ):
+            decision = _resolve_deterministic_request_seed(
+                dialect_id="future_seedless",
+                explicit_seed_present=False,
+            )
+
+        args = {"seed": 7, "temperature": 0.5}
+        _apply_request_seed_decision_to_args(args, decision)
+
+        assert args == {"temperature": 0.5}
+
+    def test_present_decision_replaces_existing_argument_seed(self):
+        decision = _resolve_deterministic_request_seed(
+            dialect_id="openai_chat",
+            explicit_seed_present=True,
+            explicit_seed=0,
+        )
+        args = {"seed": 9, "temperature": 0.5}
+
+        _apply_request_seed_decision_to_args(args, decision)
+
+        assert args == {"seed": 0, "temperature": 0.5}
 
     def test_reserved_seed_policy_fails_loudly(self):
         with pytest.raises(ValueError, match="openai_responses.*has not declared"):
@@ -5041,7 +5151,6 @@ class TestDeterministicRequestSeedPolicy:
         assert decision.seed_present is True
         assert decision.seed == seed
         assert decision.provenance.value == "binding_config"
-        assert decision.remove_inherited_seed is False
 
 
 class TestDeterministicMode:

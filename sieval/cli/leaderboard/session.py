@@ -161,11 +161,13 @@ class _RequestSeedDecision:
 
     dialect_id: str
     support: RequestSeedSupport
+    # Evidence-only: records where deterministic sampling is controlled
+    # (currently derivable from dialect_id). Execution consumes the frozen
+    # final seed state, not this field.
     scope: _RequestSeedScope
     seed_present: bool
     seed: int | None
     provenance: _RequestSeedProvenance
-    remove_inherited_seed: bool
 
     @property
     def explicit_seed_present(self) -> bool:
@@ -209,7 +211,6 @@ def _resolve_deterministic_request_seed(
             seed_present=True,
             seed=explicit_seed,
             provenance=explicit_provenance,
-            remove_inherited_seed=False,
         )
     if support is RequestSeedSupport.SUPPORTED:
         return _RequestSeedDecision(
@@ -219,7 +220,6 @@ def _resolve_deterministic_request_seed(
             seed_present=True,
             seed=DETERMINISTIC_DEFAULT_SEED,
             provenance=_RequestSeedProvenance.AUTOMATIC,
-            remove_inherited_seed=False,
         )
     return _RequestSeedDecision(
         dialect_id=dialect_id,
@@ -228,11 +228,15 @@ def _resolve_deterministic_request_seed(
         seed_present=False,
         seed=None,
         provenance=_RequestSeedProvenance.NONE,
-        # The legacy path is deterministic at engine scope and never inherits
-        # an orchestration-injected request default.  Ordinary unsupported
-        # dialects must remove one inherited from a supporting parent binding.
-        remove_inherited_seed=scope is _RequestSeedScope.PER_REQUEST,
     )
+
+
+def _validated_request_seed(value: object) -> int | None:
+    """Return one typed request seed or reject an invalid explicit value."""
+
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+        raise TypeError("seed must be an integer")
+    return cast(int | None, value)
 
 
 def _with_task_infer_seed(
@@ -243,15 +247,12 @@ def _with_task_infer_seed(
 
     if "seed" not in infer_args:
         return decision
-    seed = infer_args["seed"]
-    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
-        raise TypeError("seed must be an integer")
+    seed = _validated_request_seed(infer_args["seed"])
     return dataclasses.replace(
         decision,
         seed_present=True,
         seed=seed,
         provenance=_RequestSeedProvenance.TASK_INFER_ARGS,
-        remove_inherited_seed=False,
     )
 
 
@@ -276,8 +277,7 @@ def _apply_request_seed_decision_to_model(
             f"{decision.dialect_id!r}, but the bound model uses "
             f"{model.dialect_id!r}"
         )
-    if "seed" in model._kwargs:
-        model = model.without_args("seed")
+    model = model.without_args("seed")
     if decision.seed_present:
         model = model.with_args(seed=decision.seed)
     return model
@@ -2564,12 +2564,7 @@ class EvalSession:
     ) -> tuple[bool, int | None]:
         if "seed" not in values:
             return False, None
-        value = values["seed"]
-        if value is not None and (
-            isinstance(value, bool) or not isinstance(value, int)
-        ):
-            raise TypeError("seed must be an integer")
-        return True, value
+        return True, _validated_request_seed(values["seed"])
 
     def _freeze_deterministic_request_seed_decisions(self) -> None:
         """Freeze every model request-default seed decision after prelaunch."""
@@ -2678,7 +2673,6 @@ class EvalSession:
         binding: NormalizedModelBinding,
     ) -> dict[str, JSONValue]:
         entry: dict[str, JSONValue] = {
-            "binding_id": binding.binding_id,
             "requested_model_id": binding.requested_model_id,
             "dialect_id": decision.dialect_id,
             "request_seed_support": decision.support.value,
@@ -2687,10 +2681,9 @@ class EvalSession:
             "seed": decision.seed,
             "seed_provenance": decision.provenance.value,
             "explicit_seed_present": decision.explicit_seed_present,
-            "remove_inherited_seed": decision.remove_inherited_seed,
         }
-        if isinstance(binding, ExternalModelBinding):
-            entry["runtime_plan_fingerprint"] = binding.runtime_plan_fingerprint
+        if not isinstance(binding, ExternalModelBinding):
+            entry["binding_id"] = binding.binding_id
         return entry
 
     def _deterministic_seed_contract(self) -> dict[str, JSONValue]:
@@ -3879,31 +3872,6 @@ class EvalSession:
         raise ValueError(
             f"Task '{task_name}': 'dataset' must be a string reference or inline definition"  # noqa: E501
         )
-
-    def _resolve_task_model(self, task_cfg: TaskConfigDict, task_name: str) -> Model:
-        """Resolve model for a task."""
-        model_ref = task_cfg.get("model")
-
-        if model_ref is not None and not isinstance(model_ref, str):
-            raise ValueError(f"Task '{task_name}': 'model' must be a string reference")
-
-        # If no model specified, use default if only one exists
-        if not model_ref:
-            if len(self.models) == 1:
-                return next(iter(self.models.values()))
-            elif len(self.models) == 0:
-                raise ValueError(f"Task '{task_name}': no models defined in config")
-            else:
-                raise ValueError(
-                    f"Task '{task_name}': 'model' required when multiple models are defined"  # noqa: E501
-                )
-
-        if model_ref not in self.models:
-            raise ValueError(
-                f"Task '{task_name}' references unknown model '{model_ref}'"
-            )
-
-        return self.models[model_ref]
 
     def _build_runner_config(
         self, task_cfg: TaskConfigDict, defaults: dict[str, Any]
