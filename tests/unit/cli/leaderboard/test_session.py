@@ -20,6 +20,7 @@ import yaml
 
 from sieval.cli._filter_spec import VALUES_DIGEST_KEY, compute_values_digest
 from sieval.cli.leaderboard.session import (
+    _DETERMINISTIC_SEED_CONTRACT_KEY,
     _NONMATCH_RUNNER_KEYS,
     _STRICT_RUNNER_KEYS,
     _THROUGHPUT_RUNNER_KEYS,
@@ -27,6 +28,8 @@ from sieval.cli.leaderboard.session import (
     EvalSession,
     _append_resume_note,
     _apply_endpoint_injection,
+    _apply_request_seed_decision_to_args,
+    _apply_request_seed_decision_to_model,
     _brief_diff,
     _cross_version_resume_hint,
     _describe_order_change,
@@ -35,6 +38,7 @@ from sieval.cli.leaderboard.session import (
     _diff_lines,
     _format_comment_header,
     _reify_cli_overrides,
+    _resolve_deterministic_request_seed,
     _sort_versions,
     _split_header,
     _strip_header,
@@ -47,6 +51,7 @@ from sieval.cli.leaderboard.session import (
 from sieval.cli.resolution import derive_model_type
 from sieval.cli.validation import _VALID_OPERATIONS
 from sieval.core.models.connection_factory import DEFAULT_REQUEST_TIMEOUT
+from sieval.core.models.dialect_registry import RequestSeedSupport
 from sieval.core.models.model import Model
 from sieval.core.models.reconcile import CheckStage, Configured, DeferredCheck
 from sieval.core.models.requirements import (
@@ -54,6 +59,7 @@ from sieval.core.models.requirements import (
     InlineModelBinding,
     InputKind,
     NamedModelBinding,
+    RequirementContext,
     TaskModelRequirement,
     TaskRequirements,
 )
@@ -76,6 +82,32 @@ def _write_yaml_config(tmp_path: Path, filename: str, content: str) -> Path:
     return path
 
 
+def _task_requirement_context_for_setup_test(
+    task_cfg: object,
+    models: dict[str, Model],
+) -> RequirementContext:
+    """Build the frozen candidate seam expected by direct ``_setup_tasks`` tests."""
+
+    if not isinstance(task_cfg, dict):
+        return RequirementContext()
+    typed_task_cfg = cast(dict[str, Any], task_cfg)
+    infer_args = typed_task_cfg.get("infer_args", {})
+    if not isinstance(infer_args, dict):
+        infer_args = {}
+    model_name = typed_task_cfg.get("model")
+    if not model_name and len(models) == 1:
+        model_name = next(iter(models))
+    bindings = {}
+    if isinstance(model_name, str) and model_name:
+        bindings["candidate"] = NamedModelBinding(
+            binding_id=f"model:{model_name}",
+            root_deployment_key=f"model:{model_name}",
+            requested_model_id=model_name,
+            config_name=model_name,
+        )
+    return RequirementContext(model_bindings=bindings, infer_args=infer_args)
+
+
 def _prepare_eval_session(
     config_path: Path,
     *,
@@ -85,6 +117,14 @@ def _prepare_eval_session(
     runner = EvalSession(config_path=str(config_path), resume=resume)
     if models is not None:
         runner.models = models
+    tasks_cfg = runner._get_named_config_map("tasks")
+    runner._task_requirement_contexts = {
+        task_name: _task_requirement_context_for_setup_test(
+            task_cfg,
+            runner.models,
+        )
+        for task_name, task_cfg in tasks_cfg.items()
+    }
     runner._init_runner()
     runner._setup_datasets()
     runner._setup_tasks()
@@ -712,58 +752,60 @@ class TestDeriveModelType:
             derive_model_type("m", None, cast(Any, object()))
 
 
-# ===================================================================
-# Resolve task model / dataset helpers
-# ===================================================================
-class TestResolveTaskModel:
-    def _make_runner(self, models=None):
-        runner = object.__new__(EvalSession)
-        runner.models = models or {}
-        return runner
+class TestTaskModelConfigName:
+    """Task -> candidate model-name resolution.
 
-    def test_explicit_model_ref(self):
-        m = MagicMock()
-        runner = self._make_runner({"my_model": m})
-        result = runner._resolve_task_model({"model": "my_model"}, "t1")
-        assert result is m
+    This is the single surviving resolver: `_setup_tasks` reads the candidate
+    from the prelaunch-frozen `RequirementContext`, so these errors are the
+    only thing standing between a typo'd `model:` and a confusing failure
+    much deeper in binding.
+    """
 
-    def test_single_model_default(self):
-        m = MagicMock()
-        runner = self._make_runner({"only": m})
-        result = runner._resolve_task_model({}, "t1")
-        assert result is m
+    def _session(self):
+        return object.__new__(EvalSession)
 
-    def test_error_cases(self):
-        # (models_map, task_cfg, expected_error_pattern)
-        cases = [
-            # Explicit model reference does not exist.
-            (
-                {"my_model": MagicMock()},
-                {"model": "bad_ref"},
-                "unknown model",
-            ),
-            # No model available and no reference provided.
-            (
-                {},
-                {},
-                "no models defined",
-            ),
-            # Multiple models available but task doesn't choose one.
-            (
-                {"a": MagicMock(), "b": MagicMock()},
-                {},
-                "'model' required",
-            ),
-        ]
-        for models, task_cfg, error_match in cases:
-            runner = self._make_runner(models)
-            with pytest.raises(ValueError, match=error_match):
-                runner._resolve_task_model(task_cfg, "t1")
+    def test_explicit_model_ref_is_returned(self):
+        session = self._session()
+        models_cfg = {"my_model": {"name": "org/m"}, "other": {"name": "org/o"}}
 
-    def test_model_ref_must_be_string(self):
-        runner = self._make_runner({"my_model": MagicMock()})
+        assert (
+            session._task_model_config_name("t1", {"model": "my_model"}, models_cfg)
+            == "my_model"
+        )
+
+    def test_single_model_is_the_default_candidate(self):
+        session = self._session()
+
+        assert (
+            session._task_model_config_name("t1", {}, {"only": {"name": "org/m"}})
+            == "only"
+        )
+
+    def test_unknown_model_ref_is_rejected(self):
+        session = self._session()
+        with pytest.raises(ValueError, match="references unknown model 'bad_ref'"):
+            session._task_model_config_name(
+                "t1", {"model": "bad_ref"}, {"my_model": {"name": "org/m"}}
+            )
+
+    def test_no_models_defined_is_rejected(self):
+        session = self._session()
+        with pytest.raises(ValueError, match="no models defined in config"):
+            session._task_model_config_name("t1", {}, {})
+
+    def test_ambiguous_candidate_is_rejected(self):
+        session = self._session()
+        with pytest.raises(ValueError, match="'model' required when multiple models"):
+            session._task_model_config_name(
+                "t1", {}, {"a": {"name": "org/a"}, "b": {"name": "org/b"}}
+            )
+
+    def test_non_string_model_ref_is_rejected(self):
+        session = self._session()
         with pytest.raises(ValueError, match="'model' must be a string reference"):
-            runner._resolve_task_model({"model": 123}, "t1")
+            session._task_model_config_name(
+                "t1", {"model": 123}, {"my_model": {"name": "org/m"}}
+            )
 
 
 class TestResolveTaskDataset:
@@ -1084,6 +1126,7 @@ class TestEvalSessionArun:
     async def test_arun_full_chain(self, tmp_path):
         """EvalSession.arun() should load config, set up all components, and run."""
         yaml_content = """\
+deterministic: true
 result_dir: "{result_dir}"
 
 models:
@@ -1122,6 +1165,16 @@ tasks:
 
         assert "chain_eval" in results
         assert results["chain_eval"]["total"] == 3
+        persisted = yaml.safe_load(
+            (tmp_path / "arun_results" / "effective_config.yaml").read_text()
+        )
+        contract = persisted[_DETERMINISTIC_SEED_CONTRACT_KEY]
+        assert set(contract) == {"bindings", "external_roles", "candidates"}
+        binding = contract["bindings"]["model:mock_model"]
+        assert binding["dialect_id"] == "openai_chat"
+        assert binding["request_seed_support"] == "supported"
+        assert binding["seed"] == DETERMINISTIC_DEFAULT_SEED
+        assert binding["seed_provenance"] == "automatic"
 
 
 class TestEvalSessionConfigLoading:
@@ -1461,6 +1514,17 @@ class TestSetupTasksErrors:
         runner.models = models or {}
         runner.datasets = datasets or {}
         runner.runner = MultiTaskRunner()
+        runner._task_requirement_contexts = (
+            {
+                task_name: _task_requirement_context_for_setup_test(
+                    task_cfg,
+                    runner.models,
+                )
+                for task_name, task_cfg in tasks_cfg.items()
+            }
+            if isinstance(tasks_cfg, dict)
+            else {}
+        )
         return runner
 
     def test_tasks_not_dict_raises(self):
@@ -1690,6 +1754,120 @@ class TestPrelaunchReconciliation:
     @staticmethod
     def _config(tmp_path: Path, body: str) -> Path:
         return _write_yaml_config(tmp_path, "prelaunch.yaml", body)
+
+    async def _external_seed_contract_entry(
+        self,
+        tmp_path: Path,
+        *,
+        requested_model_id: str = "org/external-grader",
+        api_base: str = "https://external.example:8000/v1",
+        completion: bool = False,
+        explicit_seed: int | None = None,
+    ) -> dict[str, Any]:
+        from sieval.core.models import ChatModel, GenModel
+
+        config_path = self._config(
+            tmp_path,
+            """
+deterministic: true
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args: {}
+""",
+        )
+        if completion:
+            if explicit_seed is None:
+                external: Model = GenModel(
+                    model=requested_model_id,
+                    api_base=api_base,
+                    api_key="external-key",
+                )
+            else:
+                external = GenModel(
+                    model=requested_model_id,
+                    api_base=api_base,
+                    api_key="external-key",
+                    seed=explicit_seed,
+                )
+        else:
+            if explicit_seed is None:
+                external = ChatModel(
+                    model=requested_model_id,
+                    api_base=api_base,
+                    api_key="external-key",
+                )
+            else:
+                external = ChatModel(
+                    model=requested_model_id,
+                    api_base=api_base,
+                    api_key="external-key",
+                    seed=explicit_seed,
+                )
+        session = EvalSession(config_path)
+        tasks = cast(dict[str, Any], session.config["tasks"])
+        task = cast(dict[str, Any], tasks["judged"])
+        cast(dict[str, Any], task["args"])["grader"] = external
+        task_class = self.ScoringJudgeTask if completion else self.JudgeTask
+
+        try:
+            with patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=task_class,
+            ):
+                session.prepare_prelaunch()
+                session._stamp_deterministic_seed_contract()
+            contract = cast(
+                dict[str, Any],
+                session._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY],
+            )
+            entry = cast(dict[str, Any], contract["external_roles"]["judged.grader"])
+            return dict(entry)
+        finally:
+            await external.aclose()
+
+    @pytest.mark.anyio
+    async def test_external_seed_contract_uses_stable_semantic_identity(
+        self, tmp_path: Path
+    ) -> None:
+        first = await self._external_seed_contract_entry(tmp_path)
+        reconstructed = await self._external_seed_contract_entry(tmp_path)
+        moved_endpoint = await self._external_seed_contract_entry(
+            tmp_path,
+            api_base="https://external.example:9000/v1",
+        )
+
+        assert first == reconstructed == moved_endpoint
+        assert "binding_id" not in first
+        assert "runtime_plan_fingerprint" not in first
+
+    @pytest.mark.anyio
+    async def test_external_seed_contract_retains_semantic_sensitivity(
+        self, tmp_path: Path
+    ) -> None:
+        baseline = await self._external_seed_contract_entry(tmp_path)
+        changed_model = await self._external_seed_contract_entry(
+            tmp_path,
+            requested_model_id="org/other-grader",
+        )
+        changed_dialect = await self._external_seed_contract_entry(
+            tmp_path,
+            completion=True,
+        )
+        changed_seed = await self._external_seed_contract_entry(
+            tmp_path,
+            explicit_seed=7,
+        )
+
+        assert changed_model != baseline
+        assert changed_dialect != baseline
+        assert changed_seed != baseline
 
     def test_implicit_single_model_completion_uses_normalized_hook_evidence(
         self, tmp_path: Path
@@ -3502,6 +3680,7 @@ tasks:
         config_path = self._config(
             tmp_path,
             """
+deterministic: true
 models:
   candidate:
     name: org/candidate
@@ -3519,6 +3698,7 @@ tasks:
         api_base: https://extractor.example/v1
         api_key: extractor-key
         temperature: 0
+        seed: 17
 """,
         )
         session = EvalSession(config_path)
@@ -3536,12 +3716,28 @@ tasks:
             ) as client_factory,
         ):
             session._setup_prelaunch_reconciliation()
+            tasks = cast(dict, session.config["tasks"])
+            extracted = cast(dict, tasks["extracted"])
+            task_args = cast(dict, extracted["args"])
+            cast(dict, task_args["extractor"])["seed"] = 71
             session._setup_postlaunch_reconciliation()
             session._setup_models()
+            session._stamp_deterministic_seed_contract()
 
         extractor = session._bound_task_role_models["extracted"]["extractor"]
         assert isinstance(session.models["candidate"], ChatModel)
         assert isinstance(extractor, ChatModel)
+        assert session.models["candidate"]._kwargs["seed"] == 0
+        assert extractor._kwargs["seed"] == 17
+        binding_id = (
+            session._task_requirement_contexts["extracted"]
+            .model_bindings["extractor"]
+            .binding_id
+        )
+        contract = session._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY]
+        inline_contract = contract["bindings"][binding_id]
+        assert inline_contract["seed"] == 17
+        assert inline_contract["seed_provenance"] == "binding_config"
         assert extractor is not session.models["candidate"]
         assert extractor.pool is not session.models["candidate"].pool
         assert len(session._owned_pools) == 2
@@ -3556,13 +3752,14 @@ tasks:
 
     @pytest.mark.anyio
     async def test_postlaunch_inline_grader_gets_own_pool_and_role_binding(
-        self, tmp_path: Path
+        self, tmp_path: Path, loguru_caplog
     ) -> None:
         from sieval.core.models import ChatModel
 
         config_path = self._config(
             tmp_path,
             """
+deterministic: true
 models:
   candidate:
     name: org/candidate
@@ -3603,6 +3800,8 @@ tasks:
         grader = session._bound_task_role_models["judged"]["grader"]
         assert isinstance(session.models["candidate"], ChatModel)
         assert isinstance(grader, ChatModel)
+        assert session.models["candidate"]._kwargs["seed"] == 0
+        assert grader._kwargs["seed"] == 0
         assert grader is not session.models["candidate"]
         assert grader.pool is not session.models["candidate"].pool
         assert len(session._owned_pools) == 2
@@ -3610,6 +3809,11 @@ tasks:
             "https://candidate.example/v1",
             "https://grader.example/v1",
         }
+        assert any(
+            "judged.grader" in record.message
+            for record in loguru_caplog.records
+            if "best-effort" in record.message
+        )
 
         await session._close_owned_model_resources()
         for close in closes:
@@ -3617,13 +3821,14 @@ tasks:
 
     @pytest.mark.anyio
     async def test_external_grader_pool_is_borrowed_not_closed(
-        self, tmp_path: Path
+        self, tmp_path: Path, loguru_caplog
     ) -> None:
         from sieval.core.models import ChatModel
 
         config_path = self._config(
             tmp_path,
             """
+deterministic: true
 models:
   candidate:
     name: org/candidate
@@ -3671,6 +3876,8 @@ tasks:
             rebound = session._bound_task_role_models["judged"]["grader"]
             assert rebound is not external
             assert rebound.pool is external.pool
+            assert "seed" not in external._kwargs
+            assert rebound._kwargs["seed"] == 0
             assert rebound.runtime_plan is not None
             postlaunch = session.postlaunch_reconcile_result
             assert postlaunch is not None
@@ -3680,6 +3887,17 @@ tasks:
                 is postlaunch.runtime_plans[external.runtime_plan.binding_id]
             )
             assert external.pool not in session._owned_pools.values()
+            session._stamp_deterministic_seed_contract()
+            contract = session._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY]
+            external_contract = contract["external_roles"]["judged.grader"]
+            assert external_contract["explicit_seed_present"] is False
+            assert external_contract["seed"] == DETERMINISTIC_DEFAULT_SEED
+            assert external_contract["seed_provenance"] == "automatic"
+            assert any(
+                "judged.grader" in record.message
+                for record in loguru_caplog.records
+                if "best-effort" in record.message
+            )
             await session._close_owned_model_resources()
 
         candidate_close.assert_awaited_once()
@@ -3705,6 +3923,7 @@ tasks:
         config_path = self._config(
             tmp_path,
             f"""
+deterministic: true
 models:
   candidate:
     name: org/candidate
@@ -3723,6 +3942,7 @@ tasks:
         derived = {
             "a": base.with_args(
                 temperature=0,
+                seed=7,
                 extra={"source": "a"},
                 concurrency_limit=2,
             ),
@@ -3756,8 +3976,13 @@ tasks:
                 patch.object(base.pool, "aclose", external_close),
             ):
                 session._setup_prelaunch_reconciliation()
+                # The exact external role defaults are frozen before rebind.
+                # Later source mutation must not change contract or execution.
+                derived["a"]._kwargs["seed"] = 70
+                derived["b"]._kwargs["seed"] = 90
                 session._setup_postlaunch_reconciliation()
                 session._setup_models()
+                session._stamp_deterministic_seed_contract()
 
                 postlaunch = session.postlaunch_reconcile_result
                 assert postlaunch is not None
@@ -3765,11 +3990,22 @@ tasks:
                 rebound_plan = postlaunch.runtime_plans[base.runtime_plan.binding_id]
                 for name in ("a", "b"):
                     rebound = session._bound_task_role_models[name]["grader"]
-                    assert rebound._kwargs == {"temperature": 0 if name == "a" else 1}
+                    assert rebound._kwargs == {
+                        "temperature": 0 if name == "a" else 1,
+                        "seed": 7 if name == "a" else DETERMINISTIC_DEFAULT_SEED,
+                    }
                     assert rebound.extra == {"source": name}
                     assert rebound._limiter is derived[name]._limiter
                     assert rebound.pool is base.pool
                     assert rebound.runtime_plan is rebound_plan
+
+                contract = session._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY]
+                explicit = contract["external_roles"]["a.grader"]
+                automatic = contract["external_roles"]["b.grader"]
+                assert explicit["seed"] == 7
+                assert explicit["seed_provenance"] == "external_model"
+                assert automatic["seed"] == DETERMINISTIC_DEFAULT_SEED
+                assert automatic["seed_provenance"] == "automatic"
 
                 assert base.pool not in session._owned_pools.values()
                 await session._close_owned_model_resources()
@@ -4112,7 +4348,7 @@ tasks:
         close.assert_awaited_once()
 
     @pytest.mark.anyio
-    async def test_deterministic_sglang_legacy_seed_is_engine_level_noop(
+    async def test_deterministic_sglang_legacy_does_not_auto_inject_request_seed(
         self, tmp_path: Path
     ) -> None:
         from sieval.core.models import (
@@ -4168,9 +4404,18 @@ tasks:
                 session._setup_prelaunch_reconciliation()
                 session._setup_postlaunch_reconciliation()
                 session._setup_models()
+                session._stamp_deterministic_seed_contract()
 
             model = session.models["m"]
             assert isinstance(model, SglangGenModel)
+            assert "seed" not in model._kwargs
+            contract = session._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY]
+            binding = contract["bindings"]["model:m"]
+            assert binding["request_seed_support"] == "unsupported"
+            assert binding["seed_scope"] == "engine_level_only"
+            assert binding["seed_present"] is False
+            assert binding["seed"] is None
+            assert binding["seed_provenance"] == "none"
             with patch.object(model._legacy_transport, "arun", transport_arun):
                 generated = await model.agenerate("prompt")
                 scored = await model.alogprobs("prompt", echo=False)
@@ -4181,14 +4426,152 @@ tasks:
                 cast(Request, call.args[0]) for call in transport_arun.await_args_list
             ]
             assert len(requests) == 2
-            assert all(
-                request.sampling.seed == DETERMINISTIC_DEFAULT_SEED
-                for request in requests
-            )
+            assert all(request.sampling.seed is None for request in requests)
         finally:
             await session._close_owned_model_resources()
 
         close.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_explicit_sglang_legacy_seed_remains_engine_level_noop(
+        self, tmp_path: Path
+    ) -> None:
+        from sieval.core.models import Request, Response, SglangGenModel
+
+        config_path = self._config(
+            tmp_path,
+            """
+deterministic: true
+models:
+  m:
+    name: org/model
+    type: gen
+    engine: sglang
+    api_base: https://sglang.example/v1
+    api_key: local
+    args:
+      seed: 7
+tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+        close = AsyncMock()
+        connection = types.SimpleNamespace(
+            close=close,
+            base_url="https://sglang.example/v1",
+        )
+        transport_arun = AsyncMock(return_value=Response(texts=("ok",)))
+
+        try:
+            with (
+                patch(
+                    "sieval.cli.leaderboard.session.resolve_task_class",
+                    return_value=self.CompletionTask,
+                ),
+                patch(
+                    "sieval.core.models.sglang_gen_model.AsyncOpenAI",
+                    return_value=connection,
+                ),
+            ):
+                session._setup_prelaunch_reconciliation()
+                session._setup_postlaunch_reconciliation()
+                session._setup_models()
+
+            model = session.models["m"]
+            assert isinstance(model, SglangGenModel)
+            assert model._kwargs["seed"] == 7
+            with patch.object(model._legacy_transport, "arun", transport_arun):
+                output = await model.agenerate("prompt")
+
+            assert output.texts == ["ok"]
+            call = transport_arun.await_args
+            assert call is not None
+            request = cast(Request, call.args[0])
+            assert request.sampling.seed == 7
+        finally:
+            await session._close_owned_model_resources()
+
+        close.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_deterministic_legacy_candidate_survives_task_setup(
+        self, tmp_path: Path
+    ) -> None:
+        """`_setup_tasks` applies the frozen decision to a `SglangGenModel`.
+
+        The legacy facade is the one candidate that reaches
+        `_apply_request_seed_decision_to_model` as a `Model` *subclass* whose
+        `with_dialect` raises, so the helper's dialect guard has to be
+        satisfied by `SglangGenModel.dialect_id` rather than a runtime plan.
+        """
+        from sieval.core.models import SglangGenModel
+        from tests.unit.core.runners.test_runner import MockTask
+
+        class LegacyGenTask(MockTask):
+            model_type = "gen"
+
+        config_path = self._config(
+            tmp_path,
+            """
+deterministic: true
+models:
+  m:
+    name: org/model
+    type: gen
+    engine: sglang
+    api_base: https://sglang.example/v1
+    api_key: local
+datasets:
+  ds:
+    class: fake.Dataset
+tasks:
+  completion:
+    class: fake.LegacyGenTask
+    dataset: ds
+    model: m
+""",
+        )
+        session = EvalSession(config_path)
+        close = AsyncMock()
+        connection = types.SimpleNamespace(
+            close=close,
+            base_url="https://sglang.example/v1",
+        )
+
+        try:
+            with (
+                patch(
+                    "sieval.cli.leaderboard.session.resolve_task_class",
+                    return_value=LegacyGenTask,
+                ),
+                patch(
+                    "sieval.core.models.sglang_gen_model.AsyncOpenAI",
+                    return_value=connection,
+                ),
+            ):
+                session._setup_prelaunch_reconciliation()
+                session._setup_postlaunch_reconciliation()
+                session._setup_models()
+                session._init_runner()
+                session.datasets["ds"] = MagicMock()
+                session._setup_tasks()
+
+            assert session.runner is not None
+            task_model = session.runner._runners[0]._task.model
+            assert isinstance(task_model, SglangGenModel)
+            assert task_model.dialect_id == "sglang_legacy"
+            assert "seed" not in task_model._kwargs
+            # The helper derives rather than mutates, so a distinct object is
+            # the evidence that it ran against the legacy facade at all.
+            assert task_model is not session.models["m"]
+            assert "seed" not in session.models["m"]._kwargs
+        finally:
+            await session._close_owned_model_resources()
 
 
 class TestEvalSessionWrappers:
@@ -4356,6 +4739,8 @@ class TestEvalSessionWrappers:
         runner = object.__new__(EvalSession)
         runner.runner = None
         with (
+            patch.object(runner, "prepare_prelaunch", MagicMock(return_value=None)),
+            patch.object(runner, "_stamp_deterministic_seed_contract"),
             patch.object(runner, "_prepare_execution", AsyncMock(return_value=None)),
             patch.object(
                 runner, "_persist_effective_config", AsyncMock(return_value=None)
@@ -4376,6 +4761,8 @@ class TestEvalSessionWrappers:
         runner._owned_legacy_models = {}
 
         with (
+            patch.object(runner, "prepare_prelaunch", MagicMock(return_value=None)),
+            patch.object(runner, "_stamp_deterministic_seed_contract"),
             patch.object(runner, "_prepare_execution", AsyncMock(return_value=None)),
             patch.object(
                 runner, "_persist_effective_config", AsyncMock(return_value=None)
@@ -4450,6 +4837,13 @@ class TestInferArgs:
         runner.models = models or {}
         runner.datasets = datasets or {}
         runner.runner = MultiTaskRunner()
+        runner._task_requirement_contexts = {
+            task_name: _task_requirement_context_for_setup_test(
+                task_cfg,
+                runner.models,
+            )
+            for task_name, task_cfg in tasks_cfg.items()
+        }
         return runner
 
     @pytest.mark.parametrize("key", ["name", "dataset", "model", "models_by_role"])
@@ -4785,15 +5179,117 @@ tasks:
 
 
 # ===================================================================
-# Deterministic mode: required-seed injection + transparent sampling
+# Deterministic mode: dialect-declared seed injection + transparent sampling
 # ===================================================================
+class TestDeterministicRequestSeedPolicy:
+    @pytest.mark.parametrize("dialect_id", ["openai_chat", "openai_completions"])
+    def test_supported_dialects_receive_the_automatic_seed(self, dialect_id):
+        decision = _resolve_deterministic_request_seed(
+            dialect_id=dialect_id,
+            explicit_seed_present=False,
+        )
+
+        assert decision.seed_present is True
+        assert decision.seed == DETERMINISTIC_DEFAULT_SEED
+        assert decision.provenance.value == "automatic"
+
+    def test_unsupported_dialect_requests_automatic_default_removal(self):
+        with patch(
+            "sieval.cli.leaderboard.session.get_dialect_spec",
+            return_value=types.SimpleNamespace(
+                request_seed_support=RequestSeedSupport.UNSUPPORTED
+            ),
+        ):
+            decision = _resolve_deterministic_request_seed(
+                dialect_id="future_seedless",
+                explicit_seed_present=False,
+            )
+
+        assert decision.seed_present is False
+        assert decision.seed is None
+        assert decision.provenance.value == "none"
+
+    @pytest.mark.anyio
+    async def test_absent_decision_removes_existing_model_seed(self):
+        with patch(
+            "sieval.cli.leaderboard.session.get_dialect_spec",
+            return_value=types.SimpleNamespace(
+                request_seed_support=RequestSeedSupport.UNSUPPORTED
+            ),
+        ):
+            decision = _resolve_deterministic_request_seed(
+                dialect_id="openai_chat",
+                explicit_seed_present=False,
+            )
+
+        source = MockChatModel(seed=7)
+        try:
+            model = _apply_request_seed_decision_to_model(source, decision)
+            assert "seed" not in model.meta()["default_params"]
+        finally:
+            await source.aclose()
+
+    def test_absent_decision_removes_existing_argument_seed(self):
+        with patch(
+            "sieval.cli.leaderboard.session.get_dialect_spec",
+            return_value=types.SimpleNamespace(
+                request_seed_support=RequestSeedSupport.UNSUPPORTED
+            ),
+        ):
+            decision = _resolve_deterministic_request_seed(
+                dialect_id="future_seedless",
+                explicit_seed_present=False,
+            )
+
+        args = {"seed": 7, "temperature": 0.5}
+        _apply_request_seed_decision_to_args(args, decision)
+
+        assert args == {"temperature": 0.5}
+
+    def test_present_decision_replaces_existing_argument_seed(self):
+        decision = _resolve_deterministic_request_seed(
+            dialect_id="openai_chat",
+            explicit_seed_present=True,
+            explicit_seed=0,
+        )
+        args = {"seed": 9, "temperature": 0.5}
+
+        _apply_request_seed_decision_to_args(args, decision)
+
+        assert args == {"seed": 0, "temperature": 0.5}
+
+    def test_reserved_seed_policy_fails_loudly(self):
+        with pytest.raises(ValueError, match="openai_responses.*has not declared"):
+            _resolve_deterministic_request_seed(
+                dialect_id="openai_responses",
+                explicit_seed_present=False,
+            )
+
+    @pytest.mark.parametrize("seed", [None, 0, 42])
+    def test_explicit_seed_is_never_rewritten(self, seed):
+        with patch(
+            "sieval.cli.leaderboard.session.get_dialect_spec",
+            return_value=types.SimpleNamespace(
+                request_seed_support=RequestSeedSupport.UNSUPPORTED
+            ),
+        ):
+            decision = _resolve_deterministic_request_seed(
+                dialect_id="future_seedless",
+                explicit_seed_present=True,
+                explicit_seed=seed,
+            )
+
+        assert decision.seed_present is True
+        assert decision.seed == seed
+        assert decision.provenance.value == "binding_config"
+
+
 class TestDeterministicMode:
     """Deterministic mode flag resolution, seed injection, sampling pass-through.
 
-    Deterministic mode injects only `seed` as required. All sampling
-    parameters (temperature, top_p, top_k, ...) are transparent — users
-    configure them freely and pass@k configurations with temperature > 0
-    are first-class.
+    Deterministic mode injects only ``seed``, and only when the selected
+    dialect declares that it can transmit one. All other sampling parameters
+    (temperature, top_p, top_k, ...) remain transparent.
     """
 
     class ChatTask:
@@ -4810,11 +5306,33 @@ class TestDeterministicMode:
                 ),
             )
 
-    def _bind_models(self, tmp_path: Path, config: dict) -> EvalSession:
+    class GenTask:
+        model_type = "gen"
+
+        @classmethod
+        def model_requirements_for(cls, context):
+            return (
+                TaskModelRequirement(
+                    role="candidate",
+                    binding=context.model_bindings["candidate"],
+                    requires=TaskRequirements(input=InputKind.COMPLETION),
+                    source_task="deterministic_test",
+                ),
+            )
+
+    def _bind_models(
+        self,
+        tmp_path: Path,
+        config: dict,
+        *,
+        task_class: type | None = None,
+        connection: object | None = None,
+    ) -> EvalSession:
         """Exercise the same prelaunch -> postlaunch -> bind path as a run."""
 
+        task_class = task_class or self.ChatTask
         config.setdefault("tasks", {})["eval"] = {
-            "class": "fake.ChatTask",
+            "class": f"fake.{task_class.__name__}",
             "dataset": {"class": "fake.Dataset"},
             "model": next(reversed(config["models"])),
         }
@@ -4824,11 +5342,11 @@ class TestDeterministicMode:
             yaml.safe_dump(config, sort_keys=False),
         )
         session = EvalSession(config_path)
-        connection = types.SimpleNamespace(close=AsyncMock())
+        connection = connection or types.SimpleNamespace(close=AsyncMock())
         with (
             patch(
                 "sieval.cli.leaderboard.session.resolve_task_class",
-                return_value=self.ChatTask,
+                return_value=task_class,
             ),
             patch(
                 "sieval.core.models.connection_factory.AsyncOpenAI",
@@ -4885,7 +5403,7 @@ class TestDeterministicMode:
     # ------------------------------------------------------------------
 
     def test_seed_auto_injected_when_absent(self, tmp_path):
-        """Deterministic mode injects seed=0 when user doesn't specify."""
+        """A supporting dialect receives seed=0 when the user omits it."""
         session = self._bind_models(
             tmp_path,
             {
@@ -4894,6 +5412,345 @@ class TestDeterministicMode:
             },
         )
         assert session.models["m1"]._kwargs.get("seed") == 0
+
+    def test_completions_seed_auto_injected_when_absent(self, tmp_path):
+        session = self._bind_models(
+            tmp_path,
+            {
+                "deterministic": True,
+                "models": {"m1": {"name": "mock-gen", "type": "gen", "args": {}}},
+            },
+            task_class=self.GenTask,
+        )
+
+        assert session.models["m1"].dialect_id == "openai_completions"
+        assert session.models["m1"]._kwargs.get("seed") == 0
+
+    @pytest.mark.anyio
+    async def test_chat_automatic_seed_reaches_wire_and_model_output(self, tmp_path):
+        create = AsyncMock(
+            return_value=types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        index=0,
+                        message=types.SimpleNamespace(
+                            content="ok",
+                            reasoning=None,
+                            reasoning_content=None,
+                            tool_calls=None,
+                        ),
+                        finish_reason="stop",
+                        logprobs=None,
+                    )
+                ],
+                usage=None,
+                model="served-chat",
+                system_fingerprint=None,
+            )
+        )
+        connection = types.SimpleNamespace(
+            close=AsyncMock(),
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=create)
+            ),
+        )
+        session = self._bind_models(
+            tmp_path,
+            {
+                "deterministic": True,
+                "models": {"m1": {"name": "mock-chat", "type": "chat"}},
+            },
+            connection=connection,
+        )
+
+        try:
+            output = await session.models["m1"].agenerate("hello", stream=False)
+            masked = await session.models["m1"].agenerate(
+                "hello", stream=False, seed=None
+            )
+        finally:
+            await session._close_owned_model_resources()
+
+        seeded_call, masked_call = create.await_args_list
+        assert seeded_call.kwargs["seed"] == DETERMINISTIC_DEFAULT_SEED
+        assert "seed" not in masked_call.kwargs
+        assert output.request_params is not None
+        assert output.request_params["seed"] == DETERMINISTIC_DEFAULT_SEED
+        assert masked.request_params is not None
+        assert "seed" not in masked.request_params
+
+    @pytest.mark.anyio
+    async def test_completions_automatic_seed_reaches_wire_and_model_output(
+        self, tmp_path
+    ):
+        create = AsyncMock(
+            return_value=types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        index=0,
+                        text="ok",
+                        finish_reason="stop",
+                        logprobs=None,
+                    )
+                ],
+                usage=None,
+                model="served-completion",
+                system_fingerprint=None,
+            )
+        )
+        connection = types.SimpleNamespace(
+            close=AsyncMock(),
+            completions=types.SimpleNamespace(create=create),
+        )
+        session = self._bind_models(
+            tmp_path,
+            {
+                "deterministic": True,
+                "models": {"m1": {"name": "mock-gen", "type": "gen"}},
+            },
+            task_class=self.GenTask,
+            connection=connection,
+        )
+
+        try:
+            output = await session.models["m1"].agenerate("hello", stream=False)
+        finally:
+            await session._close_owned_model_resources()
+
+        call = create.await_args
+        assert call is not None
+        assert call.kwargs["seed"] == DETERMINISTIC_DEFAULT_SEED
+        assert output.request_params is not None
+        assert output.request_params["seed"] == DETERMINISTIC_DEFAULT_SEED
+
+    @pytest.mark.anyio
+    async def test_task_infer_seed_contract_matches_each_candidate_wire(self, tmp_path):
+        from tests.unit.core.runners.test_runner import MockTask
+
+        create = AsyncMock(
+            return_value=types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        index=0,
+                        message=types.SimpleNamespace(
+                            content="ok",
+                            reasoning=None,
+                            reasoning_content=None,
+                            tool_calls=None,
+                        ),
+                        finish_reason="stop",
+                        logprobs=None,
+                    )
+                ],
+                usage=None,
+                model="served-chat",
+                system_fingerprint=None,
+            )
+        )
+        connection = types.SimpleNamespace(
+            close=AsyncMock(),
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=create)
+            ),
+        )
+        config_path = _write_yaml_config(
+            tmp_path,
+            "candidate-seeds.yaml",
+            yaml.safe_dump(
+                {
+                    "deterministic": True,
+                    "models": {"m": {"name": "mock-chat", "type": "chat"}},
+                    "datasets": {"ds": {"class": "fake.Dataset"}},
+                    "tasks": {
+                        "first": {
+                            "class": "fake.MockTask",
+                            "dataset": "ds",
+                            "model": "m",
+                            "infer_args": {"seed": 11},
+                        },
+                        "second": {
+                            "class": "fake.MockTask",
+                            "dataset": "ds",
+                            "model": "m",
+                            "infer_args": {"seed": 22},
+                        },
+                    },
+                },
+                sort_keys=False,
+            ),
+        )
+        session = EvalSession(config_path)
+
+        try:
+            with (
+                patch(
+                    "sieval.cli.leaderboard.session.resolve_task_class",
+                    return_value=MockTask,
+                ),
+                patch(
+                    "sieval.core.models.connection_factory.AsyncOpenAI",
+                    return_value=connection,
+                ),
+            ):
+                session._setup_prelaunch_reconciliation()
+                session._stamp_deterministic_seed_contract()
+
+                # Execution must consume RequirementContext.infer_args, not a
+                # second read of the now-mutated session config.
+                tasks = cast(dict, session.config["tasks"])
+                cast(dict, tasks["first"])["infer_args"] = {"seed": 91}
+                cast(dict, tasks["second"])["infer_args"] = {"seed": 92}
+
+                session._setup_postlaunch_reconciliation()
+                session._setup_models()
+                session._init_runner()
+                session.datasets["ds"] = MagicMock()
+                session._setup_tasks()
+
+            contract = session._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY]
+            assert contract["bindings"]["model:m"]["seed"] == 0
+            assert contract["candidates"]["first"]["seed"] == 11
+            assert (
+                contract["candidates"]["first"]["seed_provenance"] == "task_infer_args"
+            )
+            assert contract["candidates"]["second"]["seed"] == 22
+            assert (
+                contract["candidates"]["second"]["seed_provenance"] == "task_infer_args"
+            )
+            yaml.safe_dump(contract)
+            assert "_request_seed_decisions" not in session._reified_config
+
+            assert session.runner is not None
+            task_models = {
+                entry._task.name: entry._task.model for entry in session.runner._runners
+            }
+            await task_models["first"].agenerate("hello", stream=False)
+            await task_models["second"].agenerate("hello", stream=False)
+
+            first_call, second_call = create.await_args_list
+            assert first_call.kwargs["seed"] == 11
+            assert second_call.kwargs["seed"] == 22
+        finally:
+            await session._close_owned_model_resources()
+
+    @pytest.mark.anyio
+    async def test_task_candidate_binding_is_frozen_before_setup(self, tmp_path):
+        from tests.unit.core.runners.test_runner import MockTask
+
+        def response() -> object:
+            return types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        index=0,
+                        message=types.SimpleNamespace(
+                            content="ok",
+                            reasoning=None,
+                            reasoning_content=None,
+                            tool_calls=None,
+                        ),
+                        finish_reason="stop",
+                        logprobs=None,
+                    )
+                ],
+                usage=None,
+                model="served-chat",
+                system_fingerprint=None,
+            )
+
+        frozen_create = AsyncMock(return_value=response())
+        mutated_create = AsyncMock(return_value=response())
+        frozen_connection = types.SimpleNamespace(
+            close=AsyncMock(),
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=frozen_create)
+            ),
+        )
+        mutated_connection = types.SimpleNamespace(
+            close=AsyncMock(),
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=mutated_create)
+            ),
+        )
+        config_path = _write_yaml_config(
+            tmp_path,
+            "frozen-candidate.yaml",
+            yaml.safe_dump(
+                {
+                    "deterministic": True,
+                    "models": {
+                        "frozen": {
+                            "name": "frozen-model",
+                            "type": "chat",
+                            "api_base": "https://frozen.example/v1",
+                            "api_key": "frozen-key",
+                            "args": {"seed": 11},
+                        },
+                        "mutated": {
+                            "name": "mutated-model",
+                            "type": "chat",
+                            "api_base": "https://mutated.example/v1",
+                            "api_key": "mutated-key",
+                            "args": {"seed": 22},
+                        },
+                    },
+                    "datasets": {"ds": {"class": "fake.Dataset"}},
+                    "tasks": {
+                        "eval": {
+                            "class": "fake.MockTask",
+                            "dataset": "ds",
+                            "model": "frozen",
+                        }
+                    },
+                },
+                sort_keys=False,
+            ),
+        )
+        session = EvalSession(config_path)
+
+        try:
+            with (
+                patch(
+                    "sieval.cli.leaderboard.session.resolve_task_class",
+                    return_value=MockTask,
+                ),
+                patch(
+                    "sieval.core.models.connection_factory.AsyncOpenAI",
+                    side_effect=[frozen_connection, mutated_connection],
+                ),
+            ):
+                session._setup_prelaunch_reconciliation()
+                session._stamp_deterministic_seed_contract()
+
+                tasks = cast(dict, session.config["tasks"])
+                cast(dict, tasks["eval"])["model"] = "mutated"
+
+                session._setup_postlaunch_reconciliation()
+                session._setup_models()
+                session._init_runner()
+                session.datasets["ds"] = MagicMock()
+                session._setup_tasks()
+
+            contract = session._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY]
+            candidate_contract = contract["candidates"]["eval"]
+            assert candidate_contract["binding_id"] == "model:frozen"
+            assert candidate_contract["requested_model_id"] == "frozen-model"
+            assert candidate_contract["seed"] == 11
+
+            assert session.runner is not None
+            task_model = session.runner._runners[0]._task.model
+            assert task_model.runtime_plan is not None
+            assert task_model.runtime_plan.binding_id == "model:frozen"
+            assert task_model._kwargs["seed"] == 11
+
+            await task_model.agenerate("hello", stream=False)
+            frozen_create.assert_awaited_once()
+            mutated_create.assert_not_awaited()
+            call = frozen_create.await_args
+            assert call is not None
+            assert call.kwargs["model"] == "frozen-model"
+            assert call.kwargs["seed"] == 11
+        finally:
+            await session._close_owned_model_resources()
 
     def test_seed_user_override_preserved(self, tmp_path):
         """User's explicit seed=42 is preserved; no injection override."""
@@ -4912,6 +5769,114 @@ class TestDeterministicMode:
         )
         assert session.models["m1"]._kwargs.get("seed") == 42
 
+    @pytest.mark.anyio
+    async def test_named_seed_value_and_provenance_are_frozen_before_binding(
+        self, tmp_path
+    ):
+        create = AsyncMock(
+            return_value=types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        index=0,
+                        message=types.SimpleNamespace(
+                            content="ok",
+                            reasoning=None,
+                            reasoning_content=None,
+                            tool_calls=None,
+                        ),
+                        finish_reason="stop",
+                        logprobs=None,
+                    )
+                ],
+                usage=None,
+                model="served-chat",
+                system_fingerprint=None,
+            )
+        )
+        connection = types.SimpleNamespace(
+            close=AsyncMock(),
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=create)
+            ),
+        )
+        config_path = _write_yaml_config(
+            tmp_path,
+            "frozen-named-seed.yaml",
+            yaml.safe_dump(
+                {
+                    "deterministic": True,
+                    "models": {
+                        "m": {
+                            "name": "mock-chat",
+                            "type": "chat",
+                            "args": {"seed": 41},
+                        }
+                    },
+                    "tasks": {
+                        "eval": {
+                            "class": "fake.ChatTask",
+                            "dataset": {"class": "fake.Dataset"},
+                            "model": "m",
+                        }
+                    },
+                },
+                sort_keys=False,
+            ),
+        )
+        session = EvalSession(config_path)
+
+        try:
+            with (
+                patch(
+                    "sieval.cli.leaderboard.session.resolve_task_class",
+                    return_value=self.ChatTask,
+                ),
+                patch(
+                    "sieval.core.models.connection_factory.AsyncOpenAI",
+                    return_value=connection,
+                ),
+            ):
+                session._setup_prelaunch_reconciliation()
+                models = cast(dict, session.config["models"])
+                args = cast(dict, cast(dict, models["m"])["args"])
+                args["seed"] = 99
+                session._setup_postlaunch_reconciliation()
+                session._setup_models()
+                session._stamp_deterministic_seed_contract()
+
+            contract = session._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY]
+            assert contract["bindings"]["model:m"]["seed"] == 41
+            assert (
+                contract["bindings"]["model:m"]["seed_provenance"] == "binding_config"
+            )
+            assert contract["candidates"]["eval"]["seed"] == 41
+
+            await session.models["m"].agenerate("hello", stream=False)
+            call = create.await_args
+            assert call is not None
+            assert call.kwargs["seed"] == 41
+        finally:
+            await session._close_owned_model_resources()
+
+    def test_explicit_none_seed_is_preserved_through_derived_chain(self, tmp_path):
+        session = self._bind_models(
+            tmp_path,
+            {
+                "deterministic": True,
+                "models": {
+                    "base": {
+                        "name": "mock-chat",
+                        "type": "chat",
+                        "args": {"seed": None},
+                    },
+                    "child": {"base": "base", "args": {"temperature": 0.7}},
+                },
+            },
+        )
+
+        assert session.models["base"]._kwargs["seed"] is None
+        assert session.models["child"]._kwargs["seed"] is None
+
     def test_no_seed_injection_when_not_deterministic(self, tmp_path):
         """seed is NOT auto-injected when deterministic=False."""
         session = self._bind_models(
@@ -4923,14 +5888,8 @@ class TestDeterministicMode:
         )
         assert "seed" not in session.models["m1"]._kwargs
 
-    def test_derived_model_inherits_injected_seed(self, tmp_path):
-        """Derived models inherit seed=0 from base via with_args kwarg merge.
-
-        seed is injected only on the first (base) pass; derived models pick it
-        up through ``base_model.with_args(**args)`` which merges
-        ``{**base._kwargs, **args}``. Uses a real ``MockChatModel`` so the
-        merge is exercised rather than mocked.
-        """
+    def test_derived_model_keeps_binding_local_automatic_seed(self, tmp_path):
+        """Every compatible binding receives the deterministic request seed."""
         session = self._bind_models(
             tmp_path,
             {
@@ -5016,8 +5975,7 @@ class TestDeterministicMode:
 
     def test_per_task_infer_args_temperature_allowed(self):
         """Per-task infer_args with temperature > 0 is accepted (no lock)."""
-        mock_model = MagicMock()
-        mock_model.with_args.return_value = mock_model
+        mock_model = MockChatModel()
         mock_ds = MagicMock()
         mock_task_cls = MagicMock(return_value=MagicMock())
 
@@ -5047,13 +6005,37 @@ class TestDeterministicMode:
         runner.datasets = {"ds": mock_ds}
         runner.runner = MultiTaskRunner()
         runner.deterministic = True
+        runner._task_requirement_contexts = {
+            "eval_task": RequirementContext(
+                model_bindings={
+                    "candidate": NamedModelBinding(
+                        binding_id="model:m",
+                        root_deployment_key="model:m",
+                        requested_model_id="m",
+                        config_name="m",
+                        dialect_id="openai_chat",
+                    )
+                },
+                infer_args={"temperature": 0.6, "top_k": 20},
+            )
+        }
+        runner._request_seed_decisions_by_candidate = {
+            "eval_task": _resolve_deterministic_request_seed(
+                dialect_id="openai_chat",
+                explicit_seed_present=False,
+            )
+        }
+        runner._request_seed_decisions_frozen = True
 
         with patch(
             "sieval.cli.leaderboard.session.resolve_task_class",
             return_value=mock_task_cls,
         ):
             runner._setup_tasks()  # must not raise
-        mock_model.with_args.assert_called_once_with(temperature=0.6, top_k=20)
+        task_model = mock_task_cls.call_args.kwargs["model"]
+        assert task_model._kwargs["temperature"] == 0.6
+        assert task_model._kwargs["top_k"] == 20
+        assert task_model._kwargs["seed"] == DETERMINISTIC_DEFAULT_SEED
 
 
 # ===================================================================
@@ -5371,7 +6353,7 @@ class TestUnwrapProxies:
 
 
 class TestReifyCliOverrides:
-    def test_deterministic_sets_root_and_base_model_seed(self):
+    def test_deterministic_sets_root_without_persisting_automatic_seed(self):
         cfg = {
             "models": {
                 "base": {"name": "qwen3-4b", "args": {"max_tokens": 8192}},
@@ -5380,8 +6362,8 @@ class TestReifyCliOverrides:
         }
         out = _reify_cli_overrides(cfg, deterministic=True)
         assert out["deterministic"] is True
-        assert out["models"]["base"]["args"]["seed"] == DETERMINISTIC_DEFAULT_SEED
         assert out["models"]["base"]["args"]["max_tokens"] == 8192
+        assert "seed" not in out["models"]["base"]["args"]
         assert "seed" not in out["models"]["derived"]["args"]
 
     def test_deterministic_preserves_user_seed(self):
@@ -5389,10 +6371,10 @@ class TestReifyCliOverrides:
         out = _reify_cli_overrides(cfg, deterministic=True)
         assert out["models"]["base"]["args"]["seed"] == 42
 
-    def test_deterministic_adds_args_dict_when_missing(self):
+    def test_deterministic_does_not_add_args_dict_when_missing(self):
         cfg = {"models": {"base": {"name": "m"}}}
         out = _reify_cli_overrides(cfg, deterministic=True)
-        assert out["models"]["base"]["args"] == {"seed": DETERMINISTIC_DEFAULT_SEED}
+        assert "args" not in out["models"]["base"]
 
     def test_deterministic_idempotent_when_already_true(self):
         cfg = {
@@ -5402,6 +6384,11 @@ class TestReifyCliOverrides:
         out = _reify_cli_overrides(cfg, deterministic=True)
         assert out["deterministic"] is True
         assert out["models"]["base"]["args"]["seed"] == 0
+
+    def test_deterministic_preserves_explicit_none_seed(self):
+        cfg = {"models": {"base": {"name": "m", "args": {"seed": None}}}}
+        out = _reify_cli_overrides(cfg, deterministic=True)
+        assert out["models"]["base"]["args"]["seed"] is None
 
     def test_model_override_rewrites_base_names_only(self):
         cfg = {
@@ -5437,7 +6424,7 @@ class TestReifyCliOverrides:
         assert out["deterministic"] is True
         assert out["result_dir"] == "./new"
         assert out["models"]["base"]["name"] == "new"
-        assert out["models"]["base"]["args"]["seed"] == DETERMINISTIC_DEFAULT_SEED
+        assert "args" not in out["models"]["base"]
 
 
 class TestApplyEndpointInjection:
@@ -5683,7 +6670,7 @@ class TestEvalSessionRawConfig:
         assert session._raw_config["models"]["base"].get("args", {}).get("seed") is None
         # self.config has reification applied
         assert session.config["deterministic"] is True
-        assert session.config["models"]["base"]["args"]["seed"] == 0
+        assert "args" not in session.config["models"]["base"]
 
     def test_raw_config_unaffected_by_legacy_external_endpoint_adapter(self, tmp_path):
         config_path = _write_yaml_config(
@@ -5769,7 +6756,7 @@ class TestEvalSessionRawConfig:
 
         # Reification must survive runner initialization.
         assert session.config["deterministic"] is True
-        assert session.config["models"]["base"]["args"]["seed"] == 0
+        assert "args" not in session.config["models"]["base"]
 
 
 class TestDiffDicts:

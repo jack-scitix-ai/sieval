@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from sieval.cli.leaderboard.session import (
+    _DETERMINISTIC_SEED_CONTRACT_KEY,
     EvalSession,
     _format_comment_header,
     _split_header,
@@ -64,7 +65,7 @@ class TestPersistEffectiveConfig:
         # CLI reification baked in
         assert loaded["deterministic"] is True
         assert loaded["models"]["base"]["name"] == "new-name"
-        assert loaded["models"]["base"]["args"]["seed"] == 0
+        assert "args" not in loaded["models"]["base"]
         # Endpoint injection NOT persisted
         assert "api_base" not in loaded["models"]["base"]
         assert "api_key" not in loaded["models"]["base"]
@@ -445,6 +446,180 @@ class TestStrictResumeMatch:
 
         # Header timestamp may differ; body should still match the original file
         assert (result_dir / "effective_config.yaml").read_text() == original
+
+    @pytest.mark.anyio
+    async def test_deterministic_resume_matches_without_persisted_automatic_seed(
+        self, tmp_path: Path
+    ):
+        cfg_path = _write_yaml(
+            tmp_path,
+            "cfg.yaml",
+            "deterministic: true\n"
+            "models:\n"
+            "  base:\n"
+            "    name: mock-chat\n"
+            "    type: chat\n"
+            "    args:\n"
+            "      max_tokens: 32\n"
+            "tasks:\n"
+            "  eval:\n"
+            "    class: tests.unit.core.runners.test_runner.MockTask\n"
+            "    dataset:\n"
+            "      class: tests.conftest.MockDataset\n"
+            "    model: base\n",
+        )
+        result_dir = tmp_path / "out"
+
+        first = EvalSession(
+            config_path=str(cfg_path),
+            result_dir_override=str(result_dir),
+        )
+        first.prepare_prelaunch()
+        first._stamp_deterministic_seed_contract()
+        await first._persist_effective_config()
+        target = result_dir / "effective_config.yaml"
+        original = target.read_text()
+        persisted = yaml.safe_load(original)
+        assert persisted["deterministic"] is True
+        assert persisted["models"]["base"]["args"] == {"max_tokens": 32}
+        original_contract = persisted[_DETERMINISTIC_SEED_CONTRACT_KEY]
+
+        replayed = EvalSession(
+            config_path=str(target),
+            result_dir_override=str(tmp_path / "replayed"),
+        )
+        replayed.prepare_prelaunch()
+        replayed._stamp_deterministic_seed_contract()
+        assert (
+            replayed._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY]
+            == original_contract
+        )
+
+        resumed = EvalSession(
+            config_path=str(cfg_path),
+            resume=True,
+            result_dir_override=str(result_dir),
+        )
+        resumed.prepare_prelaunch()
+        resumed._stamp_deterministic_seed_contract()
+        await resumed._persist_effective_config()
+
+        assert target.read_text() == original
+
+    @pytest.mark.anyio
+    async def test_deterministic_seed_contract_drift_aborts_resume(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        cfg_path = _write_yaml(
+            tmp_path,
+            "cfg.yaml",
+            "deterministic: true\n"
+            "models:\n"
+            "  m:\n"
+            "    name: mock-chat\n"
+            "    type: chat\n"
+            "tasks:\n"
+            "  eval:\n"
+            "    class: tests.unit.core.runners.test_runner.MockTask\n"
+            "    dataset:\n"
+            "      class: tests.conftest.MockDataset\n"
+            "    model: m\n",
+        )
+        result_dir = tmp_path / "out"
+        first = EvalSession(
+            config_path=str(cfg_path),
+            result_dir_override=str(result_dir),
+        )
+        first.prepare_prelaunch()
+        first._stamp_deterministic_seed_contract()
+        await first._persist_effective_config()
+
+        monkeypatch.setattr(
+            "sieval.cli.leaderboard.session.DETERMINISTIC_DEFAULT_SEED", 1
+        )
+        replayed = EvalSession(
+            config_path=str(result_dir / "effective_config.yaml"),
+            result_dir_override=str(tmp_path / "replayed"),
+        )
+        replayed.prepare_prelaunch()
+        with pytest.raises(RuntimeError, match="persisted deterministic-seed contract"):
+            replayed._stamp_deterministic_seed_contract()
+
+        resumed = EvalSession(
+            config_path=str(cfg_path),
+            resume=True,
+            result_dir_override=str(result_dir),
+        )
+        resumed.prepare_prelaunch()
+        resumed._stamp_deterministic_seed_contract()
+
+        with pytest.raises(RuntimeError, match="_sieval_deterministic_seed_contract"):
+            await resumed._persist_effective_config()
+
+    def test_explicit_seed_contract_ignores_unused_default_changes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg_path = _write_yaml(
+            tmp_path,
+            "cfg.yaml",
+            "deterministic: true\n"
+            "models:\n"
+            "  m:\n"
+            "    name: mock-chat\n"
+            "    type: chat\n"
+            "    args:\n"
+            "      seed: 42\n"
+            "tasks:\n"
+            "  eval:\n"
+            "    class: tests.unit.core.runners.test_runner.MockTask\n"
+            "    dataset:\n"
+            "      class: tests.conftest.MockDataset\n"
+            "    model: m\n",
+        )
+        first = EvalSession(config_path=str(cfg_path))
+        first.prepare_prelaunch()
+        first._stamp_deterministic_seed_contract()
+        original = first._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY]
+
+        monkeypatch.setattr(
+            "sieval.cli.leaderboard.session.DETERMINISTIC_DEFAULT_SEED", 1
+        )
+        replayed = EvalSession(config_path=str(cfg_path))
+        replayed.prepare_prelaunch()
+        replayed._stamp_deterministic_seed_contract()
+
+        assert replayed._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY] == original
+
+    @pytest.mark.anyio
+    async def test_legacy_baked_automatic_seed_aborts_resume(self, tmp_path: Path):
+        cfg_path = _write_yaml(
+            tmp_path,
+            "cfg.yaml",
+            "models:\n  base:\n    name: m\n    args:\n      max_tokens: 32\n",
+        )
+        result_dir = tmp_path / "out"
+        result_dir.mkdir()
+        _write_yaml(
+            result_dir,
+            "effective_config.yaml",
+            "deterministic: true\n"
+            "models:\n"
+            "  base:\n"
+            "    name: m\n"
+            "    args:\n"
+            "      max_tokens: 32\n"
+            "      seed: 0\n"
+            f"result_dir: {result_dir}\n",
+        )
+
+        resumed = EvalSession(
+            config_path=str(cfg_path),
+            resume=True,
+            deterministic_override=True,
+            result_dir_override=str(result_dir),
+        )
+        with pytest.raises(RuntimeError, match=r"models\.base\.args\.seed"):
+            await resumed._persist_effective_config()
 
     @pytest.mark.anyio
     async def test_mismatched_deterministic_raises(self, tmp_path: Path):

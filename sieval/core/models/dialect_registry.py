@@ -88,6 +88,14 @@ class DialectImplementationStatus(StrEnum):
     RESERVED = "reserved"
 
 
+class RequestSeedSupport(StrEnum):
+    """Whether one dialect can transmit a per-request sampling seed."""
+
+    SUPPORTED = "supported"
+    UNSUPPORTED = "unsupported"
+    RESERVED = "reserved"
+
+
 @dataclass(frozen=True)
 class DialectSpec:
     """Serializable descriptor for one stable provider wire dialect."""
@@ -96,6 +104,7 @@ class DialectSpec:
     connection_family: str
     implementation_status: DialectImplementationStatus
     capability_outcomes: Mapping[CapabilityKey, DialectCapabilityStatus]
+    request_seed_support: RequestSeedSupport
     input_kinds: tuple[str, ...]
     input_modalities: tuple[str, ...]
 
@@ -108,6 +117,8 @@ class DialectSpec:
             raise TypeError(
                 "implementation_status must be a DialectImplementationStatus"
             )
+        if not isinstance(self.request_seed_support, RequestSeedSupport):
+            raise TypeError("request_seed_support must be a RequestSeedSupport")
         outcomes = normalize_dialect_capability_outcomes(
             cast(
                 Mapping[str, DialectCapabilityStatus | str],
@@ -119,6 +130,11 @@ class DialectSpec:
             and DialectCapabilityStatus.RESERVED in outcomes.values()
         ):
             raise ValueError("an active dialect cannot reserve a capability outcome")
+        if (
+            self.implementation_status is DialectImplementationStatus.ACTIVE
+            and self.request_seed_support is RequestSeedSupport.RESERVED
+        ):
+            raise ValueError("an active dialect cannot reserve request-seed support")
         object.__setattr__(
             self,
             "capability_outcomes",
@@ -142,6 +158,7 @@ class DialectSpec:
             "dialect_id": self.dialect_id,
             "connection_family": self.connection_family,
             "implementation_status": self.implementation_status.value,
+            "request_seed_support": self.request_seed_support.value,
             "capability_outcomes": {
                 key: self.capability_outcomes[key].value for key in CAPABILITY_KEYS
             },
@@ -261,6 +278,7 @@ def _spec(
     connection_family: str,
     *,
     decisions: Mapping[str, DialectCapabilityDecision] | None = None,
+    request_seed_support: RequestSeedSupport,
     input_kinds: tuple[str, ...],
     input_modalities: tuple[str, ...],
 ) -> DialectSpec:
@@ -279,6 +297,7 @@ def _spec(
         connection_family=connection_family,
         implementation_status=status,
         capability_outcomes=outcomes,
+        request_seed_support=request_seed_support,
         input_kinds=input_kinds,
         input_modalities=input_modalities,
     )
@@ -336,6 +355,7 @@ DIALECT_SPECS: Mapping[str, DialectSpec] = MappingProxyType(
             "openai_chat",
             "openai_sdk",
             decisions=_registered_decisions("openai_chat"),
+            request_seed_support=RequestSeedSupport.SUPPORTED,
             input_kinds=("chat",),
             input_modalities=("text", "image", "tool_call", "tool_result"),
         ),
@@ -343,36 +363,42 @@ DIALECT_SPECS: Mapping[str, DialectSpec] = MappingProxyType(
             "openai_completions",
             "openai_sdk",
             decisions=_registered_decisions("openai_completions"),
+            request_seed_support=RequestSeedSupport.SUPPORTED,
             input_kinds=("completion",),
             input_modalities=("text",),
         ),
         "openai_responses": _spec(
             "openai_responses",
             "openai_sdk",
+            request_seed_support=RequestSeedSupport.RESERVED,
             input_kinds=("chat",),
             input_modalities=("text", "image", "tool_call", "tool_result"),
         ),
         "anthropic_messages": _spec(
             "anthropic_messages",
             "async_http_json",
+            request_seed_support=RequestSeedSupport.RESERVED,
             input_kinds=("chat",),
             input_modalities=("text", "image", "tool_call", "tool_result"),
         ),
         "google_genai": _spec(
             "google_genai",
             "async_http_json",
+            request_seed_support=RequestSeedSupport.RESERVED,
             input_kinds=("chat",),
             input_modalities=("text", "image", "tool_call", "tool_result"),
         ),
         "sglang_native": _spec(
             "sglang_native",
             "async_http_json",
+            request_seed_support=RequestSeedSupport.RESERVED,
             input_kinds=("completion",),
             input_modalities=("text",),
         ),
         "vllm_native": _spec(
             "vllm_native",
             "async_http_json",
+            request_seed_support=RequestSeedSupport.RESERVED,
             input_kinds=("completion",),
             input_modalities=("text",),
         ),

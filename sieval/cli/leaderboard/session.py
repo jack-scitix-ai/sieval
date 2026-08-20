@@ -14,6 +14,7 @@ import shlex
 import sys
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, TypedDict, cast
@@ -76,7 +77,11 @@ from sieval.core.models.deployment import (
     RouteIntent,
     ServingFacts,
 )
-from sieval.core.models.dialect_registry import dialect_is_bindable, get_dialect_spec
+from sieval.core.models.dialect_registry import (
+    RequestSeedSupport,
+    dialect_is_bindable,
+    get_dialect_spec,
+)
 from sieval.core.models.reconcile import (
     BindingReconcileInput,
     CannotVerify,
@@ -129,6 +134,158 @@ _PR1_REQUEST_VERIFIERS = {
     "sampled_logprobs": "validate_response_channel",
     "top_logprobs": "validate_response_channel",
 }
+
+_DETERMINISTIC_SEED_CONTRACT_KEY = "_sieval_deterministic_seed_contract"
+
+
+class _RequestSeedScope(StrEnum):
+    """Where deterministic sampling is controlled for one binding."""
+
+    PER_REQUEST = "per_request"
+    ENGINE_LEVEL_ONLY = "engine_level_only"
+
+
+class _RequestSeedProvenance(StrEnum):
+    """Frozen source of one model default for ``sampling.seed``."""
+
+    NONE = "none"
+    AUTOMATIC = "automatic"
+    BINDING_CONFIG = "binding_config"
+    EXTERNAL_MODEL = "external_model"
+    TASK_INFER_ARGS = "task_infer_args"
+
+
+@dataclasses.dataclass(frozen=True)
+class _RequestSeedDecision:
+    """One frozen deterministic request-seed policy decision."""
+
+    dialect_id: str
+    support: RequestSeedSupport
+    # Evidence-only: records where deterministic sampling is controlled
+    # (currently derivable from dialect_id). Execution consumes the frozen
+    # final seed state, not this field.
+    scope: _RequestSeedScope
+    seed_present: bool
+    seed: int | None
+    provenance: _RequestSeedProvenance
+
+    @property
+    def explicit_seed_present(self) -> bool:
+        return self.provenance in {
+            _RequestSeedProvenance.BINDING_CONFIG,
+            _RequestSeedProvenance.EXTERNAL_MODEL,
+            _RequestSeedProvenance.TASK_INFER_ARGS,
+        }
+
+
+def _resolve_deterministic_request_seed(
+    *,
+    dialect_id: str,
+    explicit_seed_present: bool,
+    explicit_seed: int | None = None,
+    explicit_provenance: _RequestSeedProvenance = (
+        _RequestSeedProvenance.BINDING_CONFIG
+    ),
+) -> _RequestSeedDecision:
+    """Resolve one immutable decision for execution and persistence."""
+
+    if dialect_id == "sglang_legacy":
+        # TODO(PR-5): delete this compatibility policy when the legacy SGLang
+        # path becomes a registered ``sglang_native`` DialectSpec/binder.
+        support = RequestSeedSupport.UNSUPPORTED
+        scope = _RequestSeedScope.ENGINE_LEVEL_ONLY
+    else:
+        support = get_dialect_spec(dialect_id).request_seed_support
+        scope = _RequestSeedScope.PER_REQUEST
+
+    if support is RequestSeedSupport.RESERVED:
+        raise ValueError(
+            f"dialect {dialect_id!r} has not declared whether it supports "
+            "per-request deterministic seeds"
+        )
+    if explicit_seed_present:
+        return _RequestSeedDecision(
+            dialect_id=dialect_id,
+            support=support,
+            scope=scope,
+            seed_present=True,
+            seed=explicit_seed,
+            provenance=explicit_provenance,
+        )
+    if support is RequestSeedSupport.SUPPORTED:
+        return _RequestSeedDecision(
+            dialect_id=dialect_id,
+            support=support,
+            scope=scope,
+            seed_present=True,
+            seed=DETERMINISTIC_DEFAULT_SEED,
+            provenance=_RequestSeedProvenance.AUTOMATIC,
+        )
+    return _RequestSeedDecision(
+        dialect_id=dialect_id,
+        support=support,
+        scope=scope,
+        seed_present=False,
+        seed=None,
+        provenance=_RequestSeedProvenance.NONE,
+    )
+
+
+def _validated_request_seed(value: object, subject: str) -> int | None:
+    """Return one typed request seed or reject an invalid explicit value.
+
+    ``subject`` names the config site being read so a rejected value is
+    locatable in a config that declares many models and tasks.
+    """
+
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+        raise TypeError(f"{subject} must be an integer")
+    return cast(int | None, value)
+
+
+def _with_task_infer_seed(
+    decision: _RequestSeedDecision,
+    infer_args: Mapping[str, JSONValue],
+    subject: str,
+) -> _RequestSeedDecision:
+    """Overlay a task candidate's frozen ``infer_args.seed`` when present."""
+
+    if "seed" not in infer_args:
+        return decision
+    seed = _validated_request_seed(infer_args["seed"], subject)
+    return dataclasses.replace(
+        decision,
+        seed_present=True,
+        seed=seed,
+        provenance=_RequestSeedProvenance.TASK_INFER_ARGS,
+    )
+
+
+def _apply_request_seed_decision_to_args(
+    args: dict[str, Any], decision: _RequestSeedDecision
+) -> None:
+    """Make an argument mapping match a previously frozen seed decision."""
+
+    args.pop("seed", None)
+    if decision.seed_present:
+        args["seed"] = decision.seed
+
+
+def _apply_request_seed_decision_to_model(
+    model: Model, decision: _RequestSeedDecision
+) -> Model:
+    """Make a bound model's defaults match a previously frozen decision."""
+
+    if model.dialect_id != decision.dialect_id:
+        raise RuntimeError(
+            "frozen request-seed decision targets dialect "
+            f"{decision.dialect_id!r}, but the bound model uses "
+            f"{model.dialect_id!r}"
+        )
+    model = model.without_args("seed")
+    if decision.seed_present:
+        model = model.with_args(seed=decision.seed)
+    return model
 
 
 def _model_value_paths(value: object) -> tuple[str, ...]:
@@ -403,6 +560,7 @@ class AlignmentBlockDict(TypedDict):
 
 
 class RootConfigDict(TypedDict, total=False):
+    _sieval_deterministic_seed_contract: dict[str, JSONValue]
     deterministic: bool
     result_dir: str
     concurrency_limit: int
@@ -794,8 +952,8 @@ def _reify_cli_overrides(
 
     Mirrors EvalSession's runtime override behavior so that `sieval eval
     <persisted_effective_config>` with NO CLI args reproduces the session:
-        --deterministic → root `deterministic: true` + setdefault(seed=0) on
-                          each base model's `args`
+        --deterministic → root `deterministic: true`; automatic request seeds
+                          are resolved per binding after dialect reconciliation
         --model X       → overwrite `name: X` on every base model
         --result-dir D  → root `result_dir: D`
     Per-op seeds (dataset `shuffle.seed`, task `args.seed`) are not
@@ -803,14 +961,6 @@ def _reify_cli_overrides(
     """
     if deterministic:
         cfg["deterministic"] = True
-        models = cfg.get("models") or {}
-        if isinstance(models, dict):
-            for mcfg in models.values():
-                if not isinstance(mcfg, dict) or "base" in mcfg:
-                    continue
-                args = mcfg.setdefault("args", {})
-                if isinstance(args, dict):
-                    args.setdefault("seed", DETERMINISTIC_DEFAULT_SEED)
 
     if model is not None:
         models = cfg.get("models") or {}
@@ -957,14 +1107,20 @@ def _warn_best_effort_deterministic(
         and name not in self_managed_endpoints
     )
     if external:
-        logger.warning(
-            "Deterministic mode is best-effort for model(s) {} — "
-            "sieval applies request-level seeds where the protocol supports "
-            "them, but cannot verify the remote process seed or batch-invariant "
-            "kernels. For guaranteed reproducibility, self-host via `sieval run` / "
-            "`sieval infer start` with a local checkpoint.",
-            external,
-        )
+        _emit_best_effort_deterministic_warning(external)
+
+
+def _emit_best_effort_deterministic_warning(labels: list[str]) -> None:
+    """Emit the shared warning for externally managed model bindings."""
+
+    logger.warning(
+        "Deterministic mode is best-effort for model binding(s) {} — "
+        "sieval applies request-level seeds where the protocol supports them, "
+        "but cannot verify the remote process seed or batch-invariant kernels. "
+        "For guaranteed reproducibility, self-host via `sieval run` / "
+        "`sieval infer start` with a local checkpoint.",
+        labels,
+    )
 
 
 class EvalSession:
@@ -1173,10 +1329,21 @@ class EvalSession:
         self._owned_pools: dict[str, ConnectionPool[Any]] = {}
         self._root_shared_limiters: dict[str, anyio.CapacityLimiter | None] = {}
         self._owned_legacy_models: dict[str, SglangGenModel] = {}
+        self._warned_best_effort_role_bindings: set[str] = set()
         # Runtime-only sources for the post-launch ``models_by_role`` binding
         # seam.  They are never serialized or fingerprinted by reconciliation.
         self._task_role_model_sources: dict[str, dict[str, object]] = {}
         self._bound_task_role_models: dict[str, dict[str, Model]] = {}
+        # Runtime-only deterministic request-default decisions.  Prelaunch
+        # freezes these from normalized bindings, exact external role sources,
+        # and RequirementContext.infer_args.  Only their JSON projection enters
+        # effective_config; the caches themselves are never fingerprinted.
+        self._request_seed_decisions_by_binding: dict[str, _RequestSeedDecision] = {}
+        self._request_seed_decisions_by_external_role: dict[
+            str, _RequestSeedDecision
+        ] = {}
+        self._request_seed_decisions_by_candidate: dict[str, _RequestSeedDecision] = {}
+        self._request_seed_decisions_frozen = False
 
         # Resolved lazily in `_init_runner` at the start of `_prepare_execution`.
         self.result_dir: str | None = None
@@ -2171,6 +2338,12 @@ class EvalSession:
     def _setup_prelaunch_reconciliation(self) -> None:
         """Resolve and reconcile every task/model binding before client creation."""
 
+        self._request_seed_decisions_frozen = False
+        self._request_seed_decisions_by_binding = {}
+        self._request_seed_decisions_by_external_role = {}
+        self._request_seed_decisions_by_candidate = {}
+        self.prelaunch_reconcile_result = None
+        self.postlaunch_reconcile_result = None
         models_cfg = self._get_named_config_map("models")
         tasks_cfg = self._get_named_config_map("tasks")
 
@@ -2353,7 +2526,33 @@ class EvalSession:
         self._legacy_bypass_bindings = frozenset(legacy_bypass)
         self._prelaunch_binding_inputs = tuple(binding_inputs)
         self._prelaunch_deployment_inputs = dict(deployment_inputs)
+        self._freeze_deterministic_request_seed_decisions()
         self.prelaunch_reconcile_result = result
+        self._warn_best_effort_deterministic_roles()
+
+    def _warn_best_effort_deterministic_roles(self) -> None:
+        """Warn for inline or borrowed role models outside managed topology."""
+
+        if not self.deterministic:
+            return
+        warned = self._warned_best_effort_role_bindings
+        labels_by_binding: dict[str, list[str]] = {}
+        for task_name, context in self._task_requirement_contexts.items():
+            for role, binding in context.model_bindings.items():
+                if not isinstance(binding, InlineModelBinding | ExternalModelBinding):
+                    continue
+                if binding.binding_id in warned:
+                    continue
+                labels_by_binding.setdefault(binding.binding_id, []).append(
+                    f"{task_name}.{role}"
+                )
+        if not labels_by_binding:
+            return
+        warned.update(labels_by_binding.keys())
+        labels = sorted(
+            label for values in labels_by_binding.values() for label in values
+        )
+        _emit_best_effort_deterministic_warning(labels)
 
     def prepare_prelaunch(self) -> ReconcileResult:
         """Public pure setup seam for launch-before-I/O capability validation."""
@@ -2363,6 +2562,228 @@ class EvalSession:
         if result is None:  # defensive: the setup method assigns on success
             raise RuntimeError("pre-launch reconciliation produced no result")
         return result
+
+    @staticmethod
+    def _seed_from_mapping(
+        values: Mapping[str, object],
+        subject: str,
+    ) -> tuple[bool, int | None]:
+        if "seed" not in values:
+            return False, None
+        return True, _validated_request_seed(values["seed"], subject)
+
+    def _freeze_deterministic_request_seed_decisions(self) -> None:
+        """Freeze every model request-default seed decision after prelaunch."""
+
+        if not self.deterministic:
+            self._request_seed_decisions_by_binding = {}
+            self._request_seed_decisions_by_external_role = {}
+            self._request_seed_decisions_by_candidate = {}
+            self._request_seed_decisions_frozen = True
+            return
+
+        models_cfg = self._get_named_config_map("models")
+        by_binding: dict[str, _RequestSeedDecision] = {}
+        for binding in self._normalized_model_bindings.values():
+            if isinstance(binding, ExternalModelBinding):
+                continue
+            dialect_id = binding.dialect_id
+            if dialect_id is None:
+                raise ValueError(f"Model binding '{binding.binding_id}' has no dialect")
+            if isinstance(binding, NamedModelBinding):
+                explicit_seed_present = False
+                explicit_seed: int | None = None
+                for _, config in self._model_config_chain(
+                    binding.config_name, models_cfg
+                ):
+                    raw_args = config.get("args")
+                    if raw_args is None:
+                        continue
+                    if not isinstance(raw_args, Mapping):
+                        raise ValueError(
+                            f"Model '{binding.config_name}' args must be a dictionary"
+                        )
+                    present, value = self._seed_from_mapping(
+                        raw_args, f"Model '{binding.config_name}' args.seed"
+                    )
+                    if present:
+                        explicit_seed_present = True
+                        explicit_seed = value
+            else:
+                explicit_seed_present, explicit_seed = self._seed_from_mapping(
+                    binding.config, f"Inline binding '{binding.binding_id}' seed"
+                )
+                raw_args = binding.config.get("args")
+                if raw_args is not None:
+                    if not isinstance(raw_args, Mapping):
+                        raise ValueError(
+                            f"Inline binding '{binding.binding_id}' args must be "
+                            "a mapping"
+                        )
+                    nested_args = cast(Mapping[str, object], raw_args)
+                    nested_present, nested_seed = self._seed_from_mapping(
+                        nested_args,
+                        f"Inline binding '{binding.binding_id}' args.seed",
+                    )
+                    if nested_present:
+                        explicit_seed_present = True
+                        explicit_seed = nested_seed
+            by_binding[binding.binding_id] = _resolve_deterministic_request_seed(
+                dialect_id=dialect_id,
+                explicit_seed_present=explicit_seed_present,
+                explicit_seed=explicit_seed,
+            )
+
+        by_external_role: dict[str, _RequestSeedDecision] = {}
+        by_candidate: dict[str, _RequestSeedDecision] = {}
+        for task_name, context in sorted(self._task_requirement_contexts.items()):
+            sources = self._task_role_model_sources.get(task_name, {})
+            for role, binding in sorted(context.model_bindings.items()):
+                if isinstance(binding, ExternalModelBinding):
+                    source = sources.get(role)
+                    if not isinstance(source, Model):
+                        raise ValueError(
+                            f"External binding '{binding.binding_id}' lost its "
+                            "Model source"
+                        )
+                    dialect_id = binding.dialect_id
+                    if dialect_id is None:
+                        raise ValueError(
+                            f"External binding '{binding.binding_id}' has no dialect"
+                        )
+                    present, value = self._seed_from_mapping(
+                        source.meta()["default_params"],
+                        f"Task '{task_name}' {role} model seed",
+                    )
+                    decision = _resolve_deterministic_request_seed(
+                        dialect_id=dialect_id,
+                        explicit_seed_present=present,
+                        explicit_seed=value,
+                        explicit_provenance=_RequestSeedProvenance.EXTERNAL_MODEL,
+                    )
+                    by_external_role[f"{task_name}.{role}"] = decision
+
+            candidate = context.model_bindings.get("candidate")
+            if candidate is None:
+                raise ValueError(f"Task '{task_name}' has no candidate binding")
+            if isinstance(candidate, ExternalModelBinding):
+                raise ValueError(
+                    f"Task '{task_name}' candidate must be a named or inline binding"
+                )
+            by_candidate[task_name] = _with_task_infer_seed(
+                by_binding[candidate.binding_id],
+                context.infer_args,
+                f"Task '{task_name}' infer_args.seed",
+            )
+
+        self._request_seed_decisions_by_binding = by_binding
+        self._request_seed_decisions_by_external_role = by_external_role
+        self._request_seed_decisions_by_candidate = by_candidate
+        self._request_seed_decisions_frozen = True
+
+    @staticmethod
+    def _request_seed_contract_entry(
+        decision: _RequestSeedDecision,
+        binding: NormalizedModelBinding,
+    ) -> dict[str, JSONValue]:
+        """Project one frozen decision into strict, human-auditable evidence.
+
+        This entry's key set IS the resume-invalidation surface: ``--resume``
+        compares the persisted config strictly, so adding or removing a field
+        here invalidates every in-flight deterministic result dir. Two fields
+        are deliberately kept despite being derivable from their siblings:
+
+        * ``seed_scope`` — implied by ``dialect_id`` only while
+          ``sglang_legacy`` is the one engine-scoped dialect; a registered
+          ``sglang_native`` binder decouples the two, and rotating the
+          contract then would be more expensive than carrying it now.
+        * ``explicit_seed_present`` — implied by ``seed_provenance``, and kept
+          so an audit can answer "did a human choose this seed?" without
+          knowing which provenance values count as explicit.
+
+        ``binding_id`` is omitted for external bindings: it carries a
+        per-process identity that would rotate the contract between runs that
+        differ only by endpoint. Their stable identity is the outer
+        ``task.role`` key plus ``requested_model_id`` and ``dialect_id``.
+        """
+
+        entry: dict[str, JSONValue] = {
+            "requested_model_id": binding.requested_model_id,
+            "dialect_id": decision.dialect_id,
+            "request_seed_support": decision.support.value,
+            "seed_scope": decision.scope.value,
+            "seed_present": decision.seed_present,
+            "seed": decision.seed,
+            "seed_provenance": decision.provenance.value,
+            "explicit_seed_present": decision.explicit_seed_present,
+        }
+        if not isinstance(binding, ExternalModelBinding):
+            entry["binding_id"] = binding.binding_id
+        return entry
+
+    def _deterministic_seed_contract(self) -> dict[str, JSONValue]:
+        """Return strict evidence for frozen model request-default seeds."""
+
+        if not self._request_seed_decisions_frozen:
+            raise RuntimeError(
+                "deterministic request-seed decisions must be frozen by "
+                "pre-launch reconciliation before stamping the contract"
+            )
+        bindings = self._normalized_model_bindings
+        return {
+            "bindings": {
+                key: self._request_seed_contract_entry(decision, bindings[key])
+                for key, decision in sorted(
+                    self._request_seed_decisions_by_binding.items()
+                )
+            },
+            "external_roles": {
+                key: self._request_seed_contract_entry(
+                    decision,
+                    self._task_requirement_contexts[
+                        key.rsplit(".", 1)[0]
+                    ].model_bindings[key.rsplit(".", 1)[1]],
+                )
+                for key, decision in sorted(
+                    self._request_seed_decisions_by_external_role.items()
+                )
+            },
+            "candidates": {
+                task_name: self._request_seed_contract_entry(
+                    decision,
+                    self._task_requirement_contexts[task_name].model_bindings[
+                        "candidate"
+                    ],
+                )
+                for task_name, decision in sorted(
+                    self._request_seed_decisions_by_candidate.items()
+                )
+            },
+        }
+
+    def _stamp_deterministic_seed_contract(self) -> None:
+        """Put the current resolved seed contract in the strict persisted config."""
+
+        if not self.deterministic:
+            if _DETERMINISTIC_SEED_CONTRACT_KEY in self._raw_config:
+                raise RuntimeError(
+                    "persisted deterministic-seed contract cannot be replayed "
+                    "with deterministic mode disabled"
+                )
+            self._reified_config.pop(_DETERMINISTIC_SEED_CONTRACT_KEY, None)
+            return
+        resolved = self._deterministic_seed_contract()
+        raw_config = cast(Mapping[str, object], self._raw_config)
+        if (
+            _DETERMINISTIC_SEED_CONTRACT_KEY in raw_config
+            and raw_config[_DETERMINISTIC_SEED_CONTRACT_KEY] != resolved
+        ):
+            raise RuntimeError(
+                "persisted deterministic-seed contract no longer matches the "
+                "resolved dialect seed policy; use the same sieval version and "
+                "dialect declarations, or start from the original source config"
+            )
+        self._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY] = resolved
 
     def _source_for_binding(self, binding_id: str) -> object | None:
         """Return the runtime-only config/model source for a role binding."""
@@ -2730,6 +3151,11 @@ class EvalSession:
         result = self.postlaunch_reconcile_result
         if result is None:
             raise RuntimeError("bound model setup requires post-launch reconciliation")
+        if self.deterministic and not self._request_seed_decisions_frozen:
+            raise RuntimeError(
+                "deterministic request-seed decisions were not frozen before "
+                "model binding"
+            )
         models_cfg = self._get_named_config_map("models")
 
         by_root: dict[str, list[NormalizedModelBinding]] = {}
@@ -2767,15 +3193,18 @@ class EvalSession:
             cfg = chain[0][1]
             args = self._normalize_dict(cfg.get("args"), f"Model '{name}' args")
             if self.deterministic:
-                args.setdefault("seed", DETERMINISTIC_DEFAULT_SEED)
+                _apply_request_seed_decision_to_args(
+                    args,
+                    self._request_seed_decisions_by_binding[binding.binding_id],
+                )
             if "api_key" in cfg:
                 args["api_key"] = cfg["api_key"]
             if "api_base" in cfg:
                 args["api_base"] = cfg["api_base"]
-            model = SglangGenModel(model=binding.requested_model_id, **args)
-            self.models[name] = model
-            bound_by_binding[binding.binding_id] = model
-            self._owned_legacy_models[binding.root_deployment_key] = model
+            legacy_model = SglangGenModel(model=binding.requested_model_id, **args)
+            self.models[name] = legacy_model
+            bound_by_binding[binding.binding_id] = legacy_model
+            self._owned_legacy_models[binding.root_deployment_key] = legacy_model
             del pending_named[name]
 
         while pending_named:
@@ -2798,7 +3227,8 @@ class EvalSession:
                     deployment = self._realized_deployments_by_root[
                         binding.root_deployment_key
                     ]
-                    root_config = self._model_config_chain(name, models_cfg)[0][1]
+                    chain = self._model_config_chain(name, models_cfg)
+                    root_config = chain[0][1]
                     pool = self._create_owned_pool(
                         binding.root_deployment_key,
                         deployment,
@@ -2837,8 +3267,6 @@ class EvalSession:
                                 )
 
                     args, extra = self._request_builder_args(cfg)
-                    if is_root and self.deterministic:
-                        args.setdefault("seed", DETERMINISTIC_DEFAULT_SEED)
                     concurrency_limit = None
                     if not is_root:
                         raw_args = cfg.get("args", {})
@@ -2852,6 +3280,12 @@ class EvalSession:
                         )
                     model = self._as_legacy_wrapper(
                         model, self._aggregated_requirements[binding.binding_id]
+                    )
+
+                if self.deterministic:
+                    model = _apply_request_seed_decision_to_model(
+                        model,
+                        self._request_seed_decisions_by_binding[binding.binding_id],
                     )
 
                 self.models[name] = model
@@ -2903,6 +3337,11 @@ class EvalSession:
                 model = model.with_args(
                     extra=cast(dict[str, JSONValue] | None, extra), **direct_config
                 )
+            if self.deterministic:
+                model = _apply_request_seed_decision_to_model(
+                    model,
+                    self._request_seed_decisions_by_binding[binding.binding_id],
+                )
             bound_by_binding[binding.binding_id] = self._as_legacy_wrapper(
                 model, self._aggregated_requirements[binding.binding_id]
             )
@@ -2922,6 +3361,13 @@ class EvalSession:
                     rebound = live_model.with_dialect(
                         runtime_plan.dialect_id, runtime_plan
                     )
+                    if self.deterministic:
+                        rebound = _apply_request_seed_decision_to_model(
+                            rebound,
+                            self._request_seed_decisions_by_external_role[
+                                f"{task_name}.{role}"
+                            ],
+                        )
                     role_model = self._as_legacy_wrapper(
                         rebound, self._aggregated_requirements[binding.binding_id]
                     )
@@ -3311,6 +3757,10 @@ class EvalSession:
 
     def _setup_tasks(self) -> None:
         """Initialize all tasks from config."""
+        if self.deterministic and not self._request_seed_decisions_frozen:
+            raise RuntimeError(
+                "deterministic request-seed decisions were not frozen before task setup"
+            )
         tasks_cfg = self._get_named_config_map("tasks")
         runner_defaults_raw = self.config.get("runner_config", {})
         if not isinstance(runner_defaults_raw, dict):
@@ -3339,16 +3789,42 @@ class EvalSession:
             # Resolve dataset
             dataset = self._resolve_task_dataset(task_cfg, task_name)
 
-            # Resolve model
-            model = self._resolve_task_model(task_cfg, task_name)
+            # RequirementContext is the prelaunch-frozen source for both the
+            # candidate identity and every task-local inference default. Never
+            # resolve ``task_cfg["model"]`` from mutable config a second time:
+            # capability reconciliation and the deterministic seed contract
+            # were both derived from this exact binding.
+            try:
+                context = self._task_requirement_contexts[task_name]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Task '{task_name}' has no frozen requirement context"
+                ) from exc
+            candidate = context.model_bindings.get("candidate")
+            if not isinstance(candidate, NamedModelBinding):
+                raise RuntimeError(
+                    f"Task '{task_name}' has no frozen named candidate binding"
+                )
+            try:
+                model = self.models[candidate.config_name]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Task '{task_name}' frozen candidate model "
+                    f"'{candidate.config_name}' was not bound"
+                ) from exc
 
-            # Apply infer_args override (per-task inference parameter override)
-            infer_args = self._normalize_dict(
-                task_cfg.get("infer_args"),
-                f"Task '{task_name}' infer_args",
-            )
+            infer_args = dict(context.infer_args)
             if infer_args:
-                model = model.with_args(**infer_args)
+                model = model.with_args(**cast(dict[str, Any], infer_args))
+            if self.deterministic:
+                # The frozen candidate decision already folded in this task's
+                # ``infer_args.seed``, so it is the single authority for the
+                # final seed and overrides whatever landed above.
+                model = _apply_request_seed_decision_to_model(
+                    model,
+                    self._request_seed_decisions_by_candidate[task_name],
+                )
+            if infer_args:
                 logger.info(
                     "Task '{}': applied infer_args override {}",
                     task_name,
@@ -3426,31 +3902,6 @@ class EvalSession:
             f"Task '{task_name}': 'dataset' must be a string reference or inline definition"  # noqa: E501
         )
 
-    def _resolve_task_model(self, task_cfg: TaskConfigDict, task_name: str) -> Model:
-        """Resolve model for a task."""
-        model_ref = task_cfg.get("model")
-
-        if model_ref is not None and not isinstance(model_ref, str):
-            raise ValueError(f"Task '{task_name}': 'model' must be a string reference")
-
-        # If no model specified, use default if only one exists
-        if not model_ref:
-            if len(self.models) == 1:
-                return next(iter(self.models.values()))
-            elif len(self.models) == 0:
-                raise ValueError(f"Task '{task_name}': no models defined in config")
-            else:
-                raise ValueError(
-                    f"Task '{task_name}': 'model' required when multiple models are defined"  # noqa: E501
-                )
-
-        if model_ref not in self.models:
-            raise ValueError(
-                f"Task '{task_name}' references unknown model '{model_ref}'"
-            )
-
-        return self.models[model_ref]
-
     def _build_runner_config(
         self, task_cfg: TaskConfigDict, defaults: dict[str, Any]
     ) -> TaskRunnerConfig:
@@ -3483,7 +3934,8 @@ class EvalSession:
         # Resolve task-side requirements and fail before any model/client is
         # constructed.  This is pure setup work; managed runs re-run the same
         # reconciliation after launch with realized Deployment/ServingFacts.
-        await run_sync(self.prepare_prelaunch)
+        if self.prelaunch_reconcile_result is None:
+            await run_sync(self.prepare_prelaunch)
         await run_sync(self._setup_postlaunch_reconciliation)
 
         # Wrap in to_thread: dataset download / heavy model init can block the
@@ -3643,11 +4095,12 @@ class EvalSession:
     async def _persist_effective_config(self) -> None:
         """Write effective_config.yaml to result_dir at session start.
 
-        Dumps ``self._reified_config`` (raw YAML + CLI reification, minus
-        legacy endpoint-adapter injection). User-supplied ``api_base`` /
-        ``api_key`` in the source YAML ARE preserved. Runtime endpoints are
-        excluded, so ``sieval run <this file>`` can re-launch services from
-        the preserved ``path`` / ``infer`` fields.
+        Dumps ``self._reified_config`` (raw YAML + CLI reification + the
+        resolved deterministic-seed contract, minus legacy endpoint-adapter
+        injection). User-supplied ``api_base`` / ``api_key`` in the source
+        YAML ARE preserved. Runtime endpoints are excluded, so ``sieval run
+        <this file>`` can re-launch services from the preserved ``path`` /
+        ``infer`` fields.
         """
         body = yaml.safe_dump(
             self._reified_config,
@@ -3724,9 +4177,12 @@ class EvalSession:
     async def arun(self) -> dict[str, Any]:
         """Run all configured tasks asynchronously."""
         try:
-            # Persist BEFORE _prepare_execution so a resume-mismatch abort
-            # fails fast — avoid paying the model/dataset load cost just to
-            # discover the config doesn't match the persisted one.
+            # Pure prelaunch resolution stamps the binding-local seed contract
+            # into effective_config before the strict resume comparison. No
+            # model client, dataset, or serving I/O has happened at this point;
+            # pure config/requirement errors may therefore surface first.
+            await run_sync(self.prepare_prelaunch)
+            self._stamp_deterministic_seed_contract()
             await self._persist_effective_config()
             await self._persist_infer_plans()
             await self._prepare_execution()

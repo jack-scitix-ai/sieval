@@ -316,6 +316,23 @@ class TestWirePlumbing:
         assert resp.request_params["sampling_params"] == {"temperature": 0.0}
 
     @pytest.mark.anyio
+    async def test_explicit_seed_is_not_persisted_when_wire_cannot_transmit_it(self):
+        t, post = _make_transport(
+            {"text": "x", "meta_info": _meta(prompt_tokens=1, completion_tokens=1)}
+        )
+
+        resp = await t.arun(_request("prompt", sampling=SamplingParams(seed=7)))
+
+        body = post.call_args.kwargs["body"]
+        assert "seed" not in body
+        assert "seed" not in _sampling(body)
+        assert resp.request_params is not None
+        assert "seed" not in resp.request_params
+        sampling_params = resp.request_params["sampling_params"]
+        assert isinstance(sampling_params, dict)
+        assert "seed" not in sampling_params
+
+    @pytest.mark.anyio
     async def test_absent_provider_model_id_stays_none(self):
         t, _ = _make_transport({"text": "x", "meta_info": _meta(prompt_tokens=1)})
         resp = await t.arun(_request("hi"))
