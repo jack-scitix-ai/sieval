@@ -206,6 +206,10 @@ class SglangGenModel(Model):
         return None
 
     @property
+    def provenance_plan(self) -> None:
+        return None
+
+    @property
     def capabilities(self) -> frozenset[Capability]:
         return self._legacy_transport.capabilities
 
@@ -228,6 +232,13 @@ class SglangGenModel(Model):
         del dialect_id, runtime_plan
         raise RuntimeError(
             "sglang_legacy cannot rebind before the sglang_native PR-5 binder"
+        )
+
+    def with_provenance_plan(self, provenance_plan: Any) -> Self:
+        del provenance_plan
+        raise RuntimeError(
+            "sglang_legacy has no runtime plan for provenance before the "
+            "sglang_native PR-5 binder"
         )
 
     def _legacy_lifecycle_owner(self) -> "SglangGenModel":

@@ -51,6 +51,7 @@ from sieval.core.models.model import (
     _PROVENANCE_SEMANTIC_PLAN_FIELDS,
     _PROVENANCE_SPECIAL_PLAN_FIELDS,
     _apply_request_defaults,
+    _validate_provenance_plan,
 )
 from sieval.core.models.reconcile import CheckStage, DeferredCheck, RuntimeBindingPlan
 
@@ -237,6 +238,17 @@ class TestModelUnique:
             _PROVENANCE_PROJECTABLE_CHECK_FIELDS | _PROVENANCE_SEMANTIC_CHECK_FIELDS
         )
 
+    def test_identical_provenance_plan_skips_serialization(self, gen_model) -> None:
+        plan = gen_model.runtime_plan
+        assert plan is not None
+
+        with patch.object(
+            RuntimeBindingPlan,
+            "to_json_value",
+            side_effect=AssertionError("identical plans need no comparison"),
+        ):
+            _validate_provenance_plan(plan, plan)
+
     @pytest.mark.parametrize(
         "field",
         [
@@ -319,7 +331,7 @@ class TestModelUnique:
         }
 
         with pytest.raises(ValueError, match=field.replace(".", r"\.")):
-            gen_model._with_provenance_plan(variants[field])
+            gen_model.with_provenance_plan(variants[field])
 
     @pytest.mark.parametrize("projected_value", [True, 1.0])
     def test_rebind_compares_json_semantics_without_numeric_coercion(
@@ -332,11 +344,11 @@ class TestModelUnique:
             request_defaults=RequestDefaults({"sampling.temperature": 1}),
         )
         rebound = gen_model.with_dialect(plan.dialect_id, runtime_plan)
-        provenance_plan = rebound._provenance_plan
+        provenance_plan = rebound.provenance_plan
         assert provenance_plan is not None
 
         with pytest.raises(ValueError, match="request_defaults"):
-            rebound._with_provenance_plan(
+            rebound.with_provenance_plan(
                 replace(
                     provenance_plan,
                     request_defaults=RequestDefaults(
@@ -348,18 +360,18 @@ class TestModelUnique:
     def test_noop_rebind_preserves_full_projected_provenance(self, gen_model):
         plan = gen_model.runtime_plan
         assert plan is not None
-        current_provenance = gen_model._provenance_plan
+        current_provenance = gen_model.provenance_plan
         assert current_provenance is not None
         full_projection = replace(
             current_provenance,
             binding_plan_fingerprint="stable:reconciled-binding",
             deployment_plan_fingerprint="stable:reconciled-deployment",
         )
-        rebound = gen_model._with_provenance_plan(full_projection)
+        rebound = gen_model.with_provenance_plan(full_projection)
 
         repeated = rebound.with_dialect(plan.dialect_id, plan)
 
-        assert repeated._provenance_plan == full_projection
+        assert repeated.provenance_plan == full_projection
         assert (
             repeated._provenance(Response(texts=("repeated",))).capabilities
             == rebound._provenance(Response(texts=("rebound",))).capabilities
@@ -376,19 +388,19 @@ class TestModelUnique:
         )
         runtime_plan = replace(plan, request_checks=(runtime_check,))
         rebound = gen_model.with_dialect(plan.dialect_id, runtime_plan)
-        provenance_plan = rebound._provenance_plan
+        provenance_plan = rebound.provenance_plan
         assert provenance_plan is not None
         stable_check = replace(
             provenance_plan.request_checks[0],
             reason=f"stable root {provenance_plan.root_deployment_key}",
         )
 
-        projected = rebound._with_provenance_plan(
+        projected = rebound.with_provenance_plan(
             replace(provenance_plan, request_checks=(stable_check,))
         )
 
-        assert projected._provenance_plan is not None
-        assert projected._provenance_plan.request_checks == (stable_check,)
+        assert projected.provenance_plan is not None
+        assert projected.provenance_plan.request_checks == (stable_check,)
 
     def test_canonical_rebind_rejects_non_runtime_provenance(self, gen_model):
         legacy_plan = gen_model.runtime_plan
@@ -422,7 +434,12 @@ class TestModelUnique:
         )
 
         with pytest.raises(ValueError, match="persist their runtime plan verbatim"):
-            canonical._with_provenance_plan(projected)
+            canonical.with_provenance_plan(projected)
+        with pytest.raises(ValueError, match="persist their runtime plan verbatim"):
+            canonical.with_reconciled_plan(
+                plan,
+                projected,
+            )
 
     @pytest.mark.anyio
     @pytest.mark.parametrize(
@@ -438,7 +455,7 @@ class TestModelUnique:
         )
         execute = AsyncMock(return_value=Response(texts=("unexpected",)))
 
-        assert rebound._provenance_plan is None
+        assert rebound.provenance_plan is None
         with pytest.raises(RuntimeError, match="provenance is incomplete"):
             rebound._provenance(Response(texts=("not persisted",)))
         with (
@@ -448,6 +465,29 @@ class TestModelUnique:
             await rebound.arun(Request(input=CompletionInput("prompt")))
 
         execute.assert_not_awaited()
+
+    def test_rebind_can_attach_composition_provenance_atomically(self, gen_model):
+        runtime_plan = gen_model.runtime_plan
+        provenance_plan = gen_model.provenance_plan
+        assert runtime_plan is not None
+        assert provenance_plan is not None
+        reconciled_runtime = replace(
+            runtime_plan,
+            binding_plan_fingerprint="opaque:reconciled-binding",
+            deployment_plan_fingerprint="opaque:reconciled-deployment",
+        )
+        reconciled_provenance = replace(
+            provenance_plan,
+            binding_plan_fingerprint="stable:reconciled-binding",
+            deployment_plan_fingerprint="stable:reconciled-deployment",
+        )
+
+        rebound = gen_model.with_reconciled_plan(
+            reconciled_runtime,
+            reconciled_provenance,
+        )
+
+        assert rebound.provenance_plan == reconciled_provenance
 
     def test_legacy_runtime_fingerprint_covers_every_plan_field(self, gen_model):
         plan = gen_model.runtime_plan

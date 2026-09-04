@@ -10,11 +10,44 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from sieval.core.models._legacy_binding import build_legacy_openai_binding
+from sieval.core.models._legacy_binding import (
+    _legacy_provenance_projector_for_plan,
+    build_legacy_openai_binding,
+)
 from sieval.core.models.connection_factory import DEFAULT_REQUEST_TIMEOUT
 
 
 class TestLegacyBindingClient:
+    def test_constructor_builds_provenance_without_recovering_its_own_plan(
+        self,
+    ) -> None:
+        client = SimpleNamespace(
+            base_url="https://legacy.example/v1/",
+            close=AsyncMock(),
+        )
+        with (
+            patch(
+                "sieval.core.models._legacy_binding.AsyncOpenAI",
+                return_value=client,
+            ),
+            patch(
+                "sieval.core.models._legacy_binding."
+                "_legacy_provenance_projector_for_plan",
+                side_effect=AssertionError("constructor must not use recovery"),
+            ),
+        ):
+            binding = build_legacy_openai_binding(
+                dialect_id="openai_chat",
+                model="m",
+                api_base="https://legacy.example/v1",
+                api_key="sk-runtime-only",
+                max_retries=4,
+                concurrency_limit=None,
+                parent_limiter=None,
+            )
+
+        assert binding.provenance_projector(binding.runtime_plan) is not None
+
     def test_client_declares_the_shared_request_timeout(self) -> None:
         """The wrapper path owes the same declared bound as the factory.
 
@@ -303,3 +336,28 @@ class TestLegacyBindingClient:
             for projected in variant_provenance
             if projected is not None
         )
+
+    def test_projected_plan_is_not_reported_as_a_malformed_runtime_identity(
+        self,
+    ) -> None:
+        client = SimpleNamespace(
+            base_url="https://legacy.example/v1/",
+            close=AsyncMock(),
+        )
+        with patch(
+            "sieval.core.models._legacy_binding.AsyncOpenAI",
+            return_value=client,
+        ):
+            binding = build_legacy_openai_binding(
+                dialect_id="openai_chat",
+                model="m",
+                api_base="https://legacy.example/v1",
+                api_key="sk-runtime-only",
+                max_retries=4,
+                concurrency_limit=None,
+                parent_limiter=None,
+            )
+
+        projected = binding.provenance_projector(binding.runtime_plan)
+        assert projected is not None
+        assert _legacy_provenance_projector_for_plan(projected) is None

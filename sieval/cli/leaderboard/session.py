@@ -391,78 +391,84 @@ def _record_plan_provenance_replacements(
         )
 
 
-def _replace_provenance_tokens(
-    value: JSONValue,
+def _replace_provenance_reference_text(
+    value: str,
     replacements: Mapping[str, str],
-) -> JSONValue:
-    """Recursively replace original runtime identities exactly once."""
+) -> str:
+    """Replace identity references in a field whose schema declares them.
 
-    pattern = (
-        re.compile(
-            "|".join(
-                re.escape(runtime_value)
-                for runtime_value in sorted(
-                    replacements,
-                    key=lambda runtime_value: len(runtime_value),
-                    reverse=True,
-                )
+    This helper is deliberately limited to provenance ``sources`` fields.  In
+    those fields, every occurrence of a known runtime token is an identity
+    reference by contract.  Arbitrary JSON, diagnostic text, mapping keys, and
+    user parameters must instead remain byte-for-byte unchanged and fail loud
+    if they contain a volatile token.
+    """
+
+    if not replacements:
+        return value
+    pattern = re.compile(
+        "|".join(
+            re.escape(runtime_value)
+            for runtime_value in sorted(
+                replacements,
+                key=lambda runtime_value: len(runtime_value),
+                reverse=True,
             )
         )
-        if replacements
-        else None
     )
+    return pattern.sub(lambda match: replacements[match.group(0)], value)
 
-    def project(current: JSONValue) -> JSONValue:
+
+def _provenance_tokens_in(
+    value: JSONValue,
+    runtime_tokens: frozenset[str],
+) -> frozenset[str]:
+    """Return volatile identity tokens present in unprojected JSON data."""
+
+    found: set[str] = set()
+
+    def visit(current: JSONValue) -> None:
         if isinstance(current, str):
-            if pattern is None:
-                return current
-            return pattern.sub(
-                lambda match: replacements[match.group(0)],
-                current,
-            )
+            found.update(token for token in runtime_tokens if token in current)
+            return
         if isinstance(current, list):
-            return [project(item) for item in current]
+            for item in current:
+                visit(item)
+            return
         if isinstance(current, Mapping):
-            projected_mapping: dict[str, JSONValue] = {}
             typed_mapping = cast(Mapping[str, JSONValue], current)
             for key, item in typed_mapping.items():
-                projected_key = cast(str, project(key))
-                if projected_key in projected_mapping:
-                    raise ValueError(
-                        "external provenance projection collapses evidence key "
-                        f"{projected_key!r}"
-                    )
-                projected_mapping[projected_key] = project(item)
-            return projected_mapping
-        return current
+                found.update(token for token in runtime_tokens if token in key)
+                visit(item)
 
-    return project(value)
+    visit(value)
+    return frozenset(found)
 
 
-def _contains_provenance_token(value: JSONValue, token: str) -> bool:
-    """Return whether a runtime token survives anywhere in JSON evidence."""
+def _reject_unprojected_provenance_tokens(
+    value: JSONValue,
+    runtime_tokens: frozenset[str],
+    *,
+    context: str,
+) -> None:
+    """Reject volatile identities in fields that provenance must not rewrite."""
 
-    if isinstance(value, str):
-        return token in value
-    if isinstance(value, list):
-        return any(_contains_provenance_token(item, token) for item in value)
-    if isinstance(value, Mapping):
-        typed_mapping = cast(Mapping[str, JSONValue], value)
-        return any(
-            token in key or _contains_provenance_token(item, token)
-            for key, item in typed_mapping.items()
+    leaked = sorted(_provenance_tokens_in(value, runtime_tokens))
+    if leaked:
+        raise ValueError(
+            f"{context} contains runtime identity token(s) in semantic data: "
+            + ", ".join(leaked)
         )
-    return False
 
 
-_EXTERNAL_PROVENANCE_PROJECTED_CHECK_FIELDS = frozenset({"reason"})
+_EXTERNAL_PROVENANCE_PROJECTED_CHECK_FIELDS = frozenset()
 _EXTERNAL_PROVENANCE_SEMANTIC_CHECK_FIELDS = frozenset(
-    {"capability", "stage", "verifier"}
+    {"capability", "stage", "verifier", "reason"}
 )
-_EXTERNAL_PROVENANCE_PROJECTED_REQUIREMENT_FIELDS = frozenset(
-    {"minimums", "sources", "reason"}
+_EXTERNAL_PROVENANCE_PROJECTED_REQUIREMENT_FIELDS = frozenset({"sources"})
+_EXTERNAL_PROVENANCE_SEMANTIC_REQUIREMENT_FIELDS = frozenset(
+    {"capability", "minimums", "verifier", "reason"}
 )
-_EXTERNAL_PROVENANCE_SEMANTIC_REQUIREMENT_FIELDS = frozenset({"capability", "verifier"})
 _EXTERNAL_PROVENANCE_PROJECTED_INTENT_FIELDS = frozenset({"sources"})
 _EXTERNAL_PROVENANCE_SEMANTIC_INTENT_FIELDS = frozenset(
     {"key", "required", "minimums", "request_defaults"}
@@ -472,7 +478,7 @@ _EXTERNAL_PROVENANCE_PROJECTED_CONNECTION_SCOPE_FIELDS = frozenset(
 )
 _EXTERNAL_PROVENANCE_SEMANTIC_CONNECTION_SCOPE_FIELDS = frozenset({"retry_policy"})
 _EXTERNAL_PROVENANCE_PROJECTED_BINDING_PLAN_FIELDS = frozenset(
-    {"binding_id", "root_deployment_key", "unavailable_capabilities"}
+    {"binding_id", "root_deployment_key"}
 )
 _EXTERNAL_PROVENANCE_SEMANTIC_BINDING_PLAN_FIELDS = frozenset(
     {
@@ -487,6 +493,7 @@ _EXTERNAL_PROVENANCE_SEMANTIC_BINDING_PLAN_FIELDS = frozenset(
         "output_channels",
         "required_output_channels",
         "route_intent",
+        "unavailable_capabilities",
     }
 )
 _EXTERNAL_PROVENANCE_SPECIAL_BINDING_PLAN_FIELDS = frozenset(
@@ -494,129 +501,112 @@ _EXTERNAL_PROVENANCE_SPECIAL_BINDING_PLAN_FIELDS = frozenset(
 )
 _EXTERNAL_PROVENANCE_COMPUTED_BINDING_PLAN_FIELDS = frozenset({"fingerprint"})
 _EXTERNAL_PROVENANCE_PROJECTED_DEPLOYMENT_PLAN_FIELDS = frozenset(
+    {"root_deployment_key"}
+)
+_EXTERNAL_PROVENANCE_SEMANTIC_DEPLOYMENT_PLAN_FIELDS = frozenset(
     {
-        "root_deployment_key",
         "engine_id",
         "desired_plan_fingerprint",
         "recipe_parameters",
         "explicit_parameters",
-        "serving_requirements",
         "launch_patch",
         "setup_checks",
         "request_checks",
-        "outcome_evidence",
+        "outcome_kinds",
     }
 )
-_EXTERNAL_PROVENANCE_SEMANTIC_DEPLOYMENT_PLAN_FIELDS = frozenset({"outcome_kinds"})
+_EXTERNAL_PROVENANCE_SPECIAL_DEPLOYMENT_PLAN_FIELDS = frozenset(
+    {"serving_requirements", "outcome_evidence"}
+)
 _EXTERNAL_PROVENANCE_COMPUTED_DEPLOYMENT_PLAN_FIELDS = frozenset({"fingerprint"})
 _EXTERNAL_PROVENANCE_PROJECTED_RECONCILE_INPUT_FIELDS = frozenset(
-    {
-        "root_deployment_key",
-        "recipe_parameters",
-        "explicit_parameters",
-        "prelaunch_plan",
-    }
+    {"root_deployment_key"}
 )
 _EXTERNAL_PROVENANCE_SEMANTIC_RECONCILE_INPUT_FIELDS = frozenset(
-    {"engine_id", "deployment", "plan"}
+    {"engine_id", "deployment", "plan", "recipe_parameters", "explicit_parameters"}
 )
+_EXTERNAL_PROVENANCE_SPECIAL_RECONCILE_INPUT_FIELDS = frozenset({"prelaunch_plan"})
 
 
-def _validate_external_provenance_schema() -> None:
-    """Fail when an externally visible projection field has no policy."""
-
-    policies = (
-        (
-            DeferredCheck,
-            _EXTERNAL_PROVENANCE_PROJECTED_CHECK_FIELDS
-            | _EXTERNAL_PROVENANCE_SEMANTIC_CHECK_FIELDS,
-        ),
-        (
-            ServingRequirement,
-            _EXTERNAL_PROVENANCE_PROJECTED_REQUIREMENT_FIELDS
-            | _EXTERNAL_PROVENANCE_SEMANTIC_REQUIREMENT_FIELDS,
-        ),
-        (
-            CapabilityIntent,
-            _EXTERNAL_PROVENANCE_PROJECTED_INTENT_FIELDS
-            | _EXTERNAL_PROVENANCE_SEMANTIC_INTENT_FIELDS,
-        ),
-        (
-            ConnectionScope,
-            _EXTERNAL_PROVENANCE_PROJECTED_CONNECTION_SCOPE_FIELDS
-            | _EXTERNAL_PROVENANCE_SEMANTIC_CONNECTION_SCOPE_FIELDS,
-        ),
-        (
-            BindingCapabilityPlan,
-            _EXTERNAL_PROVENANCE_PROJECTED_BINDING_PLAN_FIELDS
-            | _EXTERNAL_PROVENANCE_SEMANTIC_BINDING_PLAN_FIELDS
-            | _EXTERNAL_PROVENANCE_SPECIAL_BINDING_PLAN_FIELDS
-            | _EXTERNAL_PROVENANCE_COMPUTED_BINDING_PLAN_FIELDS,
-        ),
-        (
-            DeploymentCapabilityPlan,
-            _EXTERNAL_PROVENANCE_PROJECTED_DEPLOYMENT_PLAN_FIELDS
-            | _EXTERNAL_PROVENANCE_SEMANTIC_DEPLOYMENT_PLAN_FIELDS
-            | _EXTERNAL_PROVENANCE_COMPUTED_DEPLOYMENT_PLAN_FIELDS,
-        ),
-        (
-            DeploymentReconcileInput,
-            _EXTERNAL_PROVENANCE_PROJECTED_RECONCILE_INPUT_FIELDS
-            | _EXTERNAL_PROVENANCE_SEMANTIC_RECONCILE_INPUT_FIELDS,
-        ),
-    )
-    for record_type, classified_fields in policies:
-        record_fields = {item.name for item in dataclasses.fields(record_type)}
-        if record_fields == classified_fields:
-            continue
-        missing = sorted(record_fields - classified_fields)
-        stale = sorted(classified_fields - record_fields)
-        raise RuntimeError(
-            f"{record_type.__name__} external provenance policy is incomplete; "
-            f"missing={missing!r}, stale={stale!r}"
-        )
-
-
-def _replace_provenance_text(
-    value: str,
-    replacements: Mapping[str, str],
-) -> str:
-    projected = _replace_provenance_tokens(value, replacements)
-    assert isinstance(projected, str)
-    return projected
+_EXTERNAL_PROVENANCE_POLICIES = (
+    (
+        DeferredCheck,
+        _EXTERNAL_PROVENANCE_PROJECTED_CHECK_FIELDS
+        | _EXTERNAL_PROVENANCE_SEMANTIC_CHECK_FIELDS,
+    ),
+    (
+        ServingRequirement,
+        _EXTERNAL_PROVENANCE_PROJECTED_REQUIREMENT_FIELDS
+        | _EXTERNAL_PROVENANCE_SEMANTIC_REQUIREMENT_FIELDS,
+    ),
+    (
+        CapabilityIntent,
+        _EXTERNAL_PROVENANCE_PROJECTED_INTENT_FIELDS
+        | _EXTERNAL_PROVENANCE_SEMANTIC_INTENT_FIELDS,
+    ),
+    (
+        ConnectionScope,
+        _EXTERNAL_PROVENANCE_PROJECTED_CONNECTION_SCOPE_FIELDS
+        | _EXTERNAL_PROVENANCE_SEMANTIC_CONNECTION_SCOPE_FIELDS,
+    ),
+    (
+        BindingCapabilityPlan,
+        _EXTERNAL_PROVENANCE_PROJECTED_BINDING_PLAN_FIELDS
+        | _EXTERNAL_PROVENANCE_SEMANTIC_BINDING_PLAN_FIELDS
+        | _EXTERNAL_PROVENANCE_SPECIAL_BINDING_PLAN_FIELDS
+        | _EXTERNAL_PROVENANCE_COMPUTED_BINDING_PLAN_FIELDS,
+    ),
+    (
+        DeploymentCapabilityPlan,
+        _EXTERNAL_PROVENANCE_PROJECTED_DEPLOYMENT_PLAN_FIELDS
+        | _EXTERNAL_PROVENANCE_SEMANTIC_DEPLOYMENT_PLAN_FIELDS
+        | _EXTERNAL_PROVENANCE_SPECIAL_DEPLOYMENT_PLAN_FIELDS
+        | _EXTERNAL_PROVENANCE_COMPUTED_DEPLOYMENT_PLAN_FIELDS,
+    ),
+    (
+        DeploymentReconcileInput,
+        _EXTERNAL_PROVENANCE_PROJECTED_RECONCILE_INPUT_FIELDS
+        | _EXTERNAL_PROVENANCE_SEMANTIC_RECONCILE_INPUT_FIELDS
+        | _EXTERNAL_PROVENANCE_SPECIAL_RECONCILE_INPUT_FIELDS,
+    ),
+)
 
 
 def _project_provenance_check(
     check: DeferredCheck,
-    replacements: Mapping[str, str],
+    runtime_tokens: frozenset[str],
 ) -> DeferredCheck:
-    """Project diagnostic text without changing which verifier executes."""
+    """Preserve diagnostic text and reject volatile identity leakage."""
 
-    return dataclasses.replace(
-        check,
-        reason=_replace_provenance_text(check.reason, replacements),
+    _reject_unprojected_provenance_tokens(
+        check.reason,
+        runtime_tokens,
+        context="external provenance check reason",
     )
+    return check
 
 
 def _project_provenance_requirement(
     requirement: ServingRequirement,
     replacements: Mapping[str, str],
+    runtime_tokens: frozenset[str],
 ) -> ServingRequirement:
-    minimums = _replace_provenance_tokens(
-        cast(JSONValue, requirement.minimums), replacements
+    _reject_unprojected_provenance_tokens(
+        cast(JSONValue, requirement.minimums),
+        runtime_tokens,
+        context="external provenance serving minimums",
     )
-    assert isinstance(minimums, Mapping)
+    if requirement.reason is not None:
+        _reject_unprojected_provenance_tokens(
+            requirement.reason,
+            runtime_tokens,
+            context="external provenance serving reason",
+        )
     return dataclasses.replace(
         requirement,
-        minimums=cast(Mapping[str, JSONValue], minimums),
         sources=tuple(
-            _replace_provenance_text(source, replacements)
+            _replace_provenance_reference_text(source, replacements)
             for source in requirement.sources
-        ),
-        reason=(
-            None
-            if requirement.reason is None
-            else _replace_provenance_text(requirement.reason, replacements)
         ),
     )
 
@@ -624,13 +614,25 @@ def _project_provenance_requirement(
 def _project_provenance_intent(
     intent: CapabilityIntent,
     replacements: Mapping[str, str],
+    runtime_tokens: frozenset[str],
 ) -> CapabilityIntent:
     """Project diagnostic sources without changing the requested capability."""
 
+    _reject_unprojected_provenance_tokens(
+        cast(JSONValue, intent.minimums),
+        runtime_tokens,
+        context="external provenance intent minimums",
+    )
+    _reject_unprojected_provenance_tokens(
+        intent.request_defaults.to_json_value(),
+        runtime_tokens,
+        context="external provenance intent request defaults",
+    )
     return dataclasses.replace(
         intent,
         sources=tuple(
-            _replace_provenance_text(source, replacements) for source in intent.sources
+            _replace_provenance_reference_text(source, replacements)
+            for source in intent.sources
         ),
     )
 
@@ -646,35 +648,33 @@ def _project_external_binding_plan(
 ) -> BindingCapabilityPlan:
     """Build a stable view of every persisted binding-plan field."""
 
-    _validate_external_provenance_schema()
     projected = dataclasses.replace(
         plan,
         binding_id=binding_id,
         root_deployment_key=root_deployment_key,
         intents={
-            capability: _project_provenance_intent(intent, replacements)
+            capability: _project_provenance_intent(
+                intent,
+                replacements,
+                runtime_tokens,
+            )
             for capability, intent in plan.intents.items()
         },
-        unavailable_capabilities={
-            capability: _replace_provenance_text(reason, replacements)
-            for capability, reason in plan.unavailable_capabilities.items()
-        },
         serving_requirements=tuple(
-            _project_provenance_requirement(requirement, replacements)
+            _project_provenance_requirement(
+                requirement,
+                replacements,
+                runtime_tokens,
+            )
             for requirement in plan.serving_requirements
         ),
         connection_scope=connection_scope,
     )
-    leaked = sorted(
-        token
-        for token in runtime_tokens
-        if _contains_provenance_token(cast(JSONValue, projected.to_json_value()), token)
+    _reject_unprojected_provenance_tokens(
+        cast(JSONValue, projected.to_json_value()),
+        runtime_tokens,
+        context="external provenance binding plan",
     )
-    if leaked:
-        raise ValueError(
-            "external provenance binding plan contains unresolved runtime "
-            "identity token(s): " + ", ".join(leaked)
-        )
     return projected
 
 
@@ -688,10 +688,10 @@ def _project_external_deployment_plan(
 ) -> DeploymentCapabilityPlan:
     """Build a stable view of every persisted deployment-plan field."""
 
-    _validate_external_provenance_schema()
     outcome_evidence: dict[CapabilityKey, Mapping[str, JSONValue]] = {}
     for capability, evidence in plan.outcome_evidence.items():
         plan_fingerprints = evidence.get("plan_fingerprints")
+        projected_evidence: dict[str, JSONValue] = dict(evidence)
         if evidence.get("source") == "external_runtime_plans":
             if not isinstance(plan_fingerprints, list) or not all(
                 isinstance(fingerprint, str) for fingerprint in plan_fingerprints
@@ -707,71 +707,37 @@ def _project_external_deployment_plan(
                     "external provenance projection cannot resolve runtime plan "
                     "fingerprint(s): " + ", ".join(missing)
                 )
-
-        projected = _replace_provenance_tokens(evidence, replacements)
-        assert isinstance(projected, Mapping)
-        projected_evidence = cast(Mapping[str, JSONValue], projected)
-        if evidence.get("source") == "external_runtime_plans":
-            projected_fingerprints = projected_evidence.get("plan_fingerprints")
-            assert isinstance(projected_fingerprints, list)
-            projected_evidence = {
-                **projected_evidence,
-                "plan_fingerprints": sorted(
-                    {cast(str, item) for item in projected_fingerprints}
-                ),
-            }
+            projected_evidence["plan_fingerprints"] = sorted(
+                {runtime_to_provenance[item] for item in typed_fingerprints}
+            )
         outcome_evidence[capability] = projected_evidence
 
-    recipe_parameters = _replace_provenance_tokens(
-        cast(JSONValue, plan.recipe_parameters), replacements
-    )
-    explicit_parameters = _replace_provenance_tokens(
-        cast(JSONValue, plan.explicit_parameters), replacements
-    )
-    launch_patch = _replace_provenance_tokens(
-        cast(JSONValue, plan.launch_patch), replacements
-    )
-    assert isinstance(recipe_parameters, Mapping)
-    assert isinstance(explicit_parameters, Mapping)
-    assert isinstance(launch_patch, Mapping)
     projected_plan = dataclasses.replace(
         plan,
         root_deployment_key=root_deployment_key,
-        engine_id=_replace_provenance_text(plan.engine_id, replacements),
-        desired_plan_fingerprint=(
-            None
-            if plan.desired_plan_fingerprint is None
-            else _replace_provenance_text(plan.desired_plan_fingerprint, replacements)
-        ),
-        recipe_parameters=cast(Mapping[str, JSONValue], recipe_parameters),
-        explicit_parameters=cast(Mapping[str, JSONValue], explicit_parameters),
         serving_requirements=tuple(
-            _project_provenance_requirement(requirement, replacements)
+            _project_provenance_requirement(
+                requirement,
+                replacements,
+                runtime_tokens,
+            )
             for requirement in plan.serving_requirements
         ),
-        launch_patch=cast(Mapping[str, JSONValue], launch_patch),
         setup_checks=tuple(
-            _project_provenance_check(check, replacements)
+            _project_provenance_check(check, runtime_tokens)
             for check in plan.setup_checks
         ),
         request_checks=tuple(
-            _project_provenance_check(check, replacements)
+            _project_provenance_check(check, runtime_tokens)
             for check in plan.request_checks
         ),
         outcome_evidence=outcome_evidence,
     )
-    leaked = sorted(
-        token
-        for token in runtime_tokens
-        if _contains_provenance_token(
-            cast(JSONValue, projected_plan.to_json_value()), token
-        )
+    _reject_unprojected_provenance_tokens(
+        cast(JSONValue, projected_plan.to_json_value()),
+        runtime_tokens,
+        context="external provenance plan",
     )
-    if leaked:
-        raise ValueError(
-            "external provenance plan contains unresolved runtime identity "
-            "token(s): " + ", ".join(leaked)
-        )
     return projected_plan
 
 
@@ -2317,15 +2283,13 @@ class EvalSession:
                 runtime_plan = source.runtime_plan
                 if runtime_plan.root_deployment_key != root_deployment_key:
                     continue
-                if source._provenance_projector is None:
-                    provenance_plan = runtime_plan
-                else:
-                    provenance_plan = source._provenance_plan
-                    if provenance_plan is None:
-                        raise ValueError(
-                            "external legacy source has incomplete provenance: "
-                            f"{runtime_plan.binding_id}"
-                        )
+                provenance_plan = source.provenance_plan
+                if provenance_plan is None:
+                    raise ValueError(
+                        "external legacy source has incomplete provenance: "
+                        f"{runtime_plan.binding_id}"
+                    )
+                if provenance_plan != runtime_plan:
                     has_projection = True
 
                 previous = found.get(runtime_plan.binding_id)
@@ -2387,13 +2351,16 @@ class EvalSession:
     ) -> tuple[tuple[ServingRequirement, ...], DeploymentReconcileInput]:
         """Hide wrapper-private ownership identity from injected reconcilers."""
 
-        _validate_external_provenance_schema()
         context = self._external_provenance_context(deployment.root_deployment_key)
         if context is None:
             return requirements, deployment
 
         projected_requirements = tuple(
-            _project_provenance_requirement(requirement, context.replacements)
+            _project_provenance_requirement(
+                requirement,
+                context.replacements,
+                context.runtime_tokens,
+            )
             for requirement in requirements
         )
 
@@ -2406,19 +2373,9 @@ class EvalSession:
                 runtime_to_provenance=context.runtime_to_provenance,
                 runtime_tokens=context.runtime_tokens,
             )
-        recipe_parameters = _replace_provenance_tokens(
-            cast(JSONValue, deployment.recipe_parameters), context.replacements
-        )
-        explicit_parameters = _replace_provenance_tokens(
-            cast(JSONValue, deployment.explicit_parameters), context.replacements
-        )
-        assert isinstance(recipe_parameters, Mapping)
-        assert isinstance(explicit_parameters, Mapping)
         projected_deployment = dataclasses.replace(
             deployment,
             root_deployment_key=context.root_deployment_key,
-            recipe_parameters=cast(Mapping[str, JSONValue], recipe_parameters),
-            explicit_parameters=cast(Mapping[str, JSONValue], explicit_parameters),
             prelaunch_plan=prelaunch_plan,
         )
         projected_input: JSONValue = {
@@ -2427,16 +2384,11 @@ class EvalSession:
             ],
             "deployment": projected_deployment.to_json_value(),
         }
-        leaked = sorted(
-            token
-            for token in context.runtime_tokens
-            if _contains_provenance_token(projected_input, token)
+        _reject_unprojected_provenance_tokens(
+            projected_input,
+            context.runtime_tokens,
+            context="external reconciler inputs",
         )
-        if leaked:
-            raise ValueError(
-                "external reconciler inputs contain unresolved runtime identity "
-                "token(s): " + ", ".join(leaked)
-            )
         return projected_requirements, projected_deployment
 
     def _external_provenance_plan(
@@ -2448,9 +2400,7 @@ class EvalSession:
         """Project a reconciled external plan without its runtime-only identity."""
 
         runtime_plan = result.runtime_plans[binding_id]
-        if model._provenance_projector is None:
-            return runtime_plan
-        baseline = model._provenance_plan
+        baseline = model.provenance_plan
         if baseline is None:
             raise ValueError(
                 f"external binding {binding_id!r} has incomplete baseline provenance"
@@ -2458,6 +2408,8 @@ class EvalSession:
         source_baseline = model.runtime_plan
         if source_baseline is None:
             raise ValueError(f"external binding {binding_id!r} has no runtime plan")
+        if baseline == source_baseline:
+            return runtime_plan
         context = self._external_provenance_context(runtime_plan.root_deployment_key)
         if context is None:
             raise ValueError(
@@ -2537,25 +2489,18 @@ class EvalSession:
             binding_id=baseline.binding_id,
             root_deployment_key=baseline.root_deployment_key,
             request_checks=tuple(
-                _project_provenance_check(check, replacements)
+                _project_provenance_check(check, frozenset(runtime_tokens))
                 for check in runtime_plan.request_checks
             ),
             connection_identity=baseline.connection_identity,
             binding_plan_fingerprint=provenance_binding_plan.fingerprint,
             deployment_plan_fingerprint=provenance_deployment_plan.fingerprint,
         )
-        leaked = sorted(
-            token
-            for token in runtime_tokens
-            if _contains_provenance_token(
-                cast(JSONValue, provenance_plan.to_json_value()), token
-            )
+        _reject_unprojected_provenance_tokens(
+            cast(JSONValue, provenance_plan.to_json_value()),
+            frozenset(runtime_tokens),
+            context="external provenance plan",
         )
-        if leaked:
-            raise ValueError(
-                "external provenance plan contains unresolved runtime identity "
-                "token(s): " + ", ".join(leaked)
-            )
         return provenance_plan
 
     def _validate_external_runtime_obligations(self, result: ReconcileResult) -> None:
@@ -4264,10 +4209,10 @@ class EvalSession:
                         result,
                         binding.binding_id,
                     )
-                    rebound = live_model.with_dialect(
-                        runtime_plan.dialect_id, runtime_plan
+                    rebound = live_model.with_reconciled_plan(
+                        runtime_plan,
+                        provenance_plan,
                     )
-                    rebound = rebound._with_provenance_plan(provenance_plan)
                     if self.deterministic:
                         rebound = _apply_request_seed_decision_to_model(
                             rebound,

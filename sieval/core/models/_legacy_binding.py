@@ -4,13 +4,16 @@ These wrappers accept a bare ``model=``/``api_base=`` pair and must still
 present a truthful :class:`RuntimeBindingPlan`, so this module fabricates one
 from an externally-owned connection rather than from a reconciled deployment.
 The canonical ``Model.bind`` path also uses the narrow reconstruction helper
-below so converting a wrapper plan cannot discard its provenance policy.
+below so converting a wrapper plan cannot discard its provenance policy.  That
+compatibility-only dependency can be removed together with support for passing
+legacy wrapper plans to ``Model.bind``; ordinary wrapper construction does not
+round-trip through the recovery path.
 
 AI-Generated Code - Claude Opus 5 (1M context) (Anthropic)
 """
 
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import anyio
@@ -31,6 +34,11 @@ from .deployment import (
 )
 from .dialect_registry import capability_decisions_for, get_dialect_spec
 from .reconcile import RuntimeBindingPlan
+
+type _LegacyCredentialKind = Literal[
+    "explicit-credential",
+    "environment-credential",
+]
 
 
 @dataclass(frozen=True)
@@ -153,16 +161,25 @@ class _LegacyProvenanceProjector:
 
 def _legacy_private_credential_kind(
     runtime_plan: RuntimeBindingPlan,
-) -> str | None:
+) -> _LegacyCredentialKind | None:
     """Return the stable credential category for a wrapper-private identity."""
 
     identity = runtime_plan.connection_identity
     quota_scope = identity.quota_scope
     prefix = "legacy-private:"
     credential_scope = identity.credential_scope
+    stable_credential_scopes = {
+        "legacy-private:explicit-credential",
+        "legacy-private:environment-credential",
+    }
+    if quota_scope == "legacy-private":
+        if credential_scope in stable_credential_scopes:
+            return None
+        raise ValueError(
+            "projected legacy provenance identity has an invalid credential scope"
+        )
     uses_legacy_namespace = (
-        quota_scope == "legacy-private"
-        or quota_scope.startswith(prefix)
+        quota_scope.startswith(prefix)
         or credential_scope == "legacy-private"
         or credential_scope.startswith(prefix)
     )
@@ -186,14 +203,28 @@ def _legacy_private_credential_kind(
             "quota scopes"
         )
     credential_kind = credential_scope.removeprefix(credential_prefix)
-    if credential_kind not in {
-        "explicit-credential",
-        "environment-credential",
-    }:
-        raise ValueError(
-            "legacy-private connection identity has an invalid credential category"
-        )
-    return credential_kind
+    if credential_kind == "explicit-credential":
+        return "explicit-credential"
+    if credential_kind == "environment-credential":
+        return "environment-credential"
+    raise ValueError(
+        "legacy-private connection identity has an invalid credential category"
+    )
+
+
+def _legacy_stable_connection_identity(
+    runtime_identity: ConnectionIdentity,
+    credential_kind: _LegacyCredentialKind,
+) -> ConnectionIdentity:
+    """Return the stable semantic view of one wrapper-private connection."""
+
+    return ConnectionIdentity(
+        endpoint=runtime_identity.endpoint,
+        connection_family=runtime_identity.connection_family,
+        credential_scope=f"legacy-private:{credential_kind}",
+        retry_policy=runtime_identity.retry_policy,
+        quota_scope="legacy-private",
+    )
 
 
 def _legacy_capability_state(
@@ -295,12 +326,9 @@ def _legacy_provenance_projector_for_plan(
             "attach its stable provenance through the composition layer"
         )
 
-    stable_identity = ConnectionIdentity(
-        endpoint=runtime_identity.endpoint,
-        connection_family=runtime_identity.connection_family,
-        credential_scope=f"legacy-private:{credential_kind}",
-        retry_policy=runtime_identity.retry_policy,
-        quota_scope="legacy-private",
+    stable_identity = _legacy_stable_connection_identity(
+        runtime_identity,
+        credential_kind,
     )
     return _LegacyProvenanceProjector(
         stable_identity,
@@ -426,8 +454,20 @@ def build_legacy_openai_binding(
     # accident.  Persisted provenance records the same semantic binding with
     # only a credential category and a stable private-pool scope, so object
     # allocation does not make equivalent run artifacts differ.
-    provenance_projector = _legacy_provenance_projector_for_plan(runtime_plan)
-    assert provenance_projector is not None
+    credential_kind: _LegacyCredentialKind = (
+        "explicit-credential" if api_key is not None else "environment-credential"
+    )
+    provenance_identity = _legacy_stable_connection_identity(
+        identity,
+        credential_kind,
+    )
+    provenance_projector = _LegacyProvenanceProjector(
+        provenance_identity,
+        runtime_plan.binding_id,
+        runtime_plan.root_deployment_key,
+        runtime_plan.binding_plan_fingerprint,
+        runtime_plan.deployment_plan_fingerprint,
+    )
     return _LegacyOpenAIBinding(
         deployment=deployment,
         pool=pool,

@@ -127,8 +127,12 @@ class TestDefaultTransport:
     def test_legacy_facade_cannot_rebind_or_lose_its_owner(self):
         model = SglangGenModel(model="m", api_key="local")
 
+        assert model.runtime_plan is None
+        assert model.provenance_plan is None
         with pytest.raises(RuntimeError, match="cannot rebind"):
             model.with_dialect("sglang_native", object())
+        with pytest.raises(RuntimeError, match="no runtime plan for provenance"):
+            model.with_provenance_plan(object())
         model._lifecycle_owner = None
         with pytest.raises(RuntimeError, match="no lifecycle owner"):
             model._legacy_lifecycle_owner()

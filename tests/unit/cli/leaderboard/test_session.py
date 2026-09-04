@@ -22,6 +22,7 @@ import yaml
 from sieval.cli._filter_spec import VALUES_DIGEST_KEY, compute_values_digest
 from sieval.cli.leaderboard.session import (
     _DETERMINISTIC_SEED_CONTRACT_KEY,
+    _EXTERNAL_PROVENANCE_POLICIES,
     _NONMATCH_KEYS_STRIPPED_IN_BLOCKS,
     _NONMATCH_RUNNER_KEYS,
     _STRICT_RUNNER_KEYS,
@@ -40,13 +41,13 @@ from sieval.cli.leaderboard.session import (
     _diff_lines,
     _format_comment_header,
     _reify_cli_overrides,
-    _replace_provenance_tokens,
+    _reject_unprojected_provenance_tokens,
+    _replace_provenance_reference_text,
     _resolve_deterministic_request_seed,
     _sort_versions,
     _split_header,
     _strip_header,
     _strip_noncomparable_fields,
-    _validate_external_provenance_schema,
     arun_session,
     resolve_deterministic,
     run_session,
@@ -74,6 +75,7 @@ from sieval.core.models.requirements import (
 )
 from sieval.core.runners import TaskRunnerConfig
 from sieval.core.runners.multi_runner import MultiTaskRunner
+from sieval.core.types import JSONValue
 from tests.conftest import MockChatModel
 
 
@@ -1639,30 +1641,42 @@ class TestPrelaunchReconciliation:
     def test_external_provenance_policy_classifies_every_projected_field(
         self,
     ) -> None:
-        _validate_external_provenance_schema()
-
-    def test_external_provenance_projection_rejects_key_collisions(self) -> None:
-        with pytest.raises(
-            ValueError,
-            match="external provenance projection collapses evidence key 'stable'",
-        ):
-            _replace_provenance_tokens(
-                {"runtime": "first", "stable": "second"},
-                {"runtime": "stable"},
+        for record_type, classified_fields in _EXTERNAL_PROVENANCE_POLICIES:
+            assert {item.name for item in dataclasses.fields(record_type)} == (
+                classified_fields
             )
 
-    def test_external_provenance_projection_does_not_cascade_replacements(
+    def test_external_provenance_rejects_runtime_tokens_in_semantic_json(self) -> None:
+        original = {
+            "runtime-key": "user-data::runtime-long::literal",
+            "stable": "unchanged",
+        }
+        with pytest.raises(
+            ValueError,
+            match="test semantic field contains runtime identity token.*runtime-long",
+        ):
+            _reject_unprojected_provenance_tokens(
+                cast(JSONValue, original),
+                frozenset({"runtime-long"}),
+                context="test semantic field",
+            )
+        assert original == {
+            "runtime-key": "user-data::runtime-long::literal",
+            "stable": "unchanged",
+        }
+
+    def test_external_provenance_reference_projection_does_not_cascade(
         self,
     ) -> None:
         assert (
-            _replace_provenance_tokens(
-                "runtime-long",
+            _replace_provenance_reference_text(
+                "runtime-source:runtime-long",
                 {
                     "runtime-long": "runtime-short",
                     "runtime-short": "stable",
                 },
             )
-            == "runtime-short"
+            == "runtime-source:runtime-short"
         )
 
     class ChatTask:
@@ -4742,7 +4756,7 @@ tasks:
         candidate_close.assert_awaited_once()
 
     @pytest.mark.anyio
-    async def test_external_grader_pool_is_borrowed_not_closed(
+    async def test_external_grader_rebind_attaches_provenance_and_borrows_pool(
         self, tmp_path: Path, loguru_caplog
     ) -> None:
         from sieval.core.models import ChatModel
@@ -4817,6 +4831,7 @@ tasks:
             )
             assert external.pool not in session._owned_pools.values()
             assert TrackingChatModel.rebind_calls == 1
+            assert rebound.provenance_plan is not None
             session._stamp_deterministic_seed_contract()
             contract = session._reified_config[_DETERMINISTIC_SEED_CONTRACT_KEY]
             external_contract = contract["external_roles"]["judged.grader"]
@@ -4993,8 +5008,8 @@ tasks:
             assert first_rebound_plan is not first.runtime_plan
             assert second_rebound_plan is not second.runtime_plan
             assert first_rebound_plan.fingerprint != second_rebound_plan.fingerprint
-            first_source_provenance = first._provenance_plan
-            second_source_provenance = second._provenance_plan
+            first_source_provenance = first.provenance_plan
+            second_source_provenance = second.provenance_plan
             assert first_source_provenance is not None
             assert second_source_provenance is not None
             postlaunch = session.postlaunch_reconcile_result
@@ -5010,9 +5025,9 @@ tasks:
                     if "injected_reconciler" in evidence
                 ]
                 assert injected
-                assert source._provenance_plan is not None
+                assert source.provenance_plan is not None
                 assert any(
-                    source._provenance_plan.root_deployment_key in repr(evidence)
+                    source.provenance_plan.root_deployment_key in repr(evidence)
                     for evidence in injected
                 )
                 assert all(
@@ -5033,8 +5048,8 @@ tasks:
                 )
                 is None
             )
-            assert first_rebound._provenance_plan is not None
-            assert second_rebound._provenance_plan is not None
+            assert first_rebound.provenance_plan is not None
+            assert second_rebound.provenance_plan is not None
             assert first_evidence == second_evidence
             assert set(reconciler_roots) == {
                 first_source_provenance.root_deployment_key,
@@ -5499,13 +5514,41 @@ tasks:
             )
             with pytest.raises(
                 ValueError,
-                match="external provenance plan contains unresolved runtime identity",
+                match=(
+                    "external provenance plan contains runtime identity token.*"
+                    "semantic data"
+                ),
             ):
                 session._external_provenance_plan(
                     guarded_external,
                     leaked_result,
                     guarded_plan.binding_id,
                 )
+
+            semantic_recipe = {"note": f"user-data::{runtime_plan.binding_id}::literal"}
+            semantic_deployment_plan = dataclasses.replace(
+                deployment_plan,
+                recipe_parameters=semantic_recipe,
+            )
+            semantic_result = dataclasses.replace(
+                result,
+                deployment_plans={
+                    guarded_plan.root_deployment_key: semantic_deployment_plan
+                },
+            )
+            with pytest.raises(
+                ValueError,
+                match=(
+                    "external provenance plan contains runtime identity token.*"
+                    "semantic data"
+                ),
+            ):
+                session._external_provenance_plan(
+                    guarded_external,
+                    semantic_result,
+                    guarded_plan.binding_id,
+                )
+            assert semantic_deployment_plan.recipe_parameters == semantic_recipe
 
             assert (
                 changed_projected.verification_fingerprint
