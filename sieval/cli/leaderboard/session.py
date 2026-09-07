@@ -436,9 +436,8 @@ def _provenance_tokens_in(
                 visit(item)
             return
         if isinstance(current, Mapping):
-            # isinstance erases the type arguments; recover them rather than
-            # widen visit() to object, which would need an unreachable
-            # non-str key branch.
+            # isinstance erases the type arguments; widening visit() to object
+            # instead would need a non-str key branch that can never run.
             typed_mapping = cast(Mapping[str, JSONValue], current)
             for key, item in typed_mapping.items():
                 found.update(token for token in runtime_tokens if token in key)
@@ -464,9 +463,8 @@ def _reject_unprojected_provenance_tokens(
         )
 
 
-# Deliberately empty: no DeferredCheck field is projected.  Which verifier
-# executes, at which stage, and why must all reach persisted evidence
-# byte-for-byte, so a runtime token here fails loud instead of being rewritten.
+# Deliberately empty: no DeferredCheck field is projected, so a runtime token
+# in one fails loud instead of being rewritten.
 _EXTERNAL_PROVENANCE_PROJECTED_CHECK_FIELDS: frozenset[str] = frozenset()
 _EXTERNAL_PROVENANCE_SEMANTIC_CHECK_FIELDS = frozenset(
     {"capability", "stage", "verifier", "reason"}
@@ -582,11 +580,9 @@ def _reject_provenance_tokens_in_checks(
     checks: Iterable[DeferredCheck],
     runtime_tokens: frozenset[str],
 ) -> None:
-    """Reject volatile identity leakage in never-rewritten diagnostic text.
+    """Reject leaked identity in check text, which is never rewritten.
 
-    No :class:`DeferredCheck` field is projected: which verifier executes and
-    why must survive into persisted evidence byte-for-byte.  This only fails
-    loud, so callers pass their original tuple through unchanged.
+    Fails loud only, so callers pass their original tuple through unchanged.
     """
 
     for check in checks:
@@ -711,8 +707,8 @@ def _project_external_deployment_plan(
                     "external runtime plan evidence must contain string "
                     "plan_fingerprints"
                 )
-            # Lossless after the guard above, and it gives the checker the
-            # element type that isinstance cannot carry out of the list.
+            # Lossless after the guard above; carries the element type that
+            # isinstance cannot.
             typed_fingerprints = [
                 fingerprint
                 for fingerprint in plan_fingerprints

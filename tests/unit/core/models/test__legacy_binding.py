@@ -399,10 +399,7 @@ class TestLegacyBindingClient:
     ) -> None:
         """A stable quota scope does not license an arbitrary credential scope.
 
-        The stable-form arm returns ``None`` so a projected plan falls through
-        as non-legacy.  If it were reached with a credential scope this module
-        never mints, treating it as canonical would persist forged evidence
-        verbatim, so it must fail closed instead.
+        Falling through as canonical would persist forged evidence verbatim.
         """
 
         projected = _projected_plan()

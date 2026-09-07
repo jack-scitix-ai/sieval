@@ -1764,12 +1764,10 @@ class TestPrelaunchReconciliation:
             )
 
     def test_check_reason_leak_is_named_before_the_whole_plan_backstop(self) -> None:
-        """Pin the per-check rejection, not just the plan-wide one.
+        """Pin the per-check rejection, not the plan-wide backstop.
 
-        The whole-plan leak check at the end of the projection would also catch
-        a token in a check reason, so asserting only that *something* raises
-        passes with the per-check pass deleted.  The context string is what
-        distinguishes the layers, so that is what this asserts.
+        Both catch the same token, so matching the context string is the only
+        way to fail when the per-check pass is deleted.
         """
 
         runtime_token = "legacy-private:" + "b" * 32
@@ -1806,11 +1804,9 @@ class TestPrelaunchReconciliation:
     def test_projection_changes_only_the_fields_labelled_projected(self) -> None:
         """Make the PROJECTED/SEMANTIC labels load-bearing.
 
-        The completeness test above only proves every field was *named*; the
-        projection functions route fields by hand and never read these sets, so
-        a field could be labelled SEMANTIC while being rewritten (or the
-        reverse) with nothing failing.  This pins each label against what the
-        projection actually does.
+        The test above only proves every field was *named*.  The projection
+        functions route fields by hand and never read these sets, so a
+        mislabelled field would otherwise fail nothing.
         """
 
         for case in _projection_label_cases():
@@ -1828,8 +1824,7 @@ class TestPrelaunchReconciliation:
                 f"{case.label}: {sorted(changed & case.semantic_fields)} is "
                 "labelled semantic but was rewritten"
             )
-            # A label is only meaningful if the projection actually moved
-            # something, otherwise the assertions above hold vacuously.
+            # Without this the two assertions above hold vacuously.
             assert changed, f"{case.label}: projection changed nothing"
 
     def test_external_provenance_rejects_runtime_tokens_in_semantic_json(self) -> None:

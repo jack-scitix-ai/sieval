@@ -243,11 +243,9 @@ class TestModelUnique:
     ) -> None:
         """Pin the canonical-verbatim invariant inside the private constructor.
 
-        No current ``_initialize`` caller can pair ``provenance_projector=None``
-        with a differing provenance plan, so this drives the constructor
-        directly.  Unlike a schema check over fixed dataclass fields, this
-        branch is reachable by any future caller — and the callers grow with
-        each new binder — so the invariant is pinned rather than deleted.
+        No current caller can pair a null projector with a differing plan, so
+        this drives ``_initialize`` directly.  The branch is still reachable by
+        any future caller, so the invariant is pinned rather than deleted.
         """
 
         plan = gen_model.runtime_plan
@@ -278,8 +276,7 @@ class TestModelUnique:
         assert plan is not None
         assert gen_model.provenance_plan is not None
 
-        # A canonical model persists its runtime plan, so re-attaching it is a
-        # no-op that must not allocate a second model.
+        # Re-attaching what the model already persists must not allocate.
         rebound = Model.bind(gen_model.deployment, gen_model.pool, plan)
         assert rebound.provenance_plan is not None
         assert rebound.with_provenance_plan(rebound.provenance_plan) is rebound

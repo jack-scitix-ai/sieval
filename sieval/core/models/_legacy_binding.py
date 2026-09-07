@@ -420,9 +420,8 @@ def build_legacy_openai_binding(
         shared_limiter = local_limiter
 
     private_scope = uuid4().hex
-    # One derivation feeds both the volatile runtime identity and the stable
-    # provenance identity below, so the two can never disagree about whether
-    # the credential was explicit or environment-derived.
+    # Derived once for both the runtime identity and the stable provenance
+    # identity below, so the two cannot disagree.
     credential_kind: _LegacyCredentialKind = (
         "explicit-credential" if api_key is not None else "environment-credential"
     )
