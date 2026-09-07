@@ -13,7 +13,7 @@ import os
 import re
 import shlex
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -436,6 +436,9 @@ def _provenance_tokens_in(
                 visit(item)
             return
         if isinstance(current, Mapping):
+            # isinstance erases the type arguments; recover them rather than
+            # widen visit() to object, which would need an unreachable
+            # non-str key branch.
             typed_mapping = cast(Mapping[str, JSONValue], current)
             for key, item in typed_mapping.items():
                 found.update(token for token in runtime_tokens if token in key)
@@ -461,7 +464,10 @@ def _reject_unprojected_provenance_tokens(
         )
 
 
-_EXTERNAL_PROVENANCE_PROJECTED_CHECK_FIELDS = frozenset()
+# Deliberately empty: no DeferredCheck field is projected.  Which verifier
+# executes, at which stage, and why must all reach persisted evidence
+# byte-for-byte, so a runtime token here fails loud instead of being rewritten.
+_EXTERNAL_PROVENANCE_PROJECTED_CHECK_FIELDS: frozenset[str] = frozenset()
 _EXTERNAL_PROVENANCE_SEMANTIC_CHECK_FIELDS = frozenset(
     {"capability", "stage", "verifier", "reason"}
 )
@@ -572,18 +578,23 @@ _EXTERNAL_PROVENANCE_POLICIES = (
 )
 
 
-def _project_provenance_check(
-    check: DeferredCheck,
+def _reject_provenance_tokens_in_checks(
+    checks: Iterable[DeferredCheck],
     runtime_tokens: frozenset[str],
-) -> DeferredCheck:
-    """Preserve diagnostic text and reject volatile identity leakage."""
+) -> None:
+    """Reject volatile identity leakage in never-rewritten diagnostic text.
 
-    _reject_unprojected_provenance_tokens(
-        check.reason,
-        runtime_tokens,
-        context="external provenance check reason",
-    )
-    return check
+    No :class:`DeferredCheck` field is projected: which verifier executes and
+    why must survive into persisted evidence byte-for-byte.  This only fails
+    loud, so callers pass their original tuple through unchanged.
+    """
+
+    for check in checks:
+        _reject_unprojected_provenance_tokens(
+            check.reason,
+            runtime_tokens,
+            context="external provenance check reason",
+        )
 
 
 def _project_provenance_requirement(
@@ -592,7 +603,7 @@ def _project_provenance_requirement(
     runtime_tokens: frozenset[str],
 ) -> ServingRequirement:
     _reject_unprojected_provenance_tokens(
-        cast(JSONValue, requirement.minimums),
+        requirement.minimums,
         runtime_tokens,
         context="external provenance serving minimums",
     )
@@ -619,7 +630,7 @@ def _project_provenance_intent(
     """Project diagnostic sources without changing the requested capability."""
 
     _reject_unprojected_provenance_tokens(
-        cast(JSONValue, intent.minimums),
+        intent.minimums,
         runtime_tokens,
         context="external provenance intent minimums",
     )
@@ -671,7 +682,7 @@ def _project_external_binding_plan(
         connection_scope=connection_scope,
     )
     _reject_unprojected_provenance_tokens(
-        cast(JSONValue, projected.to_json_value()),
+        projected.to_json_value(),
         runtime_tokens,
         context="external provenance binding plan",
     )
@@ -693,14 +704,20 @@ def _project_external_deployment_plan(
         plan_fingerprints = evidence.get("plan_fingerprints")
         projected_evidence: dict[str, JSONValue] = dict(evidence)
         if evidence.get("source") == "external_runtime_plans":
-            if not isinstance(plan_fingerprints, list) or not all(
-                isinstance(fingerprint, str) for fingerprint in plan_fingerprints
+            if not isinstance(plan_fingerprints, list) or any(
+                not isinstance(fingerprint, str) for fingerprint in plan_fingerprints
             ):
                 raise TypeError(
                     "external runtime plan evidence must contain string "
                     "plan_fingerprints"
                 )
-            typed_fingerprints = cast(list[str], plan_fingerprints)
+            # Lossless after the guard above, and it gives the checker the
+            # element type that isinstance cannot carry out of the list.
+            typed_fingerprints = [
+                fingerprint
+                for fingerprint in plan_fingerprints
+                if isinstance(fingerprint, str)
+            ]
             missing = sorted(set(typed_fingerprints) - runtime_to_provenance.keys())
             if missing:
                 raise ValueError(
@@ -712,6 +729,8 @@ def _project_external_deployment_plan(
             )
         outcome_evidence[capability] = projected_evidence
 
+    _reject_provenance_tokens_in_checks(plan.setup_checks, runtime_tokens)
+    _reject_provenance_tokens_in_checks(plan.request_checks, runtime_tokens)
     projected_plan = dataclasses.replace(
         plan,
         root_deployment_key=root_deployment_key,
@@ -723,18 +742,10 @@ def _project_external_deployment_plan(
             )
             for requirement in plan.serving_requirements
         ),
-        setup_checks=tuple(
-            _project_provenance_check(check, runtime_tokens)
-            for check in plan.setup_checks
-        ),
-        request_checks=tuple(
-            _project_provenance_check(check, runtime_tokens)
-            for check in plan.request_checks
-        ),
         outcome_evidence=outcome_evidence,
     )
     _reject_unprojected_provenance_tokens(
-        cast(JSONValue, projected_plan.to_json_value()),
+        projected_plan.to_json_value(),
         runtime_tokens,
         context="external provenance plan",
     )
@@ -2484,20 +2495,20 @@ class EvalSession:
             runtime_to_provenance=runtime_to_provenance,
             runtime_tokens=frozenset(runtime_tokens),
         )
+        _reject_provenance_tokens_in_checks(
+            runtime_plan.request_checks,
+            frozenset(runtime_tokens),
+        )
         provenance_plan = dataclasses.replace(
             runtime_plan,
             binding_id=baseline.binding_id,
             root_deployment_key=baseline.root_deployment_key,
-            request_checks=tuple(
-                _project_provenance_check(check, frozenset(runtime_tokens))
-                for check in runtime_plan.request_checks
-            ),
             connection_identity=baseline.connection_identity,
             binding_plan_fingerprint=provenance_binding_plan.fingerprint,
             deployment_plan_fingerprint=provenance_deployment_plan.fingerprint,
         )
         _reject_unprojected_provenance_tokens(
-            cast(JSONValue, provenance_plan.to_json_value()),
+            provenance_plan.to_json_value(),
             frozenset(runtime_tokens),
             context="external provenance plan",
         )

@@ -420,14 +420,16 @@ def build_legacy_openai_binding(
         shared_limiter = local_limiter
 
     private_scope = uuid4().hex
+    # One derivation feeds both the volatile runtime identity and the stable
+    # provenance identity below, so the two can never disagree about whether
+    # the credential was explicit or environment-derived.
+    credential_kind: _LegacyCredentialKind = (
+        "explicit-credential" if api_key is not None else "environment-credential"
+    )
     identity = ConnectionIdentity(
         endpoint=endpoint,
         connection_family="openai_sdk",
-        credential_scope=(
-            f"legacy-private:{private_scope}:explicit-credential"
-            if api_key is not None
-            else f"legacy-private:{private_scope}:environment-credential"
-        ),
+        credential_scope=f"legacy-private:{private_scope}:{credential_kind}",
         retry_policy=f"openai-sdk:max-retries={max_retries}",
         quota_scope=f"legacy-private:{private_scope}",
     )
@@ -454,9 +456,6 @@ def build_legacy_openai_binding(
     # accident.  Persisted provenance records the same semantic binding with
     # only a credential category and a stable private-pool scope, so object
     # allocation does not make equivalent run artifacts differ.
-    credential_kind: _LegacyCredentialKind = (
-        "explicit-credential" if api_key is not None else "environment-credential"
-    )
     provenance_identity = _legacy_stable_connection_identity(
         identity,
         credential_kind,

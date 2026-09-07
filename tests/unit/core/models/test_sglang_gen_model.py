@@ -36,8 +36,29 @@ from sieval.core.models import (
     SglangGenModel,
     ToolParams,
 )
+from sieval.core.models._legacy_binding import build_legacy_openai_binding
 from sieval.core.models.dialect import RequestAuditError
+from sieval.core.models.reconcile import RuntimeBindingPlan
 from sieval.core.models.transports.sglang import SglangTransport
+
+
+def _a_runtime_plan() -> RuntimeBindingPlan:
+    """Build a genuine plan without opening a client, for refusal tests."""
+
+    client = SimpleNamespace(base_url="https://legacy.example/v1/", close=AsyncMock())
+    with patch(
+        "sieval.core.models._legacy_binding.AsyncOpenAI",
+        return_value=client,
+    ):
+        return build_legacy_openai_binding(
+            dialect_id="openai_completions",
+            model="m",
+            api_base="https://legacy.example/v1",
+            api_key="sk-test",
+            max_retries=2,
+            concurrency_limit=None,
+            parent_limiter=None,
+        ).runtime_plan
 
 
 class TestDefaultTransport:
@@ -126,13 +147,15 @@ class TestDefaultTransport:
 
     def test_legacy_facade_cannot_rebind_or_lose_its_owner(self):
         model = SglangGenModel(model="m", api_key="local")
+        # A real plan, so the refusal is not an artifact of a bogus argument.
+        plan = _a_runtime_plan()
 
         assert model.runtime_plan is None
         assert model.provenance_plan is None
         with pytest.raises(RuntimeError, match="cannot rebind"):
-            model.with_dialect("sglang_native", object())
+            model.with_dialect("sglang_native", plan)
         with pytest.raises(RuntimeError, match="no runtime plan for provenance"):
-            model.with_provenance_plan(object())
+            model.with_provenance_plan(plan)
         model._lifecycle_owner = None
         with pytest.raises(RuntimeError, match="no lifecycle owner"):
             model._legacy_lifecycle_owner()
