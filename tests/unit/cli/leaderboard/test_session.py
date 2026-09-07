@@ -22,7 +22,15 @@ import yaml
 from sieval.cli._filter_spec import VALUES_DIGEST_KEY, compute_values_digest
 from sieval.cli.leaderboard.session import (
     _DETERMINISTIC_SEED_CONTRACT_KEY,
+    _EXTERNAL_PROVENANCE_COMPUTED_BINDING_PLAN_FIELDS,
     _EXTERNAL_PROVENANCE_POLICIES,
+    _EXTERNAL_PROVENANCE_PROJECTED_BINDING_PLAN_FIELDS,
+    _EXTERNAL_PROVENANCE_PROJECTED_INTENT_FIELDS,
+    _EXTERNAL_PROVENANCE_PROJECTED_REQUIREMENT_FIELDS,
+    _EXTERNAL_PROVENANCE_SEMANTIC_BINDING_PLAN_FIELDS,
+    _EXTERNAL_PROVENANCE_SEMANTIC_INTENT_FIELDS,
+    _EXTERNAL_PROVENANCE_SEMANTIC_REQUIREMENT_FIELDS,
+    _EXTERNAL_PROVENANCE_SPECIAL_BINDING_PLAN_FIELDS,
     _NONMATCH_KEYS_STRIPPED_IN_BLOCKS,
     _NONMATCH_RUNNER_KEYS,
     _STRICT_RUNNER_KEYS,
@@ -40,6 +48,10 @@ from sieval.cli.leaderboard.session import (
     _diff_key_shape,
     _diff_lines,
     _format_comment_header,
+    _project_external_binding_plan,
+    _project_external_deployment_plan,
+    _project_provenance_intent,
+    _project_provenance_requirement,
     _reify_cli_overrides,
     _reject_unprojected_provenance_tokens,
     _replace_provenance_reference_text,
@@ -55,14 +67,20 @@ from sieval.cli.leaderboard.session import (
 )
 from sieval.cli.resolution import derive_model_type
 from sieval.cli.validation import _VALID_OPERATIONS
+from sieval.core.models.capabilities import CapabilityIntent, RequestDefaults
 from sieval.core.models.connection_factory import DEFAULT_REQUEST_TIMEOUT
+from sieval.core.models.deployment import RouteIntent
 from sieval.core.models.dialect_registry import RequestSeedSupport
 from sieval.core.models.model import Model
 from sieval.core.models.reconcile import (
+    BindingCapabilityPlan,
     CannotVerify,
     CheckStage,
     Configured,
+    ConnectionScope,
     DeferredCheck,
+    DeploymentCapabilityPlan,
+    ServingRequirement,
 )
 from sieval.core.models.requirements import (
     AggregatedTaskRequirements,
@@ -1634,6 +1652,105 @@ class TestSetupDatasetsErrors:
         assert "mock_ds" in runner.datasets
 
 
+@dataclasses.dataclass(frozen=True)
+class _ProjectionLabelCase:
+    """One record put through its real projection, with its declared labels."""
+
+    label: str
+    original: ServingRequirement | CapabilityIntent | BindingCapabilityPlan
+    projected: ServingRequirement | CapabilityIntent | BindingCapabilityPlan
+    projected_fields: frozenset[str]
+    semantic_fields: frozenset[str]
+    special_fields: frozenset[str] = frozenset()
+
+
+def _projection_label_cases() -> tuple[_ProjectionLabelCase, ...]:
+    """Drive each pure projection function once with a rewritable token."""
+
+    runtime_token = "legacy-private:" + "a" * 32
+    replacements = {runtime_token: "legacy-private"}
+    runtime_tokens = frozenset({runtime_token})
+
+    requirement = ServingRequirement(
+        capability="reasoning",
+        minimums={"depth": 1},
+        sources=(f"binding {runtime_token}",),
+        verifier="external_runtime_plan",
+        reason="guarded by the response contract",
+    )
+    intent = CapabilityIntent(
+        key="reasoning",
+        required=True,
+        minimums={"depth": 1},
+        sources=(f"binding {runtime_token}",),
+    )
+    binding_plan = BindingCapabilityPlan(
+        binding_id=f"binding:{runtime_token}",
+        root_deployment_key=f"root:{runtime_token}",
+        requested_model_id="m",
+        dialect_id="openai_chat",
+        declared_capabilities={},
+        intents={"reasoning": intent},
+        required_capabilities=frozenset({"reasoning"}),
+        available_capabilities=frozenset({"reasoning"}),
+        pending_capabilities=frozenset(),
+        unavailable_capabilities={},
+        capability_minimums={},
+        request_defaults=RequestDefaults(),
+        output_channels=frozenset({"text"}),
+        required_output_channels=frozenset(),
+        serving_requirements=(requirement,),
+        route_intent=RouteIntent(),
+        connection_scope=ConnectionScope(
+            credential_scope=f"{runtime_token}:explicit-credential",
+            retry_policy="openai-sdk:max-retries=4",
+            quota_scope=runtime_token,
+        ),
+    )
+    stable_scope = ConnectionScope(
+        credential_scope="legacy-private:explicit-credential",
+        retry_policy="openai-sdk:max-retries=4",
+        quota_scope="legacy-private",
+    )
+
+    return (
+        _ProjectionLabelCase(
+            label="ServingRequirement",
+            original=requirement,
+            projected=_project_provenance_requirement(
+                requirement, replacements, runtime_tokens
+            ),
+            projected_fields=_EXTERNAL_PROVENANCE_PROJECTED_REQUIREMENT_FIELDS,
+            semantic_fields=_EXTERNAL_PROVENANCE_SEMANTIC_REQUIREMENT_FIELDS,
+        ),
+        _ProjectionLabelCase(
+            label="CapabilityIntent",
+            original=intent,
+            projected=_project_provenance_intent(intent, replacements, runtime_tokens),
+            projected_fields=_EXTERNAL_PROVENANCE_PROJECTED_INTENT_FIELDS,
+            semantic_fields=_EXTERNAL_PROVENANCE_SEMANTIC_INTENT_FIELDS,
+        ),
+        _ProjectionLabelCase(
+            label="BindingCapabilityPlan",
+            original=binding_plan,
+            projected=_project_external_binding_plan(
+                binding_plan,
+                binding_id="binding:legacy-private",
+                root_deployment_key="root:legacy-private",
+                connection_scope=stable_scope,
+                replacements=replacements,
+                runtime_tokens=runtime_tokens,
+            ),
+            projected_fields=_EXTERNAL_PROVENANCE_PROJECTED_BINDING_PLAN_FIELDS,
+            semantic_fields=_EXTERNAL_PROVENANCE_SEMANTIC_BINDING_PLAN_FIELDS,
+            special_fields=(
+                _EXTERNAL_PROVENANCE_SPECIAL_BINDING_PLAN_FIELDS
+                | _EXTERNAL_PROVENANCE_COMPUTED_BINDING_PLAN_FIELDS
+            ),
+        ),
+    )
+
+
 # ===================================================================
 # RFC #25 pre-launch requirement composition and reconciliation
 # ===================================================================
@@ -1645,6 +1762,75 @@ class TestPrelaunchReconciliation:
             assert {item.name for item in dataclasses.fields(record_type)} == (
                 classified_fields
             )
+
+    def test_check_reason_leak_is_named_before_the_whole_plan_backstop(self) -> None:
+        """Pin the per-check rejection, not just the plan-wide one.
+
+        The whole-plan leak check at the end of the projection would also catch
+        a token in a check reason, so asserting only that *something* raises
+        passes with the per-check pass deleted.  The context string is what
+        distinguishes the layers, so that is what this asserts.
+        """
+
+        runtime_token = "legacy-private:" + "b" * 32
+        plan = DeploymentCapabilityPlan(
+            root_deployment_key=f"root:{runtime_token}",
+            engine_id="vllm",
+            desired_plan_fingerprint=None,
+            recipe_parameters={},
+            explicit_parameters={},
+            serving_requirements=(),
+            launch_patch={},
+            setup_checks=(
+                DeferredCheck(
+                    "reasoning",
+                    CheckStage.SETUP,
+                    "external_runtime_plan",
+                    f"guarded for {runtime_token}",
+                ),
+            ),
+            request_checks=(),
+            outcome_kinds={},
+            outcome_evidence={},
+        )
+
+        with pytest.raises(ValueError, match="external provenance check reason"):
+            _project_external_deployment_plan(
+                plan,
+                root_deployment_key="root:legacy-private",
+                replacements={runtime_token: "legacy-private"},
+                runtime_to_provenance={},
+                runtime_tokens=frozenset({runtime_token}),
+            )
+
+    def test_projection_changes_only_the_fields_labelled_projected(self) -> None:
+        """Make the PROJECTED/SEMANTIC labels load-bearing.
+
+        The completeness test above only proves every field was *named*; the
+        projection functions route fields by hand and never read these sets, so
+        a field could be labelled SEMANTIC while being rewritten (or the
+        reverse) with nothing failing.  This pins each label against what the
+        projection actually does.
+        """
+
+        for case in _projection_label_cases():
+            before = case.original.to_json_value()
+            after = case.projected.to_json_value()
+            changed = {
+                name for name in before if before[name] != after.get(name, object())
+            }
+            rewritable = case.projected_fields | case.special_fields
+            assert changed <= rewritable, (
+                f"{case.label}: {sorted(changed - rewritable)} changed but is "
+                "not labelled projected/special"
+            )
+            assert not (changed & case.semantic_fields), (
+                f"{case.label}: {sorted(changed & case.semantic_fields)} is "
+                "labelled semantic but was rewritten"
+            )
+            # A label is only meaningful if the projection actually moved
+            # something, otherwise the assertions above hold vacuously.
+            assert changed, f"{case.label}: projection changed nothing"
 
     def test_external_provenance_rejects_runtime_tokens_in_semantic_json(self) -> None:
         original = {

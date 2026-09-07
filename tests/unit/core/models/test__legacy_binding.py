@@ -10,11 +10,43 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from sieval.core.models._legacy_binding import (
     _legacy_provenance_projector_for_plan,
+    _LegacyOpenAIBinding,
     build_legacy_openai_binding,
 )
 from sieval.core.models.connection_factory import DEFAULT_REQUEST_TIMEOUT
+from sieval.core.models.reconcile import RuntimeBindingPlan
+
+
+def _a_binding(*, api_key: str | None = "sk-runtime-only") -> _LegacyOpenAIBinding:
+    """Build a wrapper binding without opening a client."""
+
+    client = SimpleNamespace(base_url="https://legacy.example/v1/", close=AsyncMock())
+    with patch(
+        "sieval.core.models._legacy_binding.AsyncOpenAI",
+        return_value=client,
+    ):
+        return build_legacy_openai_binding(
+            dialect_id="openai_chat",
+            model="m",
+            api_base="https://legacy.example/v1",
+            api_key=api_key,
+            max_retries=4,
+            concurrency_limit=None,
+            parent_limiter=None,
+        )
+
+
+def _projected_plan() -> RuntimeBindingPlan:
+    """Return the stable provenance plan a wrapper persists."""
+
+    binding = _a_binding()
+    projected = binding.provenance_projector(binding.runtime_plan)
+    assert projected is not None
+    return projected
 
 
 class TestLegacyBindingClient:
@@ -361,3 +393,72 @@ class TestLegacyBindingClient:
         projected = binding.provenance_projector(binding.runtime_plan)
         assert projected is not None
         assert _legacy_provenance_projector_for_plan(projected) is None
+
+    def test_projected_plan_with_a_tampered_credential_scope_fails_closed(
+        self,
+    ) -> None:
+        """A stable quota scope does not license an arbitrary credential scope.
+
+        The stable-form arm returns ``None`` so a projected plan falls through
+        as non-legacy.  If it were reached with a credential scope this module
+        never mints, treating it as canonical would persist forged evidence
+        verbatim, so it must fail closed instead.
+        """
+
+        projected = _projected_plan()
+        forged = replace(
+            projected,
+            connection_identity=replace(
+                projected.connection_identity,
+                credential_scope="legacy-private:forged-credential",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="invalid credential scope"):
+            _legacy_provenance_projector_for_plan(forged)
+
+    def test_legacy_credential_scope_without_a_legacy_quota_scope_fails_closed(
+        self,
+    ) -> None:
+        """A half-legacy identity is malformed, not canonical."""
+
+        plan = _a_binding().runtime_plan
+        mismatched = replace(
+            plan,
+            connection_identity=replace(
+                plan.connection_identity,
+                quota_scope="shared-pool",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="invalid quota scope"):
+            _legacy_provenance_projector_for_plan(mismatched)
+
+    def test_recovery_rejects_a_plan_whose_binding_identity_was_rewritten(
+        self,
+    ) -> None:
+        """Recovery re-derives the binding id and will not adopt a foreign one."""
+
+        plan = _a_binding().runtime_plan
+        rewritten = replace(plan, binding_id="legacy:someone-elses:binding:0000")
+
+        with pytest.raises(ValueError, match="inconsistent binding identity"):
+            _legacy_provenance_projector_for_plan(rewritten)
+
+    def test_environment_credential_plans_recover_their_stable_identity(self) -> None:
+        """The environment-credential category survives a ``Model.bind`` round-trip."""
+
+        binding = _a_binding(api_key=None)
+        runtime_scope = binding.runtime_plan.connection_identity.credential_scope
+        assert runtime_scope.endswith(":environment-credential")
+
+        projector = _legacy_provenance_projector_for_plan(binding.runtime_plan)
+        assert projector is not None
+        assert (
+            projector.connection_identity.credential_scope
+            == "legacy-private:environment-credential"
+        )
+        # Recovery must land on exactly what the constructor already built.
+        assert projector.connection_identity == (
+            binding.provenance_projector.connection_identity
+        )
