@@ -1140,8 +1140,9 @@ def _opaque_history_bundle(
             encrypted = payload.get("encrypted_content")
             if not isinstance(encrypted, str) or not encrypted:
                 return None
-            saw_reasoning = True
         history.append(payload)
+    # Guaranteed by the returns above: the bundle holds a reasoning item with
+    # encrypted_content, which _decode_opaque_continuation requires next hop.
     return json.dumps(
         {"version": _OPAQUE_CONTINUATION_VERSION, "items": history},
         ensure_ascii=False,
@@ -1657,7 +1658,11 @@ class OpenAIResponsesDialect:
                 audit.rejected(path, "Responses JSON schema names must not be empty")
             elif path.startswith("dialect_options."):
                 key = path.removeprefix("dialect_options.")
-                if key == "conversation":
+                if not key:
+                    # ``finish`` refuses this too, but without the request path;
+                    # reject at admission like the other OpenAI dialects.
+                    audit.rejected(path, "dialect option keys must be non-empty")
+                elif key == "conversation":
                     audit.rejected(
                         path,
                         "Responses conversation state is not yet modeled by the "
@@ -1886,7 +1891,9 @@ class OpenAIResponsesDialect:
         finish_reason = _finish_reason(raw)
         response_id = _required_string(_get(raw, "id"), "response.id")
         reported_store = _get(raw, "store", _MISSING)
-        if reported_store is _MISSING:
+        # A compliant reply omits ``store``; a partially compatible endpoint may
+        # echo an explicit null. Treat that as unreported, not a type violation.
+        if reported_store is _MISSING or reported_store is None:
             response_is_stored = context.requested_store
         else:
             if not isinstance(reported_store, bool):

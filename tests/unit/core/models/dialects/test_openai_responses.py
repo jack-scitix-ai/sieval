@@ -36,6 +36,7 @@ from sieval.core.models.dialect import (
     DialectError,
     OutputContractError,
     PreparedRequest,
+    Rejected,
     RequestAudit,
     RequestAuditError,
     active_request_leaves,
@@ -2033,6 +2034,13 @@ class TestPreflightRejections:
                 ),
                 "store must be a boolean",
             ),
+            (
+                Request(
+                    input=_chat(),
+                    dialect_options=DialectOptions("openai_responses", {"": 1}),
+                ),
+                "dialect option keys must be non-empty",
+            ),
         ],
     )
     async def test_every_request_rejection_happens_before_io(
@@ -2046,6 +2054,26 @@ class TestPreflightRejections:
             await dialect.arun(model_request)
 
         create.assert_not_awaited()
+
+    def test_empty_option_key_is_rejected_during_validation(self) -> None:
+        """Pin *which* layer rejects, not merely that something does.
+
+        ``finish`` is a backstop with identical wording, so matching only the
+        message still passes with this dialect's check deleted.
+        """
+
+        dialect, _ = _dialect()
+        model_request = Request(
+            input=_chat(),
+            dialect_options=DialectOptions("openai_responses", {"": 1}),
+        )
+        audit = RequestAudit(active_request_leaves(model_request))
+
+        dialect.validate_request(model_request, audit, SimpleNamespace())
+
+        decision = audit.decisions["dialect_options."]
+        assert isinstance(decision, Rejected)
+        assert "non-empty" in decision.reason
 
     @pytest.mark.anyio
     @pytest.mark.parametrize("option_key", _RESPONSES_IR_OWNED_OPTIONS)
@@ -2465,6 +2493,43 @@ class TestResponseLifting:
             OutputContractError, match="response.store must be a boolean"
         ):
             await dialect.arun(Request(input=_chat()))
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("options", "expected_session_id"),
+        [
+            pytest.param(None, "resp_1", id="implicit-store-true"),
+            pytest.param({"store": False}, None, id="explicit-store-false"),
+            pytest.param({"store": True}, "resp_1", id="explicit-store-true"),
+        ],
+    )
+    async def test_explicit_null_store_is_treated_as_unreported(
+        self,
+        options: dict[str, JSONValue] | None,
+        expected_session_id: str | None,
+    ) -> None:
+        """A partially compatible endpoint may echo ``store`` as a JSON null.
+
+        ``None`` is not the ``_MISSING`` sentinel, so without the null check
+        every reply from such an endpoint fails the boolean guard.
+        """
+
+        raw = _response()
+        raw.store = None
+        dialect, _ = _dialect(raw)
+
+        response = await dialect.arun(
+            Request(
+                input=_chat(),
+                dialect_options=(
+                    None
+                    if options is None
+                    else DialectOptions("openai_responses", options)
+                ),
+            )
+        )
+
+        assert response.session_id == expected_session_id
 
     @pytest.mark.anyio
     async def test_store_false_falls_back_to_request_when_response_omits_it(
