@@ -1001,6 +1001,16 @@ class TestWireTranslation:
             response_payload = _sdk_response_payload()
             response_payload["id"] = f"resp_{len(requests)}"
             response_payload["store"] = False
+            response_output = cast(list[dict[str, Any]], response_payload["output"])
+            message_content = cast(list[dict[str, Any]], response_output[1]["content"])
+            message_content[0]["logprobs"] = [
+                {
+                    "bytes": [65],
+                    "logprob": -0.1,
+                    "token": "A",
+                    "top_logprobs": [],
+                }
+            ]
             return httpx.Response(200, json=response_payload)
 
         http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -1050,6 +1060,14 @@ class TestWireTranslation:
         ]
         assert requests[1]["input"][0]["content"] == "hello"
         assert requests[1]["input"][3]["content"] == "next"
+        assert requests[1]["input"][2]["content"][0]["logprobs"] == [
+            {
+                "bytes": [65],
+                "logprob": -0.1,
+                "token": "A",
+                "top_logprobs": [],
+            }
+        ]
 
     @pytest.mark.anyio
     async def test_json_object_format_and_flat_function_tool_are_lowered(self) -> None:
@@ -2713,11 +2731,11 @@ class TestResponseLifting:
             (_reasoning(summary=""),),
             (
                 _reasoning("rs_raw", summary=None, content="raw reasoning"),
-                _reasoning("rs_summary", summary="visible summary"),
+                _reasoning("rs_empty", summary=""),
             ),
         ],
     )
-    async def test_requested_reasoning_summary_must_exist_on_every_item(
+    async def test_requested_reasoning_summary_requires_one_nonempty_summary(
         self, reasoning_items: tuple[object, ...]
     ) -> None:
         dialect, _ = _dialect(_response(*reasoning_items, _message()))
@@ -2729,6 +2747,29 @@ class TestResponseLifting:
                     reasoning=ReasoningParams(summary="detailed"),
                 )
             )
+
+    @pytest.mark.anyio
+    async def test_requested_reasoning_summary_is_response_level(self) -> None:
+        dialect, _ = _dialect(
+            _response(
+                _reasoning("rs_first", summary="first summary"),
+                _reasoning("rs_raw", summary=None, content="raw reasoning"),
+                _reasoning("rs_empty", summary=""),
+                _reasoning("rs_second", summary="second summary"),
+                _message(),
+            )
+        )
+
+        response = await dialect.arun(
+            Request(
+                input=_chat(),
+                reasoning=ReasoningParams(summary="detailed"),
+            )
+        )
+
+        assert response.reasoning is not None
+        assert response.reasoning[0] is not None
+        assert response.reasoning[0].text == "first summary\nsecond summary"
 
     @pytest.mark.anyio
     async def test_missing_encrypted_reasoning_is_not_advertised_as_opaque(
@@ -2837,7 +2878,7 @@ class TestResponseLifting:
                 ),
                 "server_error.*boom",
             ),
-            (_response(status="cancelled"), "non-terminal status"),
+            (_response(status="cancelled"), "unsupported terminal status"),
             (
                 _response(status="completed", error=SimpleNamespace(code="x")),
                 "completed.*error",
@@ -3071,10 +3112,10 @@ class TestResponseLifting:
         assert response.reasoning[0].text == "visible"
 
     @pytest.mark.anyio
-    async def test_missing_requested_channel_fails_output_contract(self) -> None:
+    async def test_missing_requested_reasoning_summary_fails_loudly(self) -> None:
         dialect, _ = _dialect(_response())
 
-        with pytest.raises(OutputContractError, match="required.*reasoning"):
+        with pytest.raises(OutputContractError, match="requested visible reasoning"):
             await dialect.arun(
                 Request(
                     input=_chat(),

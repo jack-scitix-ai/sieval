@@ -81,6 +81,12 @@ _SUPPORTED_IMAGE_MEDIA_TYPES = frozenset(
 )
 _SUPPORTED_IMAGE_DETAILS = frozenset({"auto", "high", "low", "original"})
 _OPAQUE_CONTINUATION_VERSION = 2
+
+# Keep the accepted wire vocabulary local instead of deriving it from the SDK.
+# AsyncOpenAI uses lenient response construction by default, so an unknown
+# provider shape can be coerced into a known SDK model instead of being rejected;
+# opaque continuation replay bypasses SDK parsing entirely.  Value-identical
+# sets below remain separate because they mirror independent upstream enums.
 _REASONING_ITEM_KEYS = frozenset(
     {"type", "id", "summary", "content", "encrypted_content", "status"}
 )
@@ -789,6 +795,12 @@ def _verification_image(part: ImagePart) -> dict[str, JSONValue]:
 
 
 def _verification_message_items(message: ChatMessage) -> list[dict[str, JSONValue]]:
+    """Independently derive the expected wire items for audit verification.
+
+    Do not reuse ``_message_to_input_items`` here: the verifier must detect
+    lowering drift rather than reproduce it through the same implementation.
+    """
+
     results = [part for part in message.content if isinstance(part, ToolResultPart)]
     if results:
         result = results[0]
@@ -1105,7 +1117,9 @@ def _opaque_history_bundle(
     OpenAI's stateless contract requires replaying the exact prior input and
     every output item in order.  A request chained through
     ``previous_response_id`` has hidden server-side history, so no faithful
-    standalone continuation can be constructed for that response.
+    standalone continuation can be constructed for that response.  Output
+    message logprobs remain part of that history because Responses accepts its
+    output-message shape as input and manual replay must preserve items intact.
     """
 
     if has_hidden_previous_response:
@@ -1241,6 +1255,10 @@ def _finish_reason(raw: object) -> str:
             "Responses request failed"
             + (f" ({code})" if isinstance(code, str) and code else "")
             + (f": {message}" if isinstance(message, str) and message else "")
+        )
+    if status == "cancelled":
+        raise OutputContractError(
+            "Responses reply has unsupported terminal status 'cancelled'"
         )
     raise OutputContractError(f"Responses reply has non-terminal status {status!r}")
 
@@ -1886,6 +1904,7 @@ class OpenAIResponsesDialect:
             None,
             "none",
         }
+        saw_reasoning_summary = False
         tool_calls: list[FunctionToolCall] = []
         server_uses: list[ServerToolUse] = []
         citations: list[Citation] = []
@@ -1941,11 +1960,10 @@ class OpenAIResponsesDialect:
                 _validate_terminal_item_status(item, path)
                 reasoning_payloads.append(_reasoning_payload(item, item_index))
                 text, is_summary = _visible_reasoning_text(item, path)
-                if requested_reasoning_summary and (not is_summary or not text):
-                    raise OutputContractError(
-                        f"{path} omitted the requested visible reasoning summary"
-                    )
-                if text:
+                if is_summary and text:
+                    saw_reasoning_summary = True
+                    reasoning_texts.append(text)
+                elif not requested_reasoning_summary and text:
                     reasoning_texts.append(text)
             elif item_type == "web_search_call":
                 server_uses.append(_web_search_use(item, path))
@@ -1953,6 +1971,11 @@ class OpenAIResponsesDialect:
                 raise OutputContractError(
                     f"Responses output item type {item_type!r} has no IR mapping"
                 )
+
+        if requested_reasoning_summary and not saw_reasoning_summary:
+            raise OutputContractError(
+                "Responses reply omitted the requested visible reasoning summary"
+            )
 
         text = "".join(text_parts)
         opaque_history = _opaque_history_bundle(
