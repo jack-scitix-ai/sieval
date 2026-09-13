@@ -701,6 +701,8 @@ def _call_state_from_contents(
 ) -> tuple[dict[str, str], set[str]]:
     names: dict[str, str] = {}
     answered: set[str] = set()
+    server_types: dict[str, str] = {}
+    answered_server_calls: set[str] = set()
     for content_index, content in enumerate(contents):
         parts = content.get("parts")
         if not isinstance(parts, list):
@@ -724,28 +726,71 @@ def _call_state_from_contents(
                     raise DialectError(f"duplicate Google function call id {call_id!r}")
                 names[call_id] = name
             response = part.get("functionResponse")
-            if not isinstance(response, dict):
+            if isinstance(response, dict):
+                call_id = response.get("id")
+                name = response.get("name")
+                if not isinstance(call_id, str) or not call_id:
+                    raise DialectError(
+                        "Google opaque functionResponse requires a non-empty id"
+                    )
+                try:
+                    expected_name = names[call_id]
+                except KeyError as exc:
+                    raise DialectError(
+                        "Google opaque functionResponse at "
+                        f"{content_index}.{part_index} has no prior functionCall"
+                    ) from exc
+                if name != expected_name:
+                    raise DialectError(
+                        f"Google opaque functionResponse name changed for {call_id!r}"
+                    )
+                if call_id in answered:
+                    raise DialectError(
+                        f"duplicate Google function result for {call_id!r}"
+                    )
+                answered.add(call_id)
+            server_call = part.get("toolCall")
+            if isinstance(server_call, dict):
+                call_id = server_call.get("id")
+                tool_type = server_call.get("toolType")
+                if not isinstance(call_id, str) or not call_id:
+                    raise DialectError("Google opaque toolCall requires a non-empty id")
+                if not isinstance(tool_type, str) or not tool_type:
+                    raise DialectError(
+                        "Google opaque toolCall requires a non-empty toolType"
+                    )
+                if call_id in server_types:
+                    raise DialectError(
+                        f"duplicate Google server tool call id {call_id!r}"
+                    )
+                server_types[call_id] = tool_type
+            server_response = part.get("toolResponse")
+            if not isinstance(server_response, dict):
                 continue
-            call_id = response.get("id")
-            name = response.get("name")
+            call_id = server_response.get("id")
+            tool_type = server_response.get("toolType")
             if not isinstance(call_id, str) or not call_id:
+                raise DialectError("Google opaque toolResponse requires a non-empty id")
+            if not isinstance(tool_type, str) or not tool_type:
                 raise DialectError(
-                    "Google opaque functionResponse requires a non-empty id"
+                    "Google opaque toolResponse requires a non-empty toolType"
                 )
             try:
-                expected_name = names[call_id]
+                expected_type = server_types[call_id]
             except KeyError as exc:
                 raise DialectError(
-                    "Google opaque functionResponse at "
-                    f"{content_index}.{part_index} has no prior functionCall"
+                    "Google opaque toolResponse at "
+                    f"{content_index}.{part_index} has no prior toolCall"
                 ) from exc
-            if name != expected_name:
+            if tool_type != expected_type:
                 raise DialectError(
-                    f"Google opaque functionResponse name changed for {call_id!r}"
+                    f"Google opaque toolResponse type changed for {call_id!r}"
                 )
-            if call_id in answered:
-                raise DialectError(f"duplicate Google function result for {call_id!r}")
-            answered.add(call_id)
+            if call_id in answered_server_calls:
+                raise DialectError(
+                    f"duplicate Google server tool result for {call_id!r}"
+                )
+            answered_server_calls.add(call_id)
     return names, answered
 
 
@@ -1184,6 +1229,23 @@ def _grounding(raw: object, path: str) -> GroundingMetadata | None:
     return GroundingMetadata(tuple(chunks), rendered)
 
 
+def _prompt_block_reason(raw: object) -> str | None:
+    feedback = _get(raw, "promptFeedback")
+    if feedback is None:
+        return None
+    if not isinstance(feedback, Mapping):
+        raise OutputContractError("response.promptFeedback must be an object")
+    feedback_mapping = cast(Mapping[str, object], feedback)
+    if "blockReason" not in feedback_mapping:
+        return None
+    reason = feedback_mapping["blockReason"]
+    if not isinstance(reason, str) or not reason.strip():
+        raise OutputContractError(
+            "response.promptFeedback.blockReason must be a non-empty string"
+        )
+    return None if reason == "BLOCK_REASON_UNSPECIFIED" else reason
+
+
 def _merge_stream_grounding_metadata(
     accumulated: dict[str, object] | None,
     incoming: object,
@@ -1216,6 +1278,55 @@ def _merge_stream_grounding_metadata(
             )
         result[raw_name] = value
     return result
+
+
+def _merge_stream_text_delta(
+    previous: object, current: object
+) -> dict[str, object] | None:
+    """Join wire text deltas only while they remain one semantic part."""
+
+    if not isinstance(previous, Mapping) or not isinstance(current, Mapping):
+        return None
+    previous_mapping = cast(Mapping[str, object], previous)
+    current_mapping = cast(Mapping[str, object], current)
+    allowed = {"text", "thought", "thoughtSignature"}
+    if set(previous_mapping) - allowed or set(current_mapping) - allowed:
+        return None
+    previous_text = previous_mapping.get("text")
+    current_text = current_mapping.get("text")
+    if not isinstance(previous_text, str) or not isinstance(current_text, str):
+        return None
+    if previous_mapping.get("thought") != current_mapping.get("thought"):
+        return None
+    previous_signature = previous_mapping.get("thoughtSignature")
+    current_signature = current_mapping.get("thoughtSignature")
+    # A signature closes the prior semantic part. A signature delivered with
+    # the next delta belongs to the part formed by joining that delta backward.
+    if previous_signature is not None:
+        return None
+    if current_signature is not None and (
+        not isinstance(current_signature, str) or not current_signature
+    ):
+        return None
+    merged = dict(previous_mapping)
+    merged["text"] = previous_text + current_text
+    if "thought" in current_mapping:
+        merged["thought"] = current_mapping["thought"]
+    if current_signature is not None:
+        merged["thoughtSignature"] = current_signature
+    return merged
+
+
+def _append_stream_parts(
+    accumulated: list[object], incoming: object, path: str
+) -> None:
+    parts = list(_sequence(incoming, path))
+    if accumulated and parts:
+        merged = _merge_stream_text_delta(accumulated[-1], parts[0])
+        if merged is not None:
+            accumulated[-1] = merged
+            parts.pop(0)
+    accumulated.extend(parts)
 
 
 def _synthetic_call_id(
@@ -1621,7 +1732,20 @@ class GoogleGenAIDialect:
 
     def _lift(self, raw: object, context: _GoogleExecutionContext) -> Response:
         req = context.request
-        candidates = _sequence(_get(raw, "candidates"), "response.candidates")
+        block_reason = _prompt_block_reason(raw)
+        raw_candidates = _get(raw, "candidates")
+        candidates = (
+            ()
+            if raw_candidates is None and block_reason is not None
+            else _sequence(raw_candidates, "response.candidates")
+        )
+        if block_reason is not None:
+            if candidates:
+                raise OutputContractError(
+                    "Google response is contradictory: prompt was blocked "
+                    f"with reason {block_reason}, but candidates were returned"
+                )
+            raise OutputContractError(f"Google prompt was blocked: {block_reason}")
         if len(candidates) != req.sampling.n:
             raise OutputContractError(
                 f"expected {req.sampling.n} Google candidates, "
@@ -1987,6 +2111,7 @@ class GoogleGenAIDialect:
         # terminal snapshot and must come from the final event.
         by_index: dict[int, dict[str, object]] = {}
         model_version: object = None
+        prompt_feedback: object = None
         for chunk_index, chunk in enumerate(chunks):
             if _get(chunk, "modelVersion") is not None:
                 current_model = _get(chunk, "modelVersion")
@@ -1995,6 +2120,14 @@ class GoogleGenAIDialect:
                         "Google stream changed modelVersion between events"
                     )
                 model_version = current_model
+            current_feedback = _get(chunk, "promptFeedback")
+            if current_feedback is not None:
+                _prompt_block_reason(chunk)
+                if prompt_feedback is not None and current_feedback != prompt_feedback:
+                    raise OutputContractError(
+                        "Google stream changed promptFeedback between events"
+                    )
+                prompt_feedback = current_feedback
             for raw_candidate in _sequence(
                 _get(chunk, "candidates", []), f"stream[{chunk_index}].candidates"
             ):
@@ -2015,8 +2148,10 @@ class GoogleGenAIDialect:
                         raise OutputContractError(
                             "Google stream candidate role is not model"
                         )
-                    state["parts"] = cast(list[object], state["parts"]) + list(
-                        _sequence(_get(content, "parts", []), "stream candidate parts")
+                    _append_stream_parts(
+                        cast(list[object], state["parts"]),
+                        _get(content, "parts", []),
+                        "stream candidate parts",
                     )
                 finish_reason = _get(raw_candidate, "finishReason")
                 if finish_reason is not None:
@@ -2101,6 +2236,10 @@ class GoogleGenAIDialect:
             )
         if model_version is not None:
             merged["modelVersion"] = copy_json_value(model_version, "stream model")
+        if prompt_feedback is not None:
+            merged["promptFeedback"] = copy_json_value(
+                prompt_feedback, "stream promptFeedback"
+            )
         return self._lift(merged, context)
 
     async def execute(self, prepared: PreparedRequest) -> Response:

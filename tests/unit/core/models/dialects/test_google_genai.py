@@ -808,6 +808,177 @@ class TestReasoningAndStructuredOutput:
             await _run(_no_io, req)
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("server_parts", "message"),
+        [
+            (
+                [
+                    {
+                        "toolResponse": {
+                            "id": "server_1",
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "response": {"ok": True},
+                        }
+                    }
+                ],
+                "toolResponse.*has no prior toolCall",
+            ),
+            (
+                [
+                    {
+                        "toolCall": {
+                            "id": "server_1",
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "args": {},
+                        }
+                    },
+                    {
+                        "toolCall": {
+                            "id": "server_1",
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "args": {},
+                        }
+                    },
+                ],
+                "duplicate Google server tool call",
+            ),
+            (
+                [
+                    {
+                        "toolCall": {
+                            "id": "server_1",
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "args": {},
+                        }
+                    },
+                    {
+                        "toolResponse": {
+                            "id": "server_1",
+                            "toolType": "URL_CONTEXT",
+                            "response": {"ok": True},
+                        }
+                    },
+                ],
+                "toolResponse type changed",
+            ),
+            (
+                [
+                    {
+                        "toolCall": {
+                            "id": "server_1",
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "args": {},
+                        }
+                    },
+                    {
+                        "toolResponse": {
+                            "id": "server_1",
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "response": {"ok": True},
+                        }
+                    },
+                    {
+                        "toolResponse": {
+                            "id": "server_1",
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "response": {"ok": True},
+                        }
+                    },
+                ],
+                "duplicate Google server tool result",
+            ),
+        ],
+    )
+    async def test_opaque_server_tool_history_rejects_invalid_call_state_before_io(
+        self, server_parts: list[dict[str, object]], message: str
+    ) -> None:
+        opaque = json.dumps(
+            {
+                "version": 1,
+                "contents": [
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "text": "history",
+                                "thoughtSignature": "signature",
+                            },
+                            *server_parts,
+                        ],
+                    }
+                ],
+            }
+        )
+
+        with pytest.raises(DialectError, match=message):
+            await _run(
+                _no_io,
+                _request(
+                    session=SessionParams(
+                        opaque_continuation=OpaqueContinuation("google_genai", opaque)
+                    )
+                ),
+            )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "server_parts",
+        [
+            [
+                {
+                    "toolCall": {
+                        "id": "server_1",
+                        "toolType": "GOOGLE_SEARCH_WEB",
+                        "args": {"q": "weather"},
+                    },
+                    "thoughtSignature": "signature",
+                }
+            ],
+            [
+                {
+                    "toolCall": {
+                        "id": "server_1",
+                        "toolType": "GOOGLE_SEARCH_WEB",
+                        "args": {"q": "weather"},
+                    },
+                    "thoughtSignature": "signature",
+                },
+                {
+                    "toolResponse": {
+                        "id": "server_1",
+                        "toolType": "GOOGLE_SEARCH_WEB",
+                        "response": {"ok": True},
+                    }
+                },
+            ],
+        ],
+    )
+    async def test_opaque_server_tool_history_accepts_open_or_answered_call(
+        self, server_parts: list[dict[str, object]]
+    ) -> None:
+        opaque = json.dumps(
+            {
+                "version": 1,
+                "contents": [{"role": "model", "parts": server_parts}],
+            }
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert json.loads(request.content)["contents"][0]["parts"] == server_parts
+            return httpx.Response(200, json=_response())
+
+        result = await _run(
+            handler,
+            _request(
+                session=SessionParams(
+                    opaque_continuation=OpaqueContinuation("google_genai", opaque)
+                )
+            ),
+        )
+
+        assert result.texts == ("Hi",)
+
+    @pytest.mark.anyio
     async def test_requested_summary_must_be_nonempty(self) -> None:
         with pytest.raises(OutputContractError, match="omitted requested thoughts"):
             await _run(
@@ -865,6 +1036,55 @@ class TestReasoningAndStructuredOutput:
 
 
 class TestResponseLifting:
+    @pytest.mark.anyio
+    async def test_blocked_prompt_surfaces_provider_reason(self) -> None:
+        with pytest.raises(
+            OutputContractError, match="Google prompt was blocked: SAFETY"
+        ):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    json={"promptFeedback": {"blockReason": "SAFETY"}},
+                )
+            )
+
+    @pytest.mark.anyio
+    async def test_unspecified_prompt_block_reason_allows_candidates(self) -> None:
+        payload = _response()
+        payload["promptFeedback"] = {"blockReason": "BLOCK_REASON_UNSPECIFIED"}
+
+        result = await _run(lambda _: httpx.Response(200, json=payload))
+
+        assert result.texts == ("Hi",)
+
+    @pytest.mark.anyio
+    async def test_candidates_with_prompt_block_reason_are_contradictory(self) -> None:
+        payload = _response()
+        payload["promptFeedback"] = {"blockReason": "SAFETY"}
+
+        with pytest.raises(OutputContractError, match="contradictory.*SAFETY"):
+            await _run(lambda _: httpx.Response(200, json=payload))
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("prompt_feedback", "message"),
+        [
+            ([], "promptFeedback must be an object"),
+            ({"blockReason": None}, "blockReason must be a non-empty string"),
+            ({"blockReason": ""}, "blockReason must be a non-empty string"),
+            ({"blockReason": "   "}, "blockReason must be a non-empty string"),
+            ({"blockReason": 1}, "blockReason must be a non-empty string"),
+        ],
+    )
+    async def test_malformed_prompt_feedback_fails_loudly(
+        self, prompt_feedback: object, message: str
+    ) -> None:
+        payload = _response()
+        payload["promptFeedback"] = prompt_feedback
+
+        with pytest.raises(OutputContractError, match=message):
+            await _run(lambda _: httpx.Response(200, json=payload))
+
     @pytest.mark.anyio
     async def test_multiple_text_candidates_preserve_choice_order(self) -> None:
         result = await _run(
@@ -1367,6 +1587,27 @@ class TestResponseLifting:
 
 class TestStreamingAndAuditEvidence:
     @pytest.mark.anyio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_http_error_status_fails_before_response_lifting(
+        self, stream: bool
+    ) -> None:
+        def handler(_: httpx.Request) -> httpx.Response:
+            payload = _response()
+            if stream:
+                return httpx.Response(
+                    400,
+                    content=_sse(payload),
+                    headers={"content-type": "text/event-stream"},
+                )
+            return httpx.Response(400, json=payload)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await _run(
+                handler,
+                _request(scheduling=SchedulingParams(stream=stream)),
+            )
+
+    @pytest.mark.anyio
     async def test_execute_rejects_absolute_operation_before_credential_leak(
         self,
     ) -> None:
@@ -1448,6 +1689,132 @@ class TestStreamingAndAuditEvidence:
         assert result.usage.total_tokens == 4
         assert result.request_params is not None
         assert result.request_params["query"] == {"alt": "sse"}
+
+    @pytest.mark.anyio
+    async def test_streaming_merges_reasoning_deltas_without_crossing_boundaries(
+        self,
+    ) -> None:
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                content=_sse(
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "ana", "thought": True}],
+                                },
+                            }
+                        ]
+                    },
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [
+                                        {
+                                            "text": "lysis",
+                                            "thought": True,
+                                            "thoughtSignature": "signature",
+                                        },
+                                        {"text": "answer"},
+                                    ],
+                                },
+                                "finishReason": "STOP",
+                            }
+                        ]
+                    },
+                ),
+                headers={"content-type": "text/event-stream"},
+            ),
+            _request(
+                reasoning=ReasoningParams(summary="auto"),
+                scheduling=SchedulingParams(stream=True),
+            ),
+        )
+
+        assert result.texts == ("answer",)
+        assert result.reasoning is not None
+        assert result.reasoning[0] is not None
+        assert result.reasoning[0].text == "analysis"
+        opaque = json.loads(cast(str, result.reasoning[0].opaque_roundtrip))
+        assert opaque["contents"][-1]["parts"] == [
+            {
+                "text": "analysis",
+                "thought": True,
+                "thoughtSignature": "signature",
+            },
+            {"text": "answer"},
+        ]
+
+    @pytest.mark.parametrize(
+        ("previous", "current"),
+        [
+            (
+                {"text": "reasoning", "thought": True},
+                {"text": "answer"},
+            ),
+            (
+                {"text": "before"},
+                {"functionCall": {"id": "call_1", "name": "f", "args": {}}},
+            ),
+            (
+                {
+                    "text": "signed",
+                    "thought": True,
+                    "thoughtSignature": "signature",
+                },
+                {"text": "new thought", "thought": True},
+            ),
+        ],
+    )
+    def test_streaming_text_merge_respects_semantic_boundaries(
+        self, previous: object, current: object
+    ) -> None:
+        assert google_genai._merge_stream_text_delta(previous, current) is None
+
+    @pytest.mark.anyio
+    async def test_streaming_blocked_prompt_surfaces_consistent_reason(self) -> None:
+        feedback = {"blockReason": "SAFETY", "blockReasonMessage": "unsafe"}
+
+        with pytest.raises(
+            OutputContractError, match="Google prompt was blocked: SAFETY"
+        ):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    content=_sse(
+                        {"promptFeedback": feedback},
+                        {
+                            "promptFeedback": {
+                                "blockReason": "SAFETY",
+                                "blockReasonMessage": "unsafe",
+                            }
+                        },
+                    ),
+                    headers={"content-type": "text/event-stream"},
+                ),
+                _request(scheduling=SchedulingParams(stream=True)),
+            )
+
+    @pytest.mark.anyio
+    async def test_streaming_rejects_conflicting_prompt_feedback(self) -> None:
+        with pytest.raises(OutputContractError, match="changed promptFeedback"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    content=_sse(
+                        {"promptFeedback": {"blockReason": "BLOCK_REASON_UNSPECIFIED"}},
+                        {"promptFeedback": {"blockReason": "SAFETY"}},
+                    ),
+                    headers={"content-type": "text/event-stream"},
+                ),
+                _request(scheduling=SchedulingParams(stream=True)),
+            )
 
     @pytest.mark.anyio
     async def test_streaming_does_not_persist_nonterminal_usage(self) -> None:
