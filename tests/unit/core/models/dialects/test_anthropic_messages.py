@@ -6,10 +6,12 @@ AI-Generated Code - GPT-5.6 (OpenAI)
 import json
 from collections.abc import Callable, Mapping
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
+import sieval.core.models.dialects.anthropic_messages as anthropic_messages_module
 from sieval.core.models.capabilities import (
     CAPABILITY_KEYS,
     DialectCapabilityStatus,
@@ -1611,6 +1613,30 @@ class TestResponseGuards:
                     json={"type": "error", "error": {"message": "bad key"}},
                 )
             )
+
+    @pytest.mark.anyio
+    async def test_stream_http_error_is_raised_before_sse_lift(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lift = AsyncMock(side_effect=AssertionError("SSE lift must not run"))
+        monkeypatch.setattr(
+            anthropic_messages_module,
+            "_terminal_stream_message",
+            lift,
+        )
+
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            await _run(
+                lambda _: httpx.Response(
+                    429,
+                    content=b"event: error\ndata: not-json\n\n",
+                    headers={"content-type": "text/event-stream"},
+                ),
+                _request(scheduling=SchedulingParams(stream=True)),
+            )
+
+        assert exc_info.value.response.status_code == 429
+        lift.assert_not_awaited()
 
 
 class TestAuditAndLowLevelContract:
