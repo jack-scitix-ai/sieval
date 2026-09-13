@@ -34,6 +34,10 @@ from .dialects.anthropic_messages import (
     CAPABILITY_DECISIONS as ANTHROPIC_MESSAGES_CAPABILITY_DECISIONS,
 )
 from .dialects.anthropic_messages import AnthropicMessagesDialect
+from .dialects.google_genai import (
+    CAPABILITY_DECISIONS as GOOGLE_GENAI_CAPABILITY_DECISIONS,
+)
+from .dialects.google_genai import GoogleGenAIDialect
 from .dialects.openai_chat import (
     CAPABILITY_DECISIONS as OPENAI_CHAT_CAPABILITY_DECISIONS,
 )
@@ -329,6 +333,10 @@ def _bind_anthropic_messages(connection: Any, requested_model_id: str) -> Dialec
     return AnthropicMessagesDialect(connection, requested_model_id)
 
 
+def _bind_google_genai(connection: Any, requested_model_id: str) -> Dialect:
+    return GoogleGenAIDialect(connection, requested_model_id)
+
+
 def _binder(
     function: Callable[[Any, str], Dialect],
     decisions: Mapping[str, DialectCapabilityDecision],
@@ -368,6 +376,13 @@ DIALECT_BINDERS: Mapping[str, DialectBinder] = MappingProxyType(
             cast(
                 Mapping[str, DialectCapabilityDecision],
                 ANTHROPIC_MESSAGES_CAPABILITY_DECISIONS,
+            ),
+        ),
+        "google_genai": _binder(
+            _bind_google_genai,
+            cast(
+                Mapping[str, DialectCapabilityDecision],
+                GOOGLE_GENAI_CAPABILITY_DECISIONS,
             ),
         ),
     }
@@ -418,7 +433,8 @@ DIALECT_SPECS: Mapping[str, DialectSpec] = MappingProxyType(
         "google_genai": _spec(
             "google_genai",
             "async_http_json",
-            request_seed_support=RequestSeedSupport.RESERVED,
+            decisions=_registered_decisions("google_genai"),
+            request_seed_support=RequestSeedSupport.SUPPORTED,
             input_kinds=("chat",),
             input_modalities=("text", "image", "tool_call", "tool_result"),
         ),

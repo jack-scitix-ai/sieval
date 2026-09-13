@@ -6847,7 +6847,9 @@ tasks:
 # Deterministic mode: dialect-declared seed injection + transparent sampling
 # ===================================================================
 class TestDeterministicRequestSeedPolicy:
-    @pytest.mark.parametrize("dialect_id", ["openai_chat", "openai_completions"])
+    @pytest.mark.parametrize(
+        "dialect_id", ["openai_chat", "openai_completions", "google_genai"]
+    )
     def test_supported_dialects_receive_the_automatic_seed(self, dialect_id):
         decision = _resolve_deterministic_request_seed(
             dialect_id=dialect_id,

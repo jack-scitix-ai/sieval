@@ -48,6 +48,7 @@ from sieval.core.models.dialect_registry import (
     get_dialect_spec,
 )
 from sieval.core.models.dialects.anthropic_messages import AnthropicMessagesDialect
+from sieval.core.models.dialects.google_genai import GoogleGenAIDialect
 from sieval.core.models.dialects.openai_chat import OpenAIChatDialect
 from sieval.core.models.dialects.openai_completions import OpenAICompletionsDialect
 from sieval.core.models.dialects.openai_responses import OpenAIResponsesDialect
@@ -133,7 +134,7 @@ class TestDialectDescriptors:
             "openai_completions": RequestSeedSupport.SUPPORTED,
             "openai_responses": RequestSeedSupport.UNSUPPORTED,
             "anthropic_messages": RequestSeedSupport.UNSUPPORTED,
-            "google_genai": RequestSeedSupport.RESERVED,
+            "google_genai": RequestSeedSupport.SUPPORTED,
             "sglang_native": RequestSeedSupport.RESERVED,
             "vllm_native": RequestSeedSupport.RESERVED,
         }
@@ -149,6 +150,7 @@ class TestDialectDescriptors:
             "openai_completions",
             "openai_responses",
             "anthropic_messages",
+            "google_genai",
         }
         assert set(DIALECT_BINDERS) == active
         assert all(inspect.isfunction(binder) for binder in DIALECT_BINDERS.values())
@@ -264,8 +266,7 @@ class TestDialectDescriptors:
         assert set(capability_decisions_for("anthropic_messages")) == set(
             CAPABILITY_KEYS
         )
-        with pytest.raises(DialectNotImplemented, match="no executable binder"):
-            capability_decisions_for("google_genai")
+        assert set(capability_decisions_for("google_genai")) == set(CAPABILITY_KEYS)
 
 
 class TestDialectBinders:
@@ -295,6 +296,7 @@ class TestDialectBinders:
             ("openai_completions", OpenAICompletionsDialect),
             ("openai_responses", OpenAIResponsesDialect),
             ("anthropic_messages", AnthropicMessagesDialect),
+            ("google_genai", GoogleGenAIDialect),
         ],
     )
     def test_active_binders_construct_expected_dialect(
@@ -302,7 +304,7 @@ class TestDialectBinders:
     ) -> None:
         binder = DIALECT_BINDERS[dialect_id]
         connection: object = object()
-        if dialect_id == "anthropic_messages":
+        if dialect_id in {"anthropic_messages", "google_genai"}:
             connection = AsyncHTTPJSONConnection(httpx.AsyncClient(), None)
         dialect = binder(connection, "requested-model")
 
@@ -317,6 +319,7 @@ class TestDialectBinders:
             ("openai_completions", OpenAICompletionsDialect),
             ("openai_responses", OpenAIResponsesDialect),
             ("anthropic_messages", AnthropicMessagesDialect),
+            ("google_genai", GoogleGenAIDialect),
         ],
     )
     def test_validated_runtime_plan_binds_active_dialect(
