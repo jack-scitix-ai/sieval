@@ -9,6 +9,7 @@ import json
 from types import SimpleNamespace
 from typing import Any, cast
 
+import httpx
 import pytest
 
 import sieval.core.models.dialect_registry as registry
@@ -18,6 +19,7 @@ from sieval.core.models.capabilities import (
     DialectCapabilityStatus,
     Supported,
 )
+from sieval.core.models.connection_factory import AsyncHTTPJSONConnection
 from sieval.core.models.deployment import (
     ConnectionIdentity,
     ConnectionPool,
@@ -45,6 +47,7 @@ from sieval.core.models.dialect_registry import (
     dialect_registry_to_json,
     get_dialect_spec,
 )
+from sieval.core.models.dialects.anthropic_messages import AnthropicMessagesDialect
 from sieval.core.models.dialects.openai_chat import OpenAIChatDialect
 from sieval.core.models.dialects.openai_completions import OpenAICompletionsDialect
 from sieval.core.models.dialects.openai_responses import OpenAIResponsesDialect
@@ -68,6 +71,7 @@ class _Connection:
 def _runtime_binding(
     dialect_id: str = "openai_chat",
 ) -> tuple[Deployment, ConnectionPool[Any], SimpleNamespace]:
+    family = DIALECT_SPECS[dialect_id].connection_family
     deployment = Deployment(
         deployment_id="deployment",
         plan=DeploymentPlanProjection("sha256:plan", "vllm"),
@@ -79,7 +83,7 @@ def _runtime_binding(
         metrics_url=None,
         facts=ServingFacts(),
     )
-    route = resolve_route(deployment, dialect_id, "openai_sdk")
+    route = resolve_route(deployment, dialect_id, family)
     identity = ConnectionIdentity(
         endpoint=route.endpoint,
         connection_family=route.connection_family,
@@ -94,7 +98,10 @@ def _runtime_binding(
         resolved_route=route,
         connection_identity=identity,
     )
-    return deployment, ConnectionPool(_Connection(), identity), plan
+    connection: object = _Connection()
+    if family == "async_http_json":
+        connection = AsyncHTTPJSONConnection(httpx.AsyncClient(), None)
+    return deployment, ConnectionPool(connection, identity), plan
 
 
 class TestDialectDescriptors:
@@ -125,7 +132,7 @@ class TestDialectDescriptors:
             "openai_chat": RequestSeedSupport.SUPPORTED,
             "openai_completions": RequestSeedSupport.SUPPORTED,
             "openai_responses": RequestSeedSupport.UNSUPPORTED,
-            "anthropic_messages": RequestSeedSupport.RESERVED,
+            "anthropic_messages": RequestSeedSupport.UNSUPPORTED,
             "google_genai": RequestSeedSupport.RESERVED,
             "sglang_native": RequestSeedSupport.RESERVED,
             "vllm_native": RequestSeedSupport.RESERVED,
@@ -141,6 +148,7 @@ class TestDialectDescriptors:
             "openai_chat",
             "openai_completions",
             "openai_responses",
+            "anthropic_messages",
         }
         assert set(DIALECT_BINDERS) == active
         assert all(inspect.isfunction(binder) for binder in DIALECT_BINDERS.values())
@@ -253,8 +261,11 @@ class TestDialectDescriptors:
     def test_capability_decisions_are_available_only_for_active_dialects(self) -> None:
         assert set(capability_decisions_for("openai_chat")) == set(CAPABILITY_KEYS)
         assert set(capability_decisions_for("openai_responses")) == set(CAPABILITY_KEYS)
+        assert set(capability_decisions_for("anthropic_messages")) == set(
+            CAPABILITY_KEYS
+        )
         with pytest.raises(DialectNotImplemented, match="later #25 adapter"):
-            capability_decisions_for("anthropic_messages")
+            capability_decisions_for("google_genai")
 
 
 class TestDialectBinders:
@@ -283,17 +294,21 @@ class TestDialectBinders:
             ("openai_chat", OpenAIChatDialect),
             ("openai_completions", OpenAICompletionsDialect),
             ("openai_responses", OpenAIResponsesDialect),
+            ("anthropic_messages", AnthropicMessagesDialect),
         ],
     )
     def test_active_binders_construct_expected_dialect(
         self, dialect_id: str, expected_type: type
     ) -> None:
         binder = DIALECT_BINDERS[dialect_id]
-        dialect = binder(object(), "requested-model")
+        connection: object = object()
+        if dialect_id == "anthropic_messages":
+            connection = AsyncHTTPJSONConnection(httpx.AsyncClient(), None)
+        dialect = binder(connection, "requested-model")
 
         assert isinstance(dialect, expected_type)
         assert dialect.dialect_id == dialect_id
-        assert dialect.connection_family == "openai_sdk"
+        assert dialect.connection_family == DIALECT_SPECS[dialect_id].connection_family
 
     @pytest.mark.parametrize(
         ("dialect_id", "expected_type"),
@@ -301,6 +316,7 @@ class TestDialectBinders:
             ("openai_chat", OpenAIChatDialect),
             ("openai_completions", OpenAICompletionsDialect),
             ("openai_responses", OpenAIResponsesDialect),
+            ("anthropic_messages", AnthropicMessagesDialect),
         ],
     )
     def test_validated_runtime_plan_binds_active_dialect(

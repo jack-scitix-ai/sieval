@@ -6865,12 +6865,14 @@ class TestDeterministicRequestSeedPolicy:
 
         assert args == {"seed": 0, "temperature": 0.5}
 
-    def test_reserved_seed_policy_fails_loudly(self):
-        with pytest.raises(ValueError, match="anthropic_messages.*has not declared"):
-            _resolve_deterministic_request_seed(
-                dialect_id="anthropic_messages",
-                explicit_seed_present=False,
-            )
+    def test_anthropic_automatic_request_seed_is_explicitly_unsupported(self):
+        decision = _resolve_deterministic_request_seed(
+            dialect_id="anthropic_messages",
+            explicit_seed_present=False,
+        )
+
+        assert decision.seed_present is False
+        assert decision.support is RequestSeedSupport.UNSUPPORTED
 
     @pytest.mark.parametrize("seed", [None, 0, 42])
     def test_explicit_seed_is_never_rewritten(self, seed):

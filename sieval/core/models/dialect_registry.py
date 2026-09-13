@@ -30,6 +30,10 @@ from .capabilities import (
 from .connection_factory import CONNECTION_FACTORY_REGISTRY
 from .deployment import ConnectionPool, Deployment, RouteIntent, resolve_route
 from .dialect import Dialect, active_request_leaves
+from .dialects.anthropic_messages import (
+    CAPABILITY_DECISIONS as ANTHROPIC_MESSAGES_CAPABILITY_DECISIONS,
+)
+from .dialects.anthropic_messages import AnthropicMessagesDialect
 from .dialects.openai_chat import (
     CAPABILITY_DECISIONS as OPENAI_CHAT_CAPABILITY_DECISIONS,
 )
@@ -321,6 +325,10 @@ def _bind_openai_responses(connection: Any, requested_model_id: str) -> Dialect:
     return OpenAIResponsesDialect(connection, requested_model_id)
 
 
+def _bind_anthropic_messages(connection: Any, requested_model_id: str) -> Dialect:
+    return AnthropicMessagesDialect(connection, requested_model_id)
+
+
 def _binder(
     function: Callable[[Any, str], Dialect],
     decisions: Mapping[str, DialectCapabilityDecision],
@@ -353,6 +361,13 @@ DIALECT_BINDERS: Mapping[str, DialectBinder] = MappingProxyType(
             cast(
                 Mapping[str, DialectCapabilityDecision],
                 OPENAI_RESPONSES_CAPABILITY_DECISIONS,
+            ),
+        ),
+        "anthropic_messages": _binder(
+            _bind_anthropic_messages,
+            cast(
+                Mapping[str, DialectCapabilityDecision],
+                ANTHROPIC_MESSAGES_CAPABILITY_DECISIONS,
             ),
         ),
     }
@@ -395,7 +410,8 @@ DIALECT_SPECS: Mapping[str, DialectSpec] = MappingProxyType(
         "anthropic_messages": _spec(
             "anthropic_messages",
             "async_http_json",
-            request_seed_support=RequestSeedSupport.RESERVED,
+            decisions=_registered_decisions("anthropic_messages"),
+            request_seed_support=RequestSeedSupport.UNSUPPORTED,
             input_kinds=("chat",),
             input_modalities=("text", "image", "tool_call", "tool_result"),
         ),
