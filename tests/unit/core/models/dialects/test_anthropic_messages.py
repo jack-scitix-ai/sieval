@@ -32,11 +32,22 @@ from sieval.core.models.dialect_registry import DIALECT_SPECS
 from sieval.core.models.dialects.anthropic_messages import (
     CAPABILITY_DECISIONS,
     AnthropicMessagesDialect,
+    _AnthropicInputVerifier,
+    _AnthropicToolChoiceVerifier,
+    _AnthropicToolsVerifier,
+    _decode_continuation,
+    _finish_stream_block,
     _LegacyPlan,
+    _ReasoningSummaryVerifier,
+    _tool_history_state,
+    _validate_history_block,
+    _validate_replay_system,
+    _validate_replay_tools,
 )
 from sieval.core.models.ir import (
     ChatInput,
     ChatMessage,
+    CompletionInput,
     DialectOptions,
     HostedToolSpec,
     ImagePart,
@@ -45,6 +56,7 @@ from sieval.core.models.ir import (
     Request,
     SamplingParams,
     SchedulingParams,
+    ScoringParams,
     SessionParams,
     StructuredOutputParams,
     TextPart,
@@ -2376,3 +2388,1166 @@ class TestProviderContractRegressions:
                 ),
                 _request(scheduling=SchedulingParams(stream=True)),
             )
+
+
+class TestReachableInputBoundaries:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("req", "message"),
+        [
+            (_request(input=CompletionInput("prompt")), "requires ChatInput"),
+            (
+                _request(input=_chat(ChatMessage("user", ()))),
+                "empty content",
+            ),
+            (
+                _request(
+                    input=_chat(ChatMessage("user", (TextPart("x"),), name="alice"))
+                ),
+                "no message name",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage("system", (cast(Any, ImagePart(url="x")),)),
+                        ChatMessage("user", (TextPart("x"),)),
+                    )
+                ),
+                "system accepts text",
+            ),
+            (
+                _request(input=_chat(ChatMessage("tool", (TextPart("x"),)))),
+                "tool-role messages",
+            ),
+            (
+                _request(
+                    input=_chat(ChatMessage("user", (ToolCallPart("id", "tool", {}),)))
+                ),
+                "tool_use blocks require assistant",
+            ),
+            (
+                _request(
+                    input=_chat(ChatMessage("assistant", (ToolResultPart("id", "x"),)))
+                ),
+                "assistant messages",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage("assistant", (ToolCallPart("", "tool", {}),))
+                    )
+                ),
+                "non-empty id and name",
+            ),
+            (
+                _request(
+                    input=_chat(ChatMessage("assistant", (ToolCallPart("id", "", {}),)))
+                ),
+                "non-empty id and name",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage("assistant", (ToolCallPart("id", "tool", [1]),))
+                    )
+                ),
+                "JSON object",
+            ),
+            (
+                _request(input=_chat(ChatMessage("tool", (ToolResultPart("", "x"),)))),
+                "non-empty tool_use_id",
+            ),
+            (
+                _request(input=_chat(ChatMessage("user", (ImagePart(url=""),)))),
+                "must not be empty",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage("user", (ImagePart(url="x", detail="high"),))
+                    )
+                ),
+                "image detail",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage(
+                            "user", (ImagePart(url="x", media_type="image/png"),)
+                        )
+                    )
+                ),
+                "URL image sources",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage(
+                            "user", (ImagePart(data="x", media_type="image/bmp"),)
+                        )
+                    )
+                ),
+                "base64 images require one of",
+            ),
+            (
+                _request(sampling=SamplingParams(max_tokens=-1)),
+                "max_tokens must be non-negative",
+            ),
+            (
+                _request(sampling=SamplingParams(max_tokens=10, top_p=-0.1)),
+                "top_p must be between",
+            ),
+            (
+                _request(sampling=SamplingParams(max_tokens=10, top_k=-1)),
+                "top_k must be non-negative",
+            ),
+            (
+                _request(sampling=SamplingParams(max_tokens=10, stop=("",))),
+                "stop sequences must not be empty",
+            ),
+            (
+                _request(sampling=SamplingParams(max_tokens=10, frequency_penalty=0.1)),
+                "no equivalent penalty",
+            ),
+            (
+                _request(sampling=SamplingParams(max_tokens=10, presence_penalty=0.1)),
+                "no equivalent penalty",
+            ),
+            (
+                _request(reasoning=ReasoningParams(effort="minimal")),
+                "unsupported Anthropic reasoning effort",
+            ),
+            (
+                _request(
+                    sampling=SamplingParams(max_tokens=2048),
+                    reasoning=ReasoningParams(budget_tokens=512),
+                ),
+                "budget must be at least 1024",
+            ),
+            (
+                _request(
+                    structured_output=StructuredOutputParams(
+                        format="json_schema", schema={}, strict=False
+                    )
+                ),
+                "always schema constrained",
+            ),
+            (
+                _request(dialect_options=DialectOptions("anthropic_messages", {"": 1})),
+                "keys must be non-empty",
+            ),
+            (
+                _request(
+                    dialect_options=DialectOptions(
+                        "anthropic_messages", {"max_tokens": 1}
+                    )
+                ),
+                "canonical provider-neutral field",
+            ),
+        ],
+    )
+    async def test_invalid_request_leaf_is_rejected_before_http(
+        self, req: Request, message: str
+    ) -> None:
+        calls = 0
+
+        def handler(_: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(200, json=_response())
+
+        with pytest.raises(
+            (DialectError, RequestAuditError, ValueError), match=message
+        ):
+            await _run(handler, req)
+
+        assert calls == 0
+
+    @pytest.mark.parametrize(
+        "scoring",
+        [
+            ScoringParams(input_scoring=True),
+            ScoringParams(sampled_logprobs=True),
+            ScoringParams(sampled_logprobs=True, top_logprobs=2),
+        ],
+    )
+    def test_low_level_dialect_validation_also_rejects_logprob_requests(
+        self, scoring: ScoringParams
+    ) -> None:
+        connection = _connection(lambda _: pytest.fail("HTTP must not run"))
+        dialect = AnthropicMessagesDialect(connection, "claude")
+        req = _request(scoring=scoring)
+        audit = RequestAudit(active_request_leaves(req))
+
+        dialect.validate_request(req, audit, _LegacyPlan())
+
+        with pytest.raises(RequestAuditError, match="does not provide logprobs"):
+            audit.raise_rejections()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("tools", "message"),
+        [
+            (
+                ToolParams(functions=({"type": "hosted", "name": "x"},)),
+                "require type='function'",
+            ),
+            (
+                ToolParams(functions=({"type": "function", "function": "wrong"},)),
+                "invalid Chat-shaped",
+            ),
+            (
+                ToolParams(
+                    functions=(
+                        {
+                            "type": "function",
+                            "name": "x",
+                            "parameters": {},
+                            "future": True,
+                        },
+                    )
+                ),
+                "unsupported function tool field",
+            ),
+            (
+                ToolParams(
+                    functions=({"type": "function", "name": "", "parameters": {}},)
+                ),
+                "non-empty string",
+            ),
+            (
+                ToolParams(
+                    functions=({"type": "function", "name": "x", "parameters": []},)
+                ),
+                "parameters must be a JSON object",
+            ),
+            (
+                ToolParams(
+                    functions=(
+                        {
+                            "type": "function",
+                            "name": "x",
+                            "parameters": {},
+                            "description": 1,
+                        },
+                    )
+                ),
+                "description must be a string",
+            ),
+            (
+                ToolParams(
+                    functions=(
+                        {
+                            "type": "function",
+                            "name": "x",
+                            "parameters": {},
+                            "strict": "yes",
+                        },
+                    )
+                ),
+                "strict must be a boolean",
+            ),
+            (
+                ToolParams(
+                    functions=({"type": "function", "name": "x", "parameters": {}},),
+                    choice="sometimes",
+                ),
+                "unsupported Anthropic tool choice",
+            ),
+            (
+                ToolParams(
+                    functions=({"type": "function", "name": "x", "parameters": {}},),
+                    choice=1,
+                ),
+                "string or mapping",
+            ),
+            (
+                ToolParams(
+                    functions=({"type": "function", "name": "x", "parameters": {}},),
+                    choice={"type": "hosted", "name": "x"},
+                ),
+                "only function-specific",
+            ),
+            (
+                ToolParams(
+                    functions=({"type": "function", "name": "x", "parameters": {}},),
+                    choice={"type": "function", "function": "wrong"},
+                ),
+                "invalid Chat-shaped function tool choice",
+            ),
+            (
+                ToolParams(
+                    functions=({"type": "function", "name": "x", "parameters": {}},),
+                    choice={
+                        "type": "function",
+                        "function": {"name": "x", "future": True},
+                    },
+                ),
+                "requires only a name",
+            ),
+            (
+                ToolParams(
+                    functions=({"type": "function", "name": "x", "parameters": {}},),
+                    choice={"type": "function", "name": "x", "future": True},
+                ),
+                "invalid function tool choice",
+            ),
+            (
+                ToolParams(
+                    functions=({"type": "function", "name": "x", "parameters": {}},),
+                    choice={"type": "function", "name": ""},
+                ),
+                "non-empty name",
+            ),
+            (
+                ToolParams(
+                    functions=({"type": "function", "name": "x", "parameters": {}},),
+                    choice="none",
+                    parallel=True,
+                ),
+                "meaningless with tool_choice='none'",
+            ),
+        ],
+    )
+    async def test_invalid_tool_shape_is_rejected_before_http(
+        self, tools: ToolParams, message: str
+    ) -> None:
+        with pytest.raises(RequestAuditError, match=message):
+            await _run(
+                lambda _: pytest.fail("HTTP must not run"),
+                _request(tools=tools),
+            )
+
+
+class TestOpaqueContinuationValidation:
+    @staticmethod
+    def _payload() -> dict[str, object]:
+        return {
+            "version": 2,
+            "system": [],
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "prior",
+                            "signature": "sig",
+                        }
+                    ],
+                }
+            ],
+            "tools": None,
+            "open_turn": False,
+            "reasoning": {"thinking": None, "effort": None},
+        }
+
+    @pytest.mark.parametrize(
+        ("mutate", "message"),
+        [
+            (lambda value: value.update(version=3), "version is unsupported"),
+            (lambda value: value.update(system={}), "history must be lists"),
+            (lambda value: value.update(messages={}), "history must be lists"),
+            (lambda value: value.update(open_turn=1), "open_turn must be a boolean"),
+            (
+                lambda value: value.update(reasoning=None),
+                "reasoning state is malformed",
+            ),
+            (
+                lambda value: value.update(reasoning={"thinking": None}),
+                "reasoning state is malformed",
+            ),
+            (
+                lambda value: value.update(
+                    reasoning={"thinking": None, "effort": "minimal"}
+                ),
+                "effort is invalid",
+            ),
+            (
+                lambda value: value.update(reasoning={"thinking": [], "effort": None}),
+                "thinking state must be an object",
+            ),
+            (
+                lambda value: value.update(
+                    reasoning={
+                        "thinking": {"type": "enabled", "budget_tokens": 2048, "x": 1},
+                        "effort": None,
+                    }
+                ),
+                "thinking state is malformed",
+            ),
+            (
+                lambda value: value.update(
+                    reasoning={
+                        "thinking": {"type": "enabled", "budget_tokens": 1},
+                        "effort": None,
+                    }
+                ),
+                "thinking budget is invalid",
+            ),
+            (
+                lambda value: value.update(
+                    reasoning={
+                        "thinking": {"type": "adaptive", "future": True},
+                        "effort": None,
+                    }
+                ),
+                "thinking state is malformed",
+            ),
+            (
+                lambda value: value.update(
+                    reasoning={"thinking": {"type": "off"}, "effort": None}
+                ),
+                "thinking type is invalid",
+            ),
+            (
+                lambda value: value.update(
+                    reasoning={
+                        "thinking": {"type": "adaptive", "display": "verbose"},
+                        "effort": None,
+                    }
+                ),
+                "thinking display is invalid",
+            ),
+            (
+                lambda value: value.update(messages=["wrong"]),
+                "continuation is malformed",
+            ),
+            (
+                lambda value: value.update(open_turn=True),
+                "open_turn disagrees",
+            ),
+            (
+                lambda value: value.update(messages=[]),
+                "contains no replayable",
+            ),
+        ],
+    )
+    def test_invalid_envelope_is_rejected(
+        self, mutate: Callable[[dict[str, object]], None], message: str
+    ) -> None:
+        payload = self._payload()
+        mutate(payload)
+
+        with pytest.raises(DialectError, match=message):
+            _decode_continuation(json.dumps(payload))
+
+    @pytest.mark.parametrize(
+        ("block", "role", "message"),
+        [
+            ({"type": "text", "text": 1}, "user", "canonical text"),
+            (
+                {"type": "text", "text": "x", "citations": [{}]},
+                "assistant",
+                "cannot be replayed",
+            ),
+            (
+                {"type": "image", "source": {"type": "url", "url": "x"}},
+                "assistant",
+                "requires user role",
+            ),
+            (
+                {"type": "image", "source": "wrong"},
+                "user",
+                "canonical image",
+            ),
+            (
+                {
+                    "type": "image",
+                    "source": {"type": "url", "url": "x", "future": True},
+                },
+                "user",
+                "canonical URL source",
+            ),
+            (
+                {"type": "image", "source": {"type": "url", "url": ""}},
+                "user",
+                "non-empty string",
+            ),
+            (
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/bmp",
+                        "data": "x",
+                    },
+                },
+                "user",
+                "media_type is unsupported",
+            ),
+            (
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": ""},
+                },
+                "user",
+                "non-empty string",
+            ),
+            (
+                {"type": "image", "source": {"type": "future"}},
+                "user",
+                "source.type is unsupported",
+            ),
+            (
+                {"type": "tool_use", "id": "id", "name": "x", "input": {}},
+                "user",
+                "requires assistant role",
+            ),
+            (
+                {
+                    "type": "tool_use",
+                    "id": "id",
+                    "name": "x",
+                    "input": {},
+                    "future": True,
+                },
+                "assistant",
+                "canonical tool_use",
+            ),
+            (
+                {"type": "tool_use", "id": "id", "name": "x", "input": []},
+                "assistant",
+                "input must be an object",
+            ),
+            (
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "id",
+                    "content": "x",
+                    "is_error": False,
+                },
+                "assistant",
+                "requires user role",
+            ),
+            (
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "id",
+                    "content": 1,
+                    "is_error": False,
+                },
+                "user",
+                "content must be a string",
+            ),
+            (
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "id",
+                    "content": "x",
+                    "is_error": "no",
+                },
+                "user",
+                "is_error must be a boolean",
+            ),
+            (
+                {"type": "thinking", "thinking": "x", "signature": "sig"},
+                "user",
+                "canonical thinking",
+            ),
+            (
+                {"type": "thinking", "thinking": 1, "signature": "sig"},
+                "assistant",
+                "thinking must be a string",
+            ),
+            (
+                {"type": "redacted_thinking", "data": "opaque"},
+                "user",
+                "canonical redacted-thinking",
+            ),
+            (
+                {"type": "future"},
+                "assistant",
+                "unsupported Anthropic block type",
+            ),
+        ],
+    )
+    def test_lossy_history_block_is_rejected(
+        self, block: Mapping[str, object], role: str, message: str
+    ) -> None:
+        with pytest.raises(DialectError, match=message):
+            _validate_history_block(cast(Any, block), "history[0]", role=role)
+
+    @pytest.mark.parametrize(
+        ("tool", "message"),
+        [
+            ({"name": "x", "input_schema": {}, "future": True}, "unsupported"),
+            ({"name": "", "input_schema": {}}, "name must"),
+            ({"name": "x", "input_schema": []}, "input_schema must"),
+            ({"name": "x", "input_schema": {}, "description": 1}, "description"),
+            ({"name": "x", "input_schema": {}, "strict": "yes"}, "strict"),
+        ],
+    )
+    def test_lossy_replay_tool_is_rejected(
+        self, tool: Mapping[str, object], message: str
+    ) -> None:
+        with pytest.raises(DialectError, match=message):
+            _validate_replay_tools([cast(Any, tool)])
+
+    @pytest.mark.parametrize(
+        "system",
+        [
+            [{"type": "future", "text": "x"}],
+            [{"type": "text", "text": 1}],
+        ],
+    )
+    def test_lossy_replay_system_is_rejected(
+        self, system: list[Mapping[str, object]]
+    ) -> None:
+        with pytest.raises(DialectError, match="opaque.system"):
+            _validate_replay_system(cast(Any, system))
+
+    @pytest.mark.parametrize(
+        ("messages", "message"),
+        [
+            ([{"role": "user", "content": [], "future": True}], "unsupported fields"),
+            ([{"role": "tool", "content": []}], "role is invalid"),
+            ([{"role": "user", "content": []}], "content must be non-empty"),
+            ([{"role": "user", "content": ["wrong"]}], "must be an object"),
+        ],
+    )
+    def test_lossy_replay_message_envelope_is_rejected(
+        self, messages: list[Mapping[str, object]], message: str
+    ) -> None:
+        payload = self._payload()
+        payload["messages"] = messages
+
+        with pytest.raises(DialectError, match=message):
+            _decode_continuation(json.dumps(payload))
+
+    @pytest.mark.parametrize(
+        ("messages", "message"),
+        [
+            ([{"role": "user", "content": "wrong"}], "content must be a list"),
+            ([{"role": "user", "content": ["wrong"]}], "must be an object"),
+            (
+                [
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "id"}],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "later"}],
+                    },
+                ],
+                "must immediately return",
+            ),
+            (
+                [
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_result", "tool_use_id": "id"}],
+                    }
+                ],
+                "require user role",
+            ),
+            (
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "id"},
+                            {"type": "tool_result", "tool_use_id": "id"},
+                        ],
+                    }
+                ],
+                "duplicates a tool_result id",
+            ),
+            (
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "tool_use", "id": "id"}],
+                    }
+                ],
+                "require assistant role",
+            ),
+        ],
+    )
+    def test_tool_history_state_rejects_invalid_protocol(
+        self, messages: list[Mapping[str, object]], message: str
+    ) -> None:
+        rejection, pending = _tool_history_state(cast(Any, messages))
+
+        assert rejection is not None and message in rejection
+        assert pending == frozenset()
+
+
+class TestWireVerifierNegativeEvidence:
+    def test_input_verifier_detects_system_presence_and_content_drift(self) -> None:
+        without_system = _AnthropicInputVerifier(_chat(), None)
+        assert (
+            without_system.verify(
+                {
+                    "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "Hello"}]}
+                    ],
+                    "system": [],
+                }
+            )
+            == "body.system was added"
+        )
+
+        source = _chat(
+            ChatMessage("system", (TextPart("rules"),)),
+            ChatMessage("user", (TextPart("Hello"),)),
+        )
+        verifier = _AnthropicInputVerifier(source, None)
+        assert verifier.verify({"messages": []}) == "body.system is missing"
+        assert (
+            verifier.verify(
+                {
+                    "system": [{"type": "text", "text": "changed"}],
+                    "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "Hello"}]}
+                    ],
+                }
+            )
+            == "body.system changed"
+        )
+
+    def test_tool_and_reasoning_verifiers_reject_wrong_wire_shape(self) -> None:
+        source = ({"type": "function", "name": "lookup", "parameters": {}},)
+        tools = _AnthropicToolsVerifier(source)
+        assert tools.verify({"tools": []}) == "body.tools count changed"
+
+        choice = _AnthropicToolChoiceVerifier(None, True)
+        assert choice.verify({"tool_choice": None}) == "body.tool_choice changed"
+
+        summary = _ReasoningSummaryVerifier("auto", False)
+        assert summary.verify({}) == "body.thinking is missing"
+        assert (
+            summary.verify({"thinking": {"type": "adaptive", "display": "omitted"}})
+            == "body.thinking.display changed"
+        )
+        assert (
+            summary.verify({"thinking": {"type": "enabled", "display": "summarized"}})
+            == "body.thinking.type changed"
+        )
+
+
+class TestAdditionalProviderResponseBoundaries:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("response", "message"),
+        [
+            ({**_response(), "id": ""}, "response.id"),
+            ({**_response(), "content": {}}, "response.content must be a list"),
+            (
+                _response([{"type": "text", "text": "x", "future": True}]),
+                "unsupported text fields",
+            ),
+            (_response([{"type": "text", "text": 1}]), "text must be a string"),
+            (
+                _response(
+                    [{"type": "thinking", "thinking": "x", "signature": "sig", "x": 1}]
+                ),
+                "unsupported thinking fields",
+            ),
+            (
+                _response([{"type": "thinking", "thinking": 1, "signature": "sig"}]),
+                "thinking must be a string",
+            ),
+            (
+                _response([{"type": "redacted_thinking", "data": "x", "future": True}]),
+                "unsupported redacted-thinking fields",
+            ),
+            (
+                _response(
+                    [
+                        {
+                            "type": "tool_use",
+                            "id": "id",
+                            "name": "x",
+                            "input": {},
+                            "future": True,
+                        }
+                    ],
+                    stop_reason="tool_use",
+                ),
+                "unsupported tool_use fields",
+            ),
+            (
+                _response(
+                    [{"type": "tool_use", "id": "id", "name": "x", "input": []}],
+                    stop_reason="tool_use",
+                ),
+                "input must be an object",
+            ),
+            (
+                {**_response(stop_reason="stop_sequence"), "stop_sequence": None},
+                "response.stop_sequence",
+            ),
+            (
+                _response(usage={"input_tokens": 1, "output_tokens": 1, "future": 1}),
+                "unsupported field",
+            ),
+            (
+                _response(
+                    usage={
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "cache_creation": {"ephemeral_1h_input_tokens": 1},
+                    }
+                ),
+                "cache_creation has unsupported fields",
+            ),
+            (
+                _response(
+                    usage={
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "server_tool_use": {"web_search_requests": 0},
+                    }
+                ),
+                "server_tool_use has unsupported fields",
+            ),
+            (
+                _response(
+                    usage={
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "service_tier": "free",
+                    }
+                ),
+                "service_tier is invalid",
+            ),
+            (
+                _response(
+                    usage={"input_tokens": 1, "output_tokens": 1, "inference_geo": 1}
+                ),
+                "inference_geo must be a string",
+            ),
+            (
+                _response(
+                    usage={
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "output_tokens_details": {"thinking_tokens": 0, "future": 0},
+                    }
+                ),
+                "output_tokens_details has unsupported fields",
+            ),
+        ],
+    )
+    async def test_malformed_response_shape_fails_loudly(
+        self, response: Mapping[str, object], message: str
+    ) -> None:
+        with pytest.raises(OutputContractError, match=message):
+            await _run(lambda _: httpx.Response(200, json=response))
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("events", "message"),
+        [
+            (({"type": "future"},), "unsupported Anthropic stream event"),
+            (
+                (_stream_start(), _stream_start()),
+                "two message_start",
+            ),
+            (
+                (
+                    {
+                        **_stream_start(),
+                        "message": _response(
+                            content=[{"type": "text", "text": "x"}], stop_reason=None
+                        ),
+                    },
+                ),
+                "content must be empty",
+            ),
+            (
+                (
+                    {
+                        **_stream_start(),
+                        "message": _response(content=[], stop_reason="end_turn"),
+                    },
+                ),
+                "stop_reason must be null",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                ),
+                "duplicated content block",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": "x"},
+                    },
+                ),
+                "inactive content block",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": "",
+                        },
+                    },
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "signature_delta", "signature": "a"},
+                    },
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "signature_delta", "signature": "b"},
+                    },
+                ),
+                "duplicated the signature delta",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": "",
+                        },
+                    },
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "signature_delta", "signature": "a"},
+                    },
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "thinking_delta", "thinking": "late"},
+                    },
+                ),
+                "followed the terminal signature delta",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": 1},
+                    },
+                ),
+                "text must be a string",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": "",
+                        },
+                    },
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "thinking_delta", "thinking": 1},
+                    },
+                ),
+                "thinking must be a string",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": "",
+                        },
+                    },
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "signature_delta", "signature": 1},
+                    },
+                ),
+                "signature must be a string",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "id",
+                            "name": "x",
+                            "input": {},
+                        },
+                    },
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "input_json_delta", "partial_json": 1},
+                    },
+                ),
+                "partial_json must be a string",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "thinking_delta", "thinking": "x"},
+                    },
+                ),
+                "does not match block type",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {"type": "content_block_stop", "index": 0},
+                ),
+                "stop targets inactive",
+            ),
+            (
+                (
+                    _stream_start(),
+                    _stream_delta(),
+                    _stream_delta(),
+                ),
+                "two message_delta",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": "end_turn",
+                            "stop_sequence": None,
+                            "container": {},
+                        },
+                        "usage": {"output_tokens": 1},
+                    },
+                ),
+                "container has no shared-IR mapping",
+            ),
+            (
+                (
+                    _stream_start(),
+                    _stream_delta(),
+                    {"type": "message_stop"},
+                    {"type": "ping"},
+                ),
+                "data after message_stop",
+            ),
+            (
+                ({"type": "ping"},),
+                "omitted message_start",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": "x"},
+                    },
+                    {"type": "message_stop"},
+                ),
+                "omitted message_delta",
+            ),
+            (
+                (
+                    _stream_start(),
+                    {
+                        "type": "content_block_start",
+                        "index": 1,
+                        "content_block": {"type": "text", "text": "x"},
+                    },
+                    {"type": "content_block_stop", "index": 1},
+                    _stream_delta(),
+                    {"type": "message_stop"},
+                ),
+                "indexes are not dense",
+            ),
+        ],
+    )
+    async def test_additional_malformed_streams_fail_loudly(
+        self, events: tuple[Mapping[str, object], ...], message: str
+    ) -> None:
+        with pytest.raises(OutputContractError, match=message):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    content=_sse(*events),
+                    headers={"content-type": "text/event-stream"},
+                ),
+                _request(scheduling=SchedulingParams(stream=True)),
+            )
+
+    @pytest.mark.parametrize(
+        ("block", "message"),
+        [
+            ({"type": "tool_use", "id": "id", "name": "x"}, "input is absent"),
+            (
+                {
+                    "type": "tool_use",
+                    "id": "id",
+                    "name": "x",
+                    "input": {"x": 1},
+                    "_partial_json": '{"y":2}',
+                },
+                "must start as an empty object",
+            ),
+            (
+                {
+                    "type": "tool_use",
+                    "id": "id",
+                    "name": "x",
+                    "input": {},
+                    "_partial_json": "[]",
+                },
+                "input must be an object",
+            ),
+        ],
+    )
+    def test_stream_tool_block_finish_rejects_ambiguous_state(
+        self, block: dict[str, object], message: str
+    ) -> None:
+        with pytest.raises(OutputContractError, match=message):
+            _finish_stream_block(cast(Any, block), "content_block[0]")
