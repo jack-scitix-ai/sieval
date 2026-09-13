@@ -475,11 +475,23 @@ class TestValidateModelCapabilities:
                 },
             )
         )
+        google = validate_eval_config(
+            self._config(
+                dialect="google_genai",
+                capabilities={
+                    "reasoning": {"effort": "high", "summary": "auto"},
+                    "hosted_tools": {"kinds": ["google_search"]},
+                    "top_logprobs": {"minimum": 20},
+                    "input_scoring": False,
+                },
+            )
+        )
 
         assert chat.ok, chat.errors
         assert completions.ok, completions.errors
         assert responses.ok, responses.errors
         assert anthropic.ok, anthropic.errors
+        assert google.ok, google.errors
 
     @pytest.mark.parametrize("dialect", [None, "", 7, ["openai_chat"]])
     def test_explicit_malformed_dialect_is_rejected(self, dialect):
@@ -590,6 +602,17 @@ class TestValidateModelCapabilities:
         assert any(
             "does not support reasoning budget_tokens" in e for e in result.errors
         )
+
+    def test_google_capability_domain_is_rejected_during_static_validation(self):
+        result = validate_eval_config(
+            self._config(
+                dialect="google_genai",
+                capabilities={"top_logprobs": {"minimum": 21}},
+            )
+        )
+
+        assert not result.ok
+        assert any("at most 20 top logprobs" in error for error in result.errors)
 
     def test_legacy_type_is_not_a_second_default_dialect_resolver(self):
         result = validate_eval_config(
@@ -1694,9 +1717,9 @@ class TestRunDryRun:
             "    model: m\n",
             encoding="utf-8",
         )
-        content = config.read_text(encoding="utf-8")
-
-        direct = validate_eval_config(yaml.safe_load(content))
+        direct = validate_eval_config(
+            yaml.safe_load(config.read_text(encoding="utf-8"))
+        )
         dry_run = run_dry_run(config)
         checks = {check["name"]: check for check in dry_run["checks"]}
 
@@ -1708,6 +1731,45 @@ class TestRunDryRun:
         assert next(iter(binding_plans.values()))["dialect_id"] == (
             "anthropic_messages"
         )
+
+    def test_active_google_dialect_reconciles_to_its_runtime_plan(self, tmp_path):
+        """Static validation and dry-run carry Google through reconciliation."""
+        from sieval.cli.validation import run_dry_run
+
+        config = tmp_path / "google-genai.yaml"
+        config.write_text(
+            "models:\n"
+            "  m:\n"
+            "    name: gemini-2.5-flash\n"
+            "    type: chat\n"
+            "    dialect: google_genai\n"
+            "    api_base: https://generativelanguage.googleapis.com\n"
+            "    api_key: test-key\n"
+            "datasets:\n"
+            "  d:\n"
+            "    class: sieval.datasets.aime_2024.AIME2024Dataset\n"
+            "tasks:\n"
+            "  t:\n"
+            "    class: sieval.tasks.aime_2024_0shot_gen.AIME2024ZeroShotGenTask\n"
+            "    dataset: d\n"
+            "    model: m\n",
+            encoding="utf-8",
+        )
+
+        direct = validate_eval_config(
+            yaml.safe_load(config.read_text(encoding="utf-8"))
+        )
+        dry_run = run_dry_run(config)
+        checks = {check["name"]: check for check in dry_run["checks"]}
+
+        assert direct.ok, direct.errors
+        assert dry_run["n_errors"] == 0
+        assert checks["schema"]["ok"] is True
+        assert checks["imports"]["ok"] is True
+        assert checks["capability_reconcile"]["ok"] is True
+        binding_plans = checks["capability_reconcile"]["plan"]["binding_plans"]
+        assert len(binding_plans) == 1
+        assert next(iter(binding_plans.values()))["dialect_id"] == "google_genai"
 
     def test_schema_validation_failure(self, tmp_path):
         """Config with bad schema returns schema check failure."""

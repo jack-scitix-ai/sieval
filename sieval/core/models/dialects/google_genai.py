@@ -8,9 +8,11 @@ audited dialect options and ambiguous response shapes fail loudly.
 AI-Generated Code - GPT-5.6 (OpenAI)
 """
 
+import hashlib
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import cast
@@ -301,7 +303,10 @@ class _GoogleContext:
 class _GoogleExecutionContext:
     request: Request
     request_params: Mapping[str, JSONValue]
+    system_instruction: Mapping[str, JSONValue] | None
     input_contents: tuple[Mapping[str, JSONValue], ...]
+    historical_function_call_ids: frozenset[str]
+    historical_server_call_ids: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -324,13 +329,17 @@ class _OperationVerifier:
     stream: bool
     version_prefix: str
 
-    def verify_prepared(self, prepared: PreparedRequest) -> str | None:
+    def expected_operation(self) -> str:
+        """Return the one relative operation this bound dialect may execute."""
+
         method = "streamGenerateContent" if self.stream else "generateContent"
         expected = (
             f"{self.version_prefix}models/{quote(self.model_name, safe='')}:{method}"
         )
-        if self.stream:
-            expected += "?alt=sse"
+        return f"{expected}?alt=sse" if self.stream else expected
+
+    def verify_prepared(self, prepared: PreparedRequest) -> str | None:
+        expected = self.expected_operation()
         if prepared.operation != expected:
             return f"operation {prepared.operation!r} does not match {expected!r}"
         return None
@@ -478,6 +487,8 @@ def _hosted_tool(spec: object) -> dict[str, JSONValue]:
 def _image_to_part(part: ImagePart) -> dict[str, JSONValue]:
     if part.detail is not None:
         raise DialectError("Google image parts have no per-image detail field")
+    if part.media_type is not None and part.media_type not in _IMAGE_MEDIA_TYPES:
+        raise DialectError(f"unsupported Google image media type {part.media_type!r}")
     if part.url is not None:
         if not part.url:
             raise DialectError("Google image URLs must not be empty")
@@ -489,8 +500,6 @@ def _image_to_part(part: ImagePart) -> dict[str, JSONValue]:
         raise DialectError(
             "Google inline images require data and an explicit MIME type"
         )
-    if part.media_type not in _IMAGE_MEDIA_TYPES:
-        raise DialectError(f"unsupported Google image media type {part.media_type!r}")
     return {"inlineData": {"data": part.data, "mimeType": part.media_type}}
 
 
@@ -641,7 +650,30 @@ def _validate_opaque_contents(raw: object) -> list[dict[str, JSONValue]]:
     return result
 
 
-def _decode_opaque(value: str) -> list[dict[str, JSONValue]]:
+def _validate_opaque_system(
+    raw: object,
+) -> dict[str, JSONValue] | None:
+    if raw is None:
+        return None
+    copied = copy_json_value(raw, "Google opaque systemInstruction")
+    if not isinstance(copied, dict) or set(copied) != {"parts"}:
+        raise DialectError("Google opaque systemInstruction has invalid shape")
+    parts = copied["parts"]
+    if not isinstance(parts, list) or not parts:
+        raise DialectError("Google opaque systemInstruction has no parts")
+    if any(
+        not isinstance(part, dict)
+        or set(part) != {"text"}
+        or not isinstance(part["text"], str)
+        for part in parts
+    ):
+        raise DialectError("Google opaque systemInstruction must be text-only")
+    return cast(dict[str, JSONValue], copied)
+
+
+def _decode_opaque(
+    value: str,
+) -> tuple[dict[str, JSONValue] | None, list[dict[str, JSONValue]]]:
     try:
         raw = json.loads(
             value,
@@ -650,49 +682,152 @@ def _decode_opaque(value: str) -> list[dict[str, JSONValue]]:
         )
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         raise DialectError("invalid Google opaque continuation JSON") from exc
-    if not isinstance(raw, dict) or set(raw) != {"version", "contents"}:
+    if (
+        not isinstance(raw, dict)
+        or not {"version", "contents"}.issubset(raw)
+        or set(raw) - {"version", "contents", "systemInstruction"}
+    ):
         raise DialectError("invalid Google opaque continuation envelope")
     if raw.get("version") != _OPAQUE_VERSION:
         raise DialectError("unsupported Google opaque continuation version")
-    return _validate_opaque_contents(raw.get("contents"))
+    return (
+        _validate_opaque_system(raw.get("systemInstruction")),
+        _validate_opaque_contents(raw.get("contents")),
+    )
 
 
-def _call_names_from_contents(
+def _call_state_from_contents(
     contents: Sequence[Mapping[str, JSONValue]],
-) -> dict[str, str]:
+) -> tuple[dict[str, str], set[str]]:
     names: dict[str, str] = {}
-    for content in contents:
+    answered: set[str] = set()
+    for content_index, content in enumerate(contents):
         parts = content.get("parts")
         if not isinstance(parts, list):
             continue
-        for part in parts:
+        for part_index, part in enumerate(parts):
             if not isinstance(part, dict):
                 continue
             call = part.get("functionCall")
-            if not isinstance(call, dict):
-                continue
-            call_id = call.get("id")
-            name = call.get("name")
-            if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
+            if isinstance(call, dict):
+                call_id = call.get("id")
+                name = call.get("name")
+                if not isinstance(call_id, str) or not call_id:
+                    raise DialectError(
+                        "Google opaque functionCall requires a non-empty id"
+                    )
+                if not isinstance(name, str) or not name:
+                    raise DialectError(
+                        "Google opaque functionCall requires a non-empty name"
+                    )
                 if call_id in names:
                     raise DialectError(f"duplicate Google function call id {call_id!r}")
                 names[call_id] = name
-    return names
+            response = part.get("functionResponse")
+            if not isinstance(response, dict):
+                continue
+            call_id = response.get("id")
+            name = response.get("name")
+            if not isinstance(call_id, str) or not call_id:
+                raise DialectError(
+                    "Google opaque functionResponse requires a non-empty id"
+                )
+            try:
+                expected_name = names[call_id]
+            except KeyError as exc:
+                raise DialectError(
+                    "Google opaque functionResponse at "
+                    f"{content_index}.{part_index} has no prior functionCall"
+                ) from exc
+            if name != expected_name:
+                raise DialectError(
+                    f"Google opaque functionResponse name changed for {call_id!r}"
+                )
+            if call_id in answered:
+                raise DialectError(f"duplicate Google function result for {call_id!r}")
+            answered.add(call_id)
+    return names, answered
+
+
+def _historical_output_call_ids(
+    contents: Sequence[Mapping[str, JSONValue]],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Recover conversation-scoped call ids from the final request body."""
+
+    function_ids: set[str] = set()
+    server_ids: set[str] = set()
+    for content_index, content in enumerate(contents):
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            raise DialectError(
+                f"final Google contents[{content_index}].parts must be a list"
+            )
+        for part_index, part in enumerate(parts):
+            if not isinstance(part, Mapping):
+                raise DialectError(
+                    f"final Google contents[{content_index}].parts[{part_index}] "
+                    "must be an object"
+                )
+            for field_name, ids in (
+                ("functionCall", function_ids),
+                ("toolCall", server_ids),
+            ):
+                if field_name not in part:
+                    continue
+                call = part[field_name]
+                if not isinstance(call, Mapping):
+                    raise DialectError(
+                        f"final Google {field_name} history must be an object"
+                    )
+                call_id = call.get("id")
+                if not isinstance(call_id, str) or not call_id:
+                    raise DialectError(
+                        f"final Google {field_name} history requires a non-empty id"
+                    )
+                if call_id in ids:
+                    raise DialectError(
+                        f"final Google history duplicates {field_name} id {call_id!r}"
+                    )
+                ids.add(call_id)
+    return frozenset(function_ids), frozenset(server_ids)
+
+
+def _chat_shape_error(request_input: ChatInput) -> str | None:
+    """Return a lossless-mapping error for Google chat history, if any."""
+
+    if any(message.role == "developer" for message in request_input.messages):
+        return (
+            "Google systemInstruction cannot preserve the distinct developer "
+            "message authority"
+        )
+    if request_input.messages[-1].role == "assistant":
+        return "google_genai does not support assistant-prefill input"
+    return None
+
+
+def _require_generation_turn(contents: Sequence[JSONValue]) -> None:
+    """Reject a body that cannot ask Google for a new model turn."""
+
+    if not contents or _get(contents[-1], "role") != "user":
+        raise DialectError("Google contents must end with a user or tool-result turn")
 
 
 def _input_to_wire(
     request_input: ChatInput, opaque: str | None
 ) -> tuple[dict[str, JSONValue] | None, list[JSONValue]]:
+    if error := _chat_shape_error(request_input):
+        raise DialectError(error)
     system_parts: list[JSONValue] = []
-    opaque_contents = _decode_opaque(opaque) if opaque is not None else []
+    opaque_system, opaque_contents = (
+        _decode_opaque(opaque) if opaque is not None else (None, [])
+    )
     contents: list[JSONValue] = list(opaque_contents)
-    call_names = _call_names_from_contents(opaque_contents)
-    answered_calls: set[str] = set()
+    call_names, answered_calls = _call_state_from_contents(opaque_contents)
     saw_conversation = False
     for message in request_input.messages:
         if message.name is not None:
             raise DialectError("Google contents have no ChatMessage.name field")
-        if message.role in {"system", "developer"}:
+        if message.role == "system":
             if saw_conversation:
                 raise DialectError(
                     "Google system/developer messages must precede conversation turns"
@@ -706,7 +841,18 @@ def _input_to_wire(
         parts = _content_parts(message, call_names, answered_calls)
         role = "model" if message.role == "assistant" else "user"
         contents.append({"role": role, "parts": parts})
-    system = {"parts": system_parts} if system_parts else None
+    _require_generation_turn(contents)
+    current_system = {"parts": system_parts} if system_parts else None
+    if (
+        opaque_system is not None
+        and current_system is not None
+        and opaque_system != current_system
+    ):
+        raise DialectError(
+            "Google opaque continuation systemInstruction conflicts with "
+            "the current request"
+        )
+    system = current_system if current_system is not None else opaque_system
     return system, contents
 
 
@@ -715,20 +861,23 @@ def _verification_input_to_wire(
 ) -> tuple[dict[str, JSONValue] | None, list[JSONValue]]:
     """Independently derive the expected input for request-audit verification."""
 
-    opaque_contents = _decode_opaque(opaque) if opaque is not None else []
+    if error := _chat_shape_error(request_input):
+        raise DialectError(error)
+    opaque_system, opaque_contents = (
+        _decode_opaque(opaque) if opaque is not None else (None, [])
+    )
     contents: list[JSONValue] = [
         copy_json_value(item, "verified Google opaque content")
         for item in opaque_contents
     ]
     system_parts: list[JSONValue] = []
-    call_names = _call_names_from_contents(opaque_contents)
-    answered: set[str] = set()
+    call_names, answered = _call_state_from_contents(opaque_contents)
     saw_conversation = False
 
     for message in request_input.messages:
         if message.name is not None:
             raise DialectError("Google contents have no ChatMessage.name field")
-        is_instruction = message.role in {"system", "developer"}
+        is_instruction = message.role == "system"
         if is_instruction and saw_conversation:
             raise DialectError(
                 "Google system/developer messages must precede conversation turns"
@@ -751,6 +900,13 @@ def _verification_input_to_wire(
                 if part.detail is not None:
                     raise DialectError(
                         "Google image parts have no per-image detail field"
+                    )
+                if (
+                    part.media_type is not None
+                    and part.media_type not in _IMAGE_MEDIA_TYPES
+                ):
+                    raise DialectError(
+                        f"unsupported Google image media type {part.media_type!r}"
                     )
                 if part.url is not None:
                     file_data: dict[str, JSONValue] = {"fileUri": part.url}
@@ -837,7 +993,18 @@ def _verification_input_to_wire(
             role = "model" if message.role == "assistant" else "user"
             contents.append({"role": role, "parts": expected_parts})
 
-    system = {"parts": system_parts} if system_parts else None
+    _require_generation_turn(contents)
+    current_system = {"parts": system_parts} if system_parts else None
+    if (
+        opaque_system is not None
+        and current_system is not None
+        and opaque_system != current_system
+    ):
+        raise DialectError(
+            "Google opaque continuation systemInstruction conflicts with "
+            "the current request"
+        )
+    system = current_system if current_system is not None else opaque_system
     return system, contents
 
 
@@ -867,7 +1034,7 @@ def _usage(raw: object) -> UsageStats | None:
     reported_total = _optional_nonnegative_int(
         _get(raw, "totalTokenCount"), "usage.totalTokenCount"
     )
-    total = reported_total if reported_total is not None else prompt + output
+    total = prompt + output
     return UsageStats(
         input_tokens=prompt,
         output_tokens=output,
@@ -886,7 +1053,11 @@ def _usage(raw: object) -> UsageStats | None:
             if _get(raw, "cachedContentTokenCount") is not None
             else None
         ),
-        reported_total_tokens=reported_total,
+        reported_total_tokens=(
+            reported_total
+            if reported_total is not None and reported_total != total
+            else None
+        ),
     )
 
 
@@ -918,9 +1089,9 @@ def _logprobs(
         if not tops:
             continue
         entries = _sequence(_get(tops[index], "candidates"), f"{path}.top[{index}]")
-        if len(entries) > requested_top_k and requested_top_k > 0:
+        if requested_top_k > 0 and len(entries) != requested_top_k:
             raise OutputContractError(
-                "Google returned more top logprobs than requested"
+                "Google returned a different number of top logprobs than requested"
             )
         alternatives.append(
             tuple(
@@ -1013,14 +1184,62 @@ def _grounding(raw: object, path: str) -> GroundingMetadata | None:
     return GroundingMetadata(tuple(chunks), rendered)
 
 
+def _synthetic_call_id(
+    input_contents: Sequence[Mapping[str, JSONValue]],
+    candidate_index: int,
+    part_index: int,
+    kind: str,
+    name: str,
+    arguments: Mapping[str, JSONValue],
+) -> str:
+    """Derive a stable IR id when Google omits an optional call id."""
+
+    payload = {
+        "input_contents": list(input_contents),
+        "candidate_index": candidate_index,
+        "part_index": part_index,
+        "kind": kind,
+        "name": name,
+        "arguments": dict(arguments),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    prefix = "google_call" if kind == "function" else "google_server"
+    return f"{prefix}_{hashlib.sha256(encoded).hexdigest()[:24]}"
+
+
 def _opaque_history(
+    system_instruction: Mapping[str, JSONValue] | None,
     input_contents: Sequence[Mapping[str, JSONValue]],
     output_content: Mapping[str, JSONValue],
+    opaque_call_ids: Mapping[int, tuple[str, str]],
 ) -> str | None:
     history: list[JSONValue] = [
         copy_json_value(item, "Google input history") for item in input_contents
     ]
-    history.append(copy_json_value(output_content, "Google output history"))
+    copied_output = copy_json_value(output_content, "Google output history")
+    if not isinstance(copied_output, dict):
+        raise AssertionError("copied Google output content must remain an object")
+    copied_parts = copied_output.get("parts")
+    if not isinstance(copied_parts, list):
+        raise AssertionError("copied Google output content must retain parts")
+    for part_index, (field_name, call_id) in opaque_call_ids.items():
+        try:
+            copied_part = copied_parts[part_index]
+        except IndexError as exc:
+            raise AssertionError("Google function-call part index changed") from exc
+        if not isinstance(copied_part, dict):
+            raise AssertionError("Google function-call part changed shape")
+        copied_call = copied_part.get(field_name)
+        if not isinstance(copied_call, dict):
+            raise AssertionError("Google call payload changed shape")
+        copied_call["id"] = call_id
+    history.append(copied_output)
     saw_signature = False
     for content in history:
         if not isinstance(content, dict):
@@ -1038,8 +1257,16 @@ def _opaque_history(
             break
     if not saw_signature:
         return None
+    envelope: dict[str, JSONValue] = {
+        "version": _OPAQUE_VERSION,
+        "contents": history,
+    }
+    if system_instruction is not None:
+        envelope["systemInstruction"] = copy_json_value(
+            system_instruction, "Google system history"
+        )
     return json.dumps(
-        {"version": _OPAQUE_VERSION, "contents": history},
+        envelope,
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
@@ -1095,9 +1322,17 @@ class GoogleGenAIDialect:
         has_named_message = isinstance(req.input, ChatInput) and any(
             message.name is not None for message in req.input.messages
         )
+        chat_shape_error = (
+            _chat_shape_error(req.input) if isinstance(req.input, ChatInput) else None
+        )
         for path in audit.active_paths:
-            if path == "input.chat" and has_named_message:
-                audit.rejected(path, "Google contents have no ChatMessage.name field")
+            if path == "input.chat":
+                if has_named_message:
+                    audit.rejected(
+                        path, "Google contents have no ChatMessage.name field"
+                    )
+                elif chat_shape_error is not None:
+                    audit.rejected(path, chat_shape_error)
             elif path.startswith("input.completion"):
                 audit.rejected(path, "google_genai requires ChatInput")
             elif path == "input.modality.image.detail":
@@ -1337,21 +1572,18 @@ class GoogleGenAIDialect:
                 body[key] = value
                 audit.consumed(path, _RootOptionVerifier(key, value))
 
-        method = "streamGenerateContent" if req.scheduling.stream else "generateContent"
-        operation = (
-            f"{self._version_prefix}models/{quote(self._model_name, safe='')}:{method}"
+        operation_verifier = _OperationVerifier(
+            self._model_name,
+            req.scheduling.stream,
+            self._version_prefix,
         )
+        operation = operation_verifier.expected_operation()
         if req.scheduling.stream:
-            operation += "?alt=sse"
             consume(
                 "scheduling.stream",
-                _OperationVerifier(
-                    self._model_name,
-                    True,
-                    self._version_prefix,
-                ),
+                operation_verifier,
             )
-        return PreparedRequest(operation, body, _GoogleContext(req))
+        return PreparedRequest(operation, body, _GoogleContext(deepcopy(req)))
 
     def _lift(self, raw: object, context: _GoogleExecutionContext) -> Response:
         req = context.request
@@ -1365,6 +1597,8 @@ class GoogleGenAIDialect:
         finish_reasons: list[str] = []
         reasoning: list[ReasoningOutput | None] = []
         calls: list[FunctionToolCall] = []
+        call_ids = set(context.historical_function_call_ids)
+        server_call_ids = set(context.historical_server_call_ids)
         server_calls: dict[str, tuple[str, Mapping[str, JSONValue]]] = {}
         server_results: dict[str, tuple[str, JSONValue]] = {}
         citations: list[Citation] = []
@@ -1399,6 +1633,7 @@ class GoogleGenAIDialect:
                 raise OutputContractError("Google response content must be an object")
             text_parts: list[str] = []
             thought_text: list[str] = []
+            opaque_call_ids: dict[int, tuple[str, str]] = {}
             for part_index, raw_part in enumerate(parts):
                 if not isinstance(raw_part, Mapping):
                     raise OutputContractError("Google response part must be an object")
@@ -1455,10 +1690,33 @@ class GoogleGenAIDialect:
                     )
                     if not isinstance(arguments, dict):
                         raise OutputContractError("functionCall.args must be an object")
+                    name = _required_string(_get(call, "name"), "functionCall.name")
+                    raw_call_id = _get(call, "id")
+                    if raw_call_id is None or raw_call_id == "":
+                        call_id = _synthetic_call_id(
+                            context.input_contents,
+                            index,
+                            part_index,
+                            "function",
+                            name,
+                            arguments,
+                        )
+                    elif isinstance(raw_call_id, str):
+                        call_id = raw_call_id
+                    else:
+                        raise OutputContractError(
+                            "functionCall.id must be a string when present"
+                        )
+                    if call_id in call_ids:
+                        raise OutputContractError(
+                            f"duplicate Google function call id {call_id!r}"
+                        )
+                    call_ids.add(call_id)
+                    opaque_call_ids[part_index] = ("functionCall", call_id)
                     calls.append(
                         FunctionToolCall(
-                            _required_string(_get(call, "id"), "functionCall.id"),
-                            _required_string(_get(call, "name"), "functionCall.name"),
+                            call_id,
+                            name,
                             arguments,
                         )
                     )
@@ -1471,18 +1729,35 @@ class GoogleGenAIDialect:
                     if not isinstance(raw_item, Mapping):
                         raise OutputContractError("toolCall must be an object")
                     item = cast(Mapping[str, object], raw_item)
-                    tool_id = _required_string(_get(item, "id"), "toolCall.id")
-                    if tool_id in server_calls:
-                        raise OutputContractError(
-                            f"duplicate Google server tool call id {tool_id!r}"
-                        )
+                    tool_type = _required_string(
+                        _get(item, "toolType"), "toolCall.toolType"
+                    )
+                    raw_tool_id = _get(item, "id")
                     raw_args = copy_json_value(_get(item, "args", {}), "toolCall.args")
                     if not isinstance(raw_args, dict):
                         raise OutputContractError("toolCall.args must be an object")
-                    server_calls[tool_id] = (
-                        _required_string(_get(item, "toolType"), "toolCall.toolType"),
-                        raw_args,
-                    )
+                    if raw_tool_id is None or raw_tool_id == "":
+                        tool_id = _synthetic_call_id(
+                            context.input_contents,
+                            index,
+                            part_index,
+                            "server",
+                            tool_type,
+                            raw_args,
+                        )
+                    elif isinstance(raw_tool_id, str):
+                        tool_id = raw_tool_id
+                    else:
+                        raise OutputContractError(
+                            "toolCall.id must be a string when present"
+                        )
+                    if tool_id in server_call_ids:
+                        raise OutputContractError(
+                            f"duplicate Google server tool call id {tool_id!r}"
+                        )
+                    server_call_ids.add(tool_id)
+                    server_calls[tool_id] = (tool_type, raw_args)
+                    opaque_call_ids[part_index] = ("toolCall", tool_id)
                 else:
                     if not req.tools.hosted:
                         raise OutputContractError(
@@ -1492,7 +1767,27 @@ class GoogleGenAIDialect:
                     if not isinstance(raw_item, Mapping):
                         raise OutputContractError("toolResponse must be an object")
                     item = cast(Mapping[str, object], raw_item)
-                    tool_id = _required_string(_get(item, "id"), "toolResponse.id")
+                    tool_type = _required_string(
+                        _get(item, "toolType"), "toolResponse.toolType"
+                    )
+                    raw_tool_id = _get(item, "id")
+                    if raw_tool_id is None or raw_tool_id == "":
+                        matching = [
+                            call_id
+                            for call_id, (call_type, _) in server_calls.items()
+                            if call_type == tool_type and call_id not in server_results
+                        ]
+                        if len(matching) != 1:
+                            raise OutputContractError(
+                                "Google toolResponse without id is ambiguous"
+                            )
+                        tool_id = matching[0]
+                    elif isinstance(raw_tool_id, str):
+                        tool_id = raw_tool_id
+                    else:
+                        raise OutputContractError(
+                            "toolResponse.id must be a string when present"
+                        )
                     if tool_id in server_results:
                         raise OutputContractError(
                             f"duplicate Google server tool response id {tool_id!r}"
@@ -1504,12 +1799,8 @@ class GoogleGenAIDialect:
                         raise OutputContractError(
                             "toolResponse.response must be an object"
                         )
-                    server_results[tool_id] = (
-                        _required_string(
-                            _get(item, "toolType"), "toolResponse.toolType"
-                        ),
-                        tool_result,
-                    )
+                    server_results[tool_id] = (tool_type, tool_result)
+                    opaque_call_ids[part_index] = ("toolResponse", tool_id)
             text = "".join(text_parts)
             texts.append(text)
             finish_reason = _required_string(
@@ -1519,7 +1810,12 @@ class GoogleGenAIDialect:
                 raise OutputContractError("Google candidate is not terminal")
             finish_reasons.append(finish_reason)
             opaque = (
-                _opaque_history(context.input_contents, content_mapping)
+                _opaque_history(
+                    context.system_instruction,
+                    context.input_contents,
+                    content_mapping,
+                    opaque_call_ids,
+                )
                 if content_mapping is not None and parts
                 else None
             )
@@ -1552,10 +1848,15 @@ class GoogleGenAIDialect:
                     "candidate.logprobsResult",
                     req.scoring.top_logprobs,
                 )
+                if text and not chosen:
+                    raise OutputContractError(
+                        "Google returned non-empty text without chosen logprobs"
+                    )
                 sampled.extend(chosen)
                 top.extend(alternatives)
         if req.reasoning.summary == "auto" and any(
-            item is None or not item.text for item in reasoning
+            item is None or item.text is None or not item.text.strip()
+            for item in reasoning
         ):
             raise OutputContractError(
                 "Google reply omitted requested thoughts for one or more candidates"
@@ -1617,7 +1918,12 @@ class GoogleGenAIDialect:
                 return
             payload = "\n".join(data_lines)
             data_lines.clear()
-            chunks.append(_strict_json_loads(payload, "Google stream event"))
+            event = _strict_json_loads(payload, "Google stream event")
+            if not isinstance(event, dict) or not event:
+                raise OutputContractError(
+                    "Google stream event must be a non-empty response object"
+                )
+            chunks.append(event)
 
         async for line in response.aiter_lines():
             if not line:
@@ -1643,14 +1949,11 @@ class GoogleGenAIDialect:
         self, chunks: list[object], context: _GoogleExecutionContext
     ) -> Response:
         # Each stream event carries candidate deltas plus cumulative/terminal
-        # metadata. Merge only provider-defined additive content and require
-        # finish/usage metadata to agree when repeated.
+        # metadata. Merge only provider-defined additive content; usage is a
+        # terminal snapshot and must come from the final event.
         by_index: dict[int, dict[str, object]] = {}
-        usage: object = None
         model_version: object = None
         for chunk_index, chunk in enumerate(chunks):
-            if _get(chunk, "usageMetadata") is not None:
-                usage = _get(chunk, "usageMetadata")
             if _get(chunk, "modelVersion") is not None:
                 current_model = _get(chunk, "modelVersion")
                 if model_version is not None and current_model != model_version:
@@ -1689,7 +1992,11 @@ class GoogleGenAIDialect:
                             "Google stream changed a candidate finishReason"
                         )
                     state["finishReason"] = finish_reason
-                for name in ("citationMetadata", "groundingMetadata"):
+                for name in (
+                    "citationMetadata",
+                    "urlContextMetadata",
+                    "groundingMetadata",
+                ):
                     value = _get(raw_candidate, name)
                     if value is not None:
                         state[name] = value
@@ -1738,8 +2045,11 @@ class GoogleGenAIDialect:
                 candidate[key] = copy_json_value(value, f"stream.{key}")
             candidates.append(candidate)
         merged: dict[str, JSONValue] = {"candidates": candidates}
-        if usage is not None:
-            merged["usageMetadata"] = copy_json_value(usage, "stream usage")
+        terminal_usage = _get(chunks[-1], "usageMetadata")
+        if terminal_usage is not None:
+            merged["usageMetadata"] = copy_json_value(
+                terminal_usage, "terminal stream usage"
+            )
         if model_version is not None:
             merged["modelVersion"] = copy_json_value(model_version, "stream model")
         return self._lift(merged, context)
@@ -1748,13 +2058,16 @@ class GoogleGenAIDialect:
         context = prepared.context
         if not isinstance(context, _GoogleContext):
             raise DialectError("google_genai received invalid prepared context")
-        expected_suffix = (
-            ":streamGenerateContent?alt=sse"
-            if context.request.scheduling.stream
-            else ":generateContent"
-        )
-        if not prepared.operation.endswith(expected_suffix):
-            raise DialectError("google_genai received the wrong prepared operation")
+        operation_mismatch = _OperationVerifier(
+            self._model_name,
+            context.request.scheduling.stream,
+            self._version_prefix,
+        ).verify_prepared(prepared)
+        if operation_mismatch is not None:
+            raise DialectError(
+                f"google_genai received the wrong prepared operation: "
+                f"{operation_mismatch}"
+            )
         body = prepared.thaw_body()
         raw_contents = body.get("contents")
         if not isinstance(raw_contents, list):
@@ -1784,6 +2097,20 @@ class GoogleGenAIDialect:
             isinstance(item, dict) for item in actual_contents
         ):
             raise DialectError("final Google request body has invalid contents")
+        historical_function_call_ids, historical_server_call_ids = (
+            _historical_output_call_ids(
+                tuple(cast(list[Mapping[str, JSONValue]], actual_contents))
+            )
+        )
+        raw_system = actual_body.get("systemInstruction")
+        if raw_system is None:
+            actual_system: Mapping[str, JSONValue] | None = None
+        elif isinstance(raw_system, dict):
+            actual_system = cast(Mapping[str, JSONValue], raw_system)
+        else:
+            raise DialectError(
+                "final Google request body has invalid systemInstruction"
+            )
         request_params: dict[str, JSONValue] = {
             "method": request.method,
             "path": request.url.path,
@@ -1799,7 +2126,10 @@ class GoogleGenAIDialect:
         execution_context = _GoogleExecutionContext(
             request=context.request,
             request_params=request_params,
+            system_instruction=actual_system,
             input_contents=tuple(cast(list[Mapping[str, JSONValue]], actual_contents)),
+            historical_function_call_ids=historical_function_call_ids,
+            historical_server_call_ids=historical_server_call_ids,
         )
         response = await self._connection.client.send(request)
         response.raise_for_status()

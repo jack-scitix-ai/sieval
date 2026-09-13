@@ -222,7 +222,6 @@ class TestRequestLowering:
         req = _request(
             input=_chat(
                 ChatMessage("system", (TextPart("Be concise"),)),
-                ChatMessage("developer", (TextPart("Use JSON"),)),
                 ChatMessage("user", (TextPart("Hello"),)),
             ),
             sampling=SamplingParams(
@@ -243,9 +242,7 @@ class TestRequestLowering:
         assert request.headers["x-goog-api-key"] == "google-secret"
         assert seen["body"] == {
             "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
-            "systemInstruction": {
-                "parts": [{"text": "Be concise"}, {"text": "Use JSON"}]
-            },
+            "systemInstruction": {"parts": [{"text": "Be concise"}]},
             "generationConfig": {
                 "temperature": 0.2,
                 "topP": 0.9,
@@ -277,6 +274,51 @@ class TestRequestLowering:
             return httpx.Response(200, json=_response())
 
         await _run(handler, credential=None)
+
+    @pytest.mark.anyio
+    async def test_prepared_context_is_detached_from_mutable_request_inputs(
+        self,
+    ) -> None:
+        function_specs: list[Mapping[str, object]] = [{"name": "lookup"}]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert json.loads(request.content)["tools"] == [
+                {"functionDeclarations": [{"name": "lookup"}]}
+            ]
+            return httpx.Response(
+                200,
+                json=_response(
+                    parts=[
+                        {
+                            "functionCall": {
+                                "id": "call_1",
+                                "name": "lookup",
+                                "args": {},
+                            }
+                        }
+                    ]
+                ),
+            )
+
+        connection = _connection(handler)
+        try:
+            dialect = GoogleGenAIDialect(connection, "gemini-2.5-flash")
+            req = _request(
+                tools=ToolParams(functions=cast(Any, function_specs)),
+            )
+            audit = RequestAudit(active_request_leaves(req))
+            dialect.validate_request(req, audit, cast(Any, SimpleNamespace()))
+            prepared = dialect.prepare(req, audit)
+            audit.finish(prepared)
+
+            function_specs.clear()
+
+            result = await dialect.execute(prepared)
+        finally:
+            await connection.aclose()
+
+        assert result.tool_calls is not None
+        assert result.tool_calls[0].name == "lookup"
 
     @pytest.mark.anyio
     async def test_multimodal_parts_preserve_order(self) -> None:
@@ -313,6 +355,24 @@ class TestRequestLowering:
                 }
             },
         ]
+
+    @pytest.mark.anyio
+    async def test_url_image_cannot_bypass_image_only_media_types(self) -> None:
+        req = _request(
+            input=_chat(
+                ChatMessage(
+                    "user",
+                    (
+                        ImagePart(
+                            url="gs://bucket/document.pdf", media_type="application/pdf"
+                        ),
+                    ),
+                )
+            )
+        )
+
+        with pytest.raises(DialectError, match="unsupported Google image media type"):
+            await _run(_no_io, req)
 
     @pytest.mark.anyio
     async def test_function_result_recovers_name_from_prior_call(self) -> None:
@@ -480,6 +540,30 @@ class TestPreIORejections:
             (
                 _request(
                     input=_chat(
+                        ChatMessage("developer", (TextPart("higher priority"),)),
+                        ChatMessage("user", (TextPart("question"),)),
+                    )
+                ),
+                "developer message authority",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage("user", (TextPart("complete this"),)),
+                        ChatMessage("assistant", (TextPart("partial"),)),
+                    )
+                ),
+                "assistant-prefill",
+            ),
+            (
+                _request(
+                    input=_chat(ChatMessage("system", (TextPart("instructions"),)))
+                ),
+                "end with a user or tool-result turn",
+            ),
+            (
+                _request(
+                    input=_chat(
                         ChatMessage(
                             "user",
                             (
@@ -549,6 +633,34 @@ class TestPreIORejections:
     ) -> None:
         with pytest.raises(RequestAuditError):
             await _run(_no_io, _request(sampling=sampling))
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "req",
+        [
+            _request(
+                sampling=SamplingParams(n=2),
+                scoring=ScoringParams(sampled_logprobs=True),
+            ),
+            _request(
+                sampling=SamplingParams(n=2),
+                tools=ToolParams(functions=({"name": "f"},)),
+            ),
+            _request(
+                sampling=SamplingParams(n=2),
+                tools=ToolParams(hosted=(HostedToolSpec("google_search"),)),
+            ),
+            _request(
+                sampling=SamplingParams(n=2),
+                structured_output=StructuredOutputParams(format="json_object"),
+            ),
+        ],
+    )
+    async def test_multiple_candidates_reject_singular_channels_before_io(
+        self, req: Request
+    ) -> None:
+        with pytest.raises(ValueError, match="singular response channels"):
+            await _run(_no_io, req)
 
 
 class TestReasoningAndStructuredOutput:
@@ -620,10 +732,98 @@ class TestReasoningAndStructuredOutput:
         assert second.reasoning[0].opaque_roundtrip
 
     @pytest.mark.anyio
+    async def test_opaque_history_preserves_system_instruction(self) -> None:
+        first = await _run(
+            lambda _: httpx.Response(
+                200,
+                json=_response(
+                    [
+                        {
+                            "text": "analysis",
+                            "thought": True,
+                            "thoughtSignature": "sig_1",
+                        },
+                        {"text": "answer"},
+                    ]
+                ),
+            ),
+            _request(
+                input=_chat(
+                    ChatMessage("system", (TextPart("Always answer as JSON"),)),
+                    ChatMessage("user", (TextPart("first"),)),
+                )
+            ),
+        )
+        assert first.reasoning is not None and first.reasoning[0] is not None
+        opaque = cast(str, first.reasoning[0].opaque_roundtrip)
+        envelope = json.loads(opaque)
+        assert envelope["systemInstruction"] == {
+            "parts": [{"text": "Always answer as JSON"}]
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            assert body["systemInstruction"] == envelope["systemInstruction"]
+            return httpx.Response(
+                200,
+                json=_response([{"text": "next", "thoughtSignature": "sig_2"}]),
+            )
+
+        await _run(
+            handler,
+            _request(
+                input=_chat(ChatMessage("user", (TextPart("next"),))),
+                session=SessionParams(
+                    opaque_continuation=OpaqueContinuation("google_genai", opaque)
+                ),
+            ),
+        )
+
+    @pytest.mark.anyio
+    async def test_opaque_history_rejects_conflicting_system_instruction(self) -> None:
+        opaque = json.dumps(
+            {
+                "version": 1,
+                "systemInstruction": {"parts": [{"text": "original"}]},
+                "contents": [
+                    {
+                        "role": "model",
+                        "parts": [{"text": "answer", "thoughtSignature": "signature"}],
+                    }
+                ],
+            }
+        )
+        req = _request(
+            input=_chat(
+                ChatMessage("system", (TextPart("replacement"),)),
+                ChatMessage("user", (TextPart("next"),)),
+            ),
+            session=SessionParams(
+                opaque_continuation=OpaqueContinuation("google_genai", opaque)
+            ),
+        )
+
+        with pytest.raises(DialectError, match="systemInstruction conflicts"):
+            await _run(_no_io, req)
+
+    @pytest.mark.anyio
     async def test_requested_summary_must_be_nonempty(self) -> None:
         with pytest.raises(OutputContractError, match="omitted requested thoughts"):
             await _run(
                 lambda _: httpx.Response(200, json=_response()),
+                _request(reasoning=ReasoningParams(summary="auto")),
+            )
+
+    @pytest.mark.anyio
+    async def test_requested_summary_rejects_whitespace_only_thoughts(self) -> None:
+        with pytest.raises(OutputContractError, match="omitted requested thoughts"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    json=_response(
+                        [{"text": " \n\t ", "thought": True}, {"text": "answer"}]
+                    ),
+                ),
                 _request(reasoning=ReasoningParams(summary="auto")),
             )
 
@@ -664,6 +864,176 @@ class TestReasoningAndStructuredOutput:
 
 
 class TestResponseLifting:
+    @pytest.mark.anyio
+    async def test_multiple_text_candidates_preserve_choice_order(self) -> None:
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {
+                            "index": 0,
+                            "content": {"role": "model", "parts": [{"text": "A"}]},
+                            "finishReason": "STOP",
+                        },
+                        {
+                            "index": 1,
+                            "content": {"role": "model", "parts": [{"text": "B"}]},
+                            "finishReason": "MAX_TOKENS",
+                        },
+                    ]
+                },
+            ),
+            _request(sampling=SamplingParams(n=2)),
+        )
+
+        assert result.texts == ("A", "B")
+        assert result.finish_reasons == ("STOP", "MAX_TOKENS")
+
+    @pytest.mark.anyio
+    async def test_multiple_candidates_reject_singular_response_metadata(self) -> None:
+        with pytest.raises(OutputContractError, match="singular citation"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    json={
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "A"}],
+                                },
+                                "finishReason": "STOP",
+                                "citationMetadata": {
+                                    "citationSources": [{"uri": "https://a.test"}]
+                                },
+                            },
+                            {
+                                "index": 1,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "B"}],
+                                },
+                                "finishReason": "STOP",
+                            },
+                        ]
+                    },
+                ),
+                _request(sampling=SamplingParams(n=2)),
+            )
+
+    @pytest.mark.anyio
+    async def test_missing_function_call_id_is_stable_and_replayable(self) -> None:
+        parts = [
+            {
+                "functionCall": {"name": "weather", "args": {"city": "Paris"}},
+                "thoughtSignature": "signature",
+            }
+        ]
+        tools = ToolParams(functions=({"name": "weather"},))
+        request = _request(tools=tools)
+        first = await _run(
+            lambda _: httpx.Response(200, json=_response(parts)),
+            request,
+        )
+        repeated = await _run(
+            lambda _: httpx.Response(200, json=_response(parts)),
+            request,
+        )
+
+        assert first.tool_calls is not None
+        call_id = first.tool_calls[0].call_id
+        assert call_id.startswith("google_call_")
+        assert repeated.tool_calls is not None
+        assert repeated.tool_calls[0].call_id == call_id
+        assert first.reasoning is not None and first.reasoning[0] is not None
+        opaque = cast(str, first.reasoning[0].opaque_roundtrip)
+        assert repeated.reasoning is not None and repeated.reasoning[0] is not None
+        assert repeated.reasoning[0].opaque_roundtrip == opaque
+        envelope = json.loads(opaque)
+        assert envelope["contents"][-1]["parts"][0]["functionCall"]["id"] == call_id
+
+        changed = await _run(
+            lambda _: httpx.Response(200, json=_response(parts)),
+            _request(
+                input=_chat(ChatMessage("user", (TextPart("Different input"),))),
+                tools=tools,
+            ),
+        )
+        assert changed.tool_calls is not None
+        assert changed.tool_calls[0].call_id != call_id
+
+        def handler(http_request: httpx.Request) -> httpx.Response:
+            body = json.loads(http_request.content)
+            assert body["contents"][-1]["parts"] == [
+                {
+                    "functionResponse": {
+                        "id": call_id,
+                        "name": "weather",
+                        "response": {"temperature": 20},
+                    }
+                }
+            ]
+            return httpx.Response(200, json=_response())
+
+        await _run(
+            handler,
+            _request(
+                input=_chat(
+                    ChatMessage(
+                        "tool",
+                        (ToolResultPart(call_id, {"temperature": 20}),),
+                    )
+                ),
+                session=SessionParams(
+                    opaque_continuation=OpaqueContinuation("google_genai", opaque)
+                ),
+            ),
+        )
+
+    @pytest.mark.anyio
+    async def test_opaque_history_restores_answered_function_calls(self) -> None:
+        opaque = json.dumps(
+            {
+                "version": 1,
+                "contents": [
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {"id": "call_1", "name": "f"},
+                                "thoughtSignature": "signature",
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "functionResponse": {
+                                    "id": "call_1",
+                                    "name": "f",
+                                    "response": {"ok": True},
+                                }
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+        req = _request(
+            input=_chat(
+                ChatMessage("tool", (ToolResultPart("call_1", {"again": True}),))
+            ),
+            session=SessionParams(
+                opaque_continuation=OpaqueContinuation("google_genai", opaque)
+            ),
+        )
+
+        with pytest.raises(DialectError, match="duplicate Google function result"):
+            await _run(_no_io, req)
+
     @pytest.mark.anyio
     async def test_usage_logprobs_citations_grounding_and_server_tools(self) -> None:
         logprobs = {
@@ -735,10 +1105,43 @@ class TestResponseLifting:
         assert result.server_tool_uses[0].tool_type == "GOOGLE_SEARCH_WEB"
         assert result.server_tool_uses[0].result == {"ok": True}
         assert result.usage is not None
-        assert result.usage.total_tokens == 7
+        assert result.usage.total_tokens == 6
         assert result.usage.reported_total_tokens == 7
         assert result.usage.reasoning_tokens == 1
         assert result.usage.cached_tokens == 2
+
+    @pytest.mark.anyio
+    async def test_missing_server_tool_ids_are_synthesized_and_paired(self) -> None:
+        parts = [
+            {
+                "toolCall": {
+                    "toolType": "GOOGLE_SEARCH_WEB",
+                    "args": {"q": "weather"},
+                },
+                "thoughtSignature": "signature",
+            },
+            {
+                "toolResponse": {
+                    "toolType": "GOOGLE_SEARCH_WEB",
+                    "response": {"ok": True},
+                }
+            },
+            {"text": "sunny"},
+        ]
+        result = await _run(
+            lambda _: httpx.Response(200, json=_response(parts)),
+            _request(tools=ToolParams(hosted=(HostedToolSpec("google_search"),))),
+        )
+
+        assert result.server_tool_uses is not None
+        tool_id = result.server_tool_uses[0].tool_use_id
+        assert tool_id.startswith("google_server_")
+        assert result.server_tool_uses[0].result == {"ok": True}
+        assert result.reasoning is not None and result.reasoning[0] is not None
+        opaque = json.loads(cast(str, result.reasoning[0].opaque_roundtrip))
+        opaque_parts = opaque["contents"][-1]["parts"]
+        assert opaque_parts[0]["toolCall"]["id"] == tool_id
+        assert opaque_parts[1]["toolResponse"]["id"] == tool_id
 
     @pytest.mark.anyio
     async def test_usage_computes_total_without_claiming_provider_report(self) -> None:
@@ -753,6 +1156,178 @@ class TestResponseLifting:
         assert result.usage is not None
         assert result.usage.total_tokens == 7
         assert result.usage.reported_total_tokens is None
+
+    @pytest.mark.anyio
+    async def test_matching_provider_total_is_not_redundantly_persisted(self) -> None:
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                json=_response(
+                    usage={
+                        "promptTokenCount": 3,
+                        "candidatesTokenCount": 4,
+                        "totalTokenCount": 7,
+                    }
+                ),
+            )
+        )
+        assert result.usage is not None
+        assert result.usage.total_tokens == 7
+        assert result.usage.reported_total_tokens is None
+
+    @pytest.mark.anyio
+    async def test_requested_top_logprobs_require_exact_cardinality(self) -> None:
+        logprobs = {
+            "chosenCandidates": [{"token": "Hi", "logProbability": -0.1}],
+            "topCandidates": [
+                {"candidates": [{"token": "Hi", "logProbability": -0.1}]}
+            ],
+        }
+        with pytest.raises(OutputContractError, match="different number"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    json=_response(candidate_extra={"logprobsResult": logprobs}),
+                ),
+                _request(
+                    scoring=ScoringParams(
+                        sampled_logprobs=True,
+                        top_logprobs=2,
+                    )
+                ),
+            )
+
+    @pytest.mark.anyio
+    async def test_nonempty_text_requires_chosen_logprobs(self) -> None:
+        logprobs = {"chosenCandidates": [], "topCandidates": []}
+        with pytest.raises(OutputContractError, match="without chosen logprobs"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    json=_response(candidate_extra={"logprobsResult": logprobs}),
+                ),
+                _request(scoring=ScoringParams(sampled_logprobs=True)),
+            )
+
+    @pytest.mark.anyio
+    async def test_duplicate_provider_function_call_ids_fail_loudly(self) -> None:
+        with pytest.raises(OutputContractError, match="duplicate Google function call"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    json=_response(
+                        [
+                            {"functionCall": {"id": "same", "name": "f", "args": {}}},
+                            {"functionCall": {"id": "same", "name": "g", "args": {}}},
+                        ]
+                    ),
+                ),
+                _request(tools=ToolParams(functions=({"name": "f"}, {"name": "g"}))),
+            )
+
+    @pytest.mark.anyio
+    async def test_provider_cannot_reuse_function_call_id_across_rounds(self) -> None:
+        tools = ToolParams(functions=({"name": "f"},))
+        first = await _run(
+            lambda _: httpx.Response(
+                200,
+                json=_response(
+                    [
+                        {
+                            "functionCall": {
+                                "id": "call_1",
+                                "name": "f",
+                                "args": {},
+                            },
+                            "thoughtSignature": "signature_1",
+                        }
+                    ]
+                ),
+            ),
+            _request(tools=tools),
+        )
+        assert first.reasoning is not None and first.reasoning[0] is not None
+        opaque = cast(str, first.reasoning[0].opaque_roundtrip)
+
+        with pytest.raises(OutputContractError, match="duplicate Google function call"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    json=_response(
+                        [
+                            {
+                                "functionCall": {
+                                    "id": "call_1",
+                                    "name": "f",
+                                    "args": {"again": True},
+                                },
+                                "thoughtSignature": "signature_2",
+                            }
+                        ]
+                    ),
+                ),
+                _request(
+                    input=_chat(
+                        ChatMessage(
+                            "tool",
+                            (ToolResultPart("call_1", {"ok": True}),),
+                        )
+                    ),
+                    session=SessionParams(
+                        opaque_continuation=OpaqueContinuation("google_genai", opaque)
+                    ),
+                    tools=tools,
+                ),
+            )
+
+    @pytest.mark.anyio
+    async def test_provider_cannot_reuse_server_tool_id_across_rounds(self) -> None:
+        tools = ToolParams(hosted=(HostedToolSpec("google_search"),))
+        first = await _run(
+            lambda _: httpx.Response(
+                200,
+                json=_response(
+                    [
+                        {
+                            "toolCall": {
+                                "id": "server_1",
+                                "toolType": "GOOGLE_SEARCH_WEB",
+                                "args": {"q": "first"},
+                            },
+                            "thoughtSignature": "signature_1",
+                        }
+                    ]
+                ),
+            ),
+            _request(tools=tools),
+        )
+        assert first.reasoning is not None and first.reasoning[0] is not None
+        opaque = cast(str, first.reasoning[0].opaque_roundtrip)
+
+        with pytest.raises(OutputContractError, match="duplicate Google server tool"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    json=_response(
+                        [
+                            {
+                                "toolCall": {
+                                    "id": "server_1",
+                                    "toolType": "GOOGLE_SEARCH_WEB",
+                                    "args": {"q": "second"},
+                                },
+                                "thoughtSignature": "signature_2",
+                            }
+                        ]
+                    ),
+                ),
+                _request(
+                    session=SessionParams(
+                        opaque_continuation=OpaqueContinuation("google_genai", opaque)
+                    ),
+                    tools=tools,
+                ),
+            )
 
     @pytest.mark.anyio
     @pytest.mark.parametrize(
@@ -790,6 +1365,34 @@ class TestResponseLifting:
 
 
 class TestStreamingAndAuditEvidence:
+    @pytest.mark.anyio
+    async def test_execute_rejects_absolute_operation_before_credential_leak(
+        self,
+    ) -> None:
+        connection = _connection(_no_io)
+        try:
+            dialect = GoogleGenAIDialect(connection, "gemini-2.5-flash")
+            req = _request()
+            audit = RequestAudit(active_request_leaves(req))
+            dialect.validate_request(req, audit, cast(Any, SimpleNamespace()))
+            prepared = dialect.prepare(req, audit)
+            audit.finish(prepared)
+            attacker_operation = (
+                "https://attacker.invalid/v1beta/models/"
+                "gemini-2.5-flash:generateContent"
+            )
+
+            with pytest.raises(DialectError, match="wrong prepared operation"):
+                await dialect.execute(
+                    PreparedRequest(
+                        attacker_operation,
+                        prepared.body,
+                        prepared.context,
+                    )
+                )
+        finally:
+            await connection.aclose()
+
     @pytest.mark.anyio
     async def test_streaming_uses_stream_operation_and_merges_deltas(self) -> None:
         seen: dict[str, object] = {}
@@ -840,8 +1443,125 @@ class TestStreamingAndAuditEvidence:
         )
         assert result.texts == ("Hello",)
         assert result.finish_reasons == ("MAX_TOKENS",)
+        assert result.usage is not None
+        assert result.usage.total_tokens == 4
         assert result.request_params is not None
         assert result.request_params["query"] == {"alt": "sse"}
+
+    @pytest.mark.anyio
+    async def test_streaming_does_not_persist_nonterminal_usage(self) -> None:
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                content=_sse(
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "Hel"}],
+                                },
+                            }
+                        ],
+                        "usageMetadata": {
+                            "promptTokenCount": 2,
+                            "candidatesTokenCount": 1,
+                            "totalTokenCount": 3,
+                        },
+                    },
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "lo"}],
+                                },
+                                "finishReason": "STOP",
+                            }
+                        ]
+                    },
+                ),
+                headers={"content-type": "text/event-stream"},
+            ),
+            _request(scheduling=SchedulingParams(stream=True)),
+        )
+
+        assert result.texts == ("Hello",)
+        assert result.usage is None
+
+    @pytest.mark.anyio
+    async def test_streaming_preserves_url_context_citations(self) -> None:
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                content=_sse(
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "answer"}],
+                                },
+                            }
+                        ]
+                    },
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "finishReason": "STOP",
+                                "urlContextMetadata": {
+                                    "urlMetadata": [
+                                        {"retrievedUrl": "https://example.test/source"}
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                ),
+                headers={"content-type": "text/event-stream"},
+            ),
+            _request(
+                scheduling=SchedulingParams(stream=True),
+                tools=ToolParams(hosted=(HostedToolSpec("url_context"),)),
+            ),
+        )
+
+        assert result.citations is not None
+        assert [item.url for item in result.citations] == [
+            "https://example.test/source"
+        ]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("invalid_event", ["junk", [], {}])
+    async def test_streaming_rejects_non_response_data_events(
+        self, invalid_event: object
+    ) -> None:
+        terminal = {
+            "candidates": [
+                {
+                    "index": 0,
+                    "content": {"role": "model", "parts": [{"text": "answer"}]},
+                    "finishReason": "STOP",
+                }
+            ]
+        }
+        content = (
+            f"data: {json.dumps(invalid_event)}\n\ndata: {json.dumps(terminal)}\n\n"
+        ).encode()
+
+        with pytest.raises(OutputContractError, match="non-empty response object"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    content=content,
+                    headers={"content-type": "text/event-stream"},
+                ),
+                _request(scheduling=SchedulingParams(stream=True)),
+            )
 
     @pytest.mark.anyio
     async def test_streaming_logprobs_are_accumulated(self) -> None:
