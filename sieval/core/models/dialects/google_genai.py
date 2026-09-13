@@ -1184,6 +1184,40 @@ def _grounding(raw: object, path: str) -> GroundingMetadata | None:
     return GroundingMetadata(tuple(chunks), rendered)
 
 
+def _merge_stream_grounding_metadata(
+    accumulated: dict[str, object] | None,
+    incoming: object,
+    path: str,
+) -> dict[str, object]:
+    """Merge Google streaming grounding metadata without losing prior evidence."""
+
+    if not isinstance(incoming, Mapping):
+        raise OutputContractError(f"{path} must be an object")
+    result: dict[str, object] = {} if accumulated is None else accumulated
+    for raw_name, value in incoming.items():
+        if not isinstance(raw_name, str):
+            raise OutputContractError(f"{path} field names must be strings")
+        if value is None:
+            continue
+        if raw_name in {"groundingChunks", "groundingSupports"}:
+            target = result.get(raw_name)
+            if target is None:
+                new_target: list[object] = []
+                result[raw_name] = new_target
+                target = new_target
+            if not isinstance(target, list):
+                raise AssertionError("Google grounding accumulator changed shape")
+            cast(list[object], target).extend(_sequence(value, f"{path}.{raw_name}"))
+            continue
+        previous = result.get(raw_name)
+        if previous is not None and previous != value:
+            raise OutputContractError(
+                f"Google stream changed {path}.{raw_name} between events"
+            )
+        result[raw_name] = value
+    return result
+
+
 def _synthetic_call_id(
     input_contents: Sequence[Mapping[str, JSONValue]],
     candidate_index: int,
@@ -1992,14 +2026,29 @@ class GoogleGenAIDialect:
                             "Google stream changed a candidate finishReason"
                         )
                     state["finishReason"] = finish_reason
-                for name in (
-                    "citationMetadata",
-                    "urlContextMetadata",
-                    "groundingMetadata",
-                ):
+                for name in ("citationMetadata", "urlContextMetadata"):
                     value = _get(raw_candidate, name)
                     if value is not None:
+                        previous = state.get(name)
+                        if previous is not None and previous != value:
+                            raise OutputContractError(
+                                f"Google stream changed {name} between events"
+                            )
                         state[name] = value
+                raw_grounding = _get(raw_candidate, "groundingMetadata")
+                if raw_grounding is not None:
+                    accumulated_grounding = state.get("groundingMetadata")
+                    if accumulated_grounding is not None and not isinstance(
+                        accumulated_grounding, dict
+                    ):
+                        raise AssertionError(
+                            "Google grounding accumulator changed type"
+                        )
+                    state["groundingMetadata"] = _merge_stream_grounding_metadata(
+                        cast(dict[str, object] | None, accumulated_grounding),
+                        raw_grounding,
+                        "groundingMetadata",
+                    )
                 raw_logprobs = _get(raw_candidate, "logprobsResult")
                 if raw_logprobs is not None:
                     if not isinstance(raw_logprobs, Mapping):

@@ -30,6 +30,7 @@ from sieval.core.models.dialect import (
     active_request_leaves,
 )
 from sieval.core.models.dialect_registry import DIALECT_SPECS
+from sieval.core.models.dialects import google_genai
 from sieval.core.models.dialects.google_genai import (
     CAPABILITY_DECISIONS,
     GoogleGenAIDialect,
@@ -1534,6 +1535,226 @@ class TestStreamingAndAuditEvidence:
         assert [item.url for item in result.citations] == [
             "https://example.test/source"
         ]
+
+    @pytest.mark.anyio
+    async def test_streaming_accumulates_grounding_chunks_in_event_order(self) -> None:
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                content=_sse(
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "grounded "}],
+                                },
+                                "groundingMetadata": {
+                                    "groundingChunks": [
+                                        {
+                                            "web": {
+                                                "uri": "https://first.test",
+                                                "title": "First",
+                                            }
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "answer"}],
+                                },
+                                "finishReason": "STOP",
+                                "groundingMetadata": {
+                                    "groundingChunks": [
+                                        {
+                                            "retrievedContext": {
+                                                "uri": "https://second.test",
+                                                "title": "Second",
+                                            }
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                ),
+                headers={"content-type": "text/event-stream"},
+            ),
+            _request(
+                scheduling=SchedulingParams(stream=True),
+                tools=ToolParams(hosted=(HostedToolSpec("google_search"),)),
+            ),
+        )
+
+        assert result.grounding is not None
+        assert [chunk.uri for chunk in result.grounding.chunks] == [
+            "https://first.test",
+            "https://second.test",
+        ]
+
+    def test_streaming_grounding_metadata_preserves_all_incremental_evidence(
+        self,
+    ) -> None:
+        search_entry_point = {"renderedContent": "<div>sources</div>"}
+        retrieval_metadata = {"googleSearchDynamicRetrievalScore": 0.75}
+        merged = google_genai._merge_stream_grounding_metadata(
+            None,
+            {
+                "groundingChunks": [{"web": {"uri": "https://first.test"}}],
+                "groundingSupports": [{"groundingChunkIndices": [0]}],
+                "searchEntryPoint": search_entry_point,
+                "retrievalMetadata": retrieval_metadata,
+                "googleMapsWidgetContextToken": "maps-token",
+            },
+            "groundingMetadata",
+        )
+        merged = google_genai._merge_stream_grounding_metadata(
+            merged,
+            {
+                "groundingChunks": [{"web": {"uri": "https://second.test"}}],
+                "groundingSupports": [{"groundingChunkIndices": [1]}],
+                "searchEntryPoint": {"renderedContent": "<div>sources</div>"},
+                "retrievalMetadata": {"googleSearchDynamicRetrievalScore": 0.75},
+                "googleMapsWidgetContextToken": "maps-token",
+            },
+            "groundingMetadata",
+        )
+
+        assert merged == {
+            "groundingChunks": [
+                {"web": {"uri": "https://first.test"}},
+                {"web": {"uri": "https://second.test"}},
+            ],
+            "groundingSupports": [
+                {"groundingChunkIndices": [0]},
+                {"groundingChunkIndices": [1]},
+            ],
+            "searchEntryPoint": search_entry_point,
+            "retrievalMetadata": retrieval_metadata,
+            "googleMapsWidgetContextToken": "maps-token",
+        }
+
+    @pytest.mark.anyio
+    async def test_streaming_accepts_identical_repeated_singular_metadata(
+        self,
+    ) -> None:
+        citation_metadata = {"citationSources": [{"uri": "https://citation.test"}]}
+        url_context_metadata = {
+            "urlMetadata": [{"retrievedUrl": "https://context.test"}]
+        }
+        first_candidate_metadata = {
+            "citationMetadata": citation_metadata,
+            "urlContextMetadata": url_context_metadata,
+        }
+        second_candidate_metadata = {
+            "citationMetadata": {"citationSources": [{"uri": "https://citation.test"}]},
+            "urlContextMetadata": {
+                "urlMetadata": [{"retrievedUrl": "https://context.test"}]
+            },
+        }
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                content=_sse(
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "answer"}],
+                                },
+                                **first_candidate_metadata,
+                            }
+                        ]
+                    },
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "finishReason": "STOP",
+                                **second_candidate_metadata,
+                            }
+                        ]
+                    },
+                ),
+                headers={"content-type": "text/event-stream"},
+            ),
+            _request(scheduling=SchedulingParams(stream=True)),
+        )
+
+        assert result.citations is not None
+        assert [item.url for item in result.citations] == [
+            "https://citation.test",
+            "https://context.test",
+        ]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("metadata_name", "first_value", "second_value"),
+        [
+            (
+                "citationMetadata",
+                {"citationSources": [{"uri": "https://first.test"}]},
+                {"citationSources": [{"uri": "https://second.test"}]},
+            ),
+            (
+                "urlContextMetadata",
+                {"urlMetadata": [{"retrievedUrl": "https://first.test"}]},
+                {"urlMetadata": [{"retrievedUrl": "https://second.test"}]},
+            ),
+            (
+                "groundingMetadata",
+                {"searchEntryPoint": {"renderedContent": "first"}},
+                {"searchEntryPoint": {"renderedContent": "second"}},
+            ),
+        ],
+    )
+    async def test_streaming_rejects_conflicting_singular_metadata(
+        self,
+        metadata_name: str,
+        first_value: Mapping[str, object],
+        second_value: Mapping[str, object],
+    ) -> None:
+        with pytest.raises(OutputContractError, match="changed .* between events"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    content=_sse(
+                        {
+                            "candidates": [
+                                {
+                                    "index": 0,
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{"text": "answer"}],
+                                    },
+                                    metadata_name: first_value,
+                                }
+                            ]
+                        },
+                        {
+                            "candidates": [
+                                {
+                                    "index": 0,
+                                    "finishReason": "STOP",
+                                    metadata_name: second_value,
+                                }
+                            ]
+                        },
+                    ),
+                    headers={"content-type": "text/event-stream"},
+                ),
+                _request(scheduling=SchedulingParams(stream=True)),
+            )
 
     @pytest.mark.anyio
     @pytest.mark.parametrize("invalid_event", ["junk", [], {}])
