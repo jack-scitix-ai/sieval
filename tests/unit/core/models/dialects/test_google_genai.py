@@ -1691,6 +1691,82 @@ class TestStreamingAndAuditEvidence:
         assert result.request_params["query"] == {"alt": "sse"}
 
     @pytest.mark.anyio
+    async def test_streaming_rejects_candidate_events_after_finish_reason(self) -> None:
+        with pytest.raises(
+            OutputContractError, match="candidate 0 after its terminal finishReason"
+        ):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    content=_sse(
+                        {
+                            "candidates": [
+                                {
+                                    "index": 0,
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{"text": "done"}],
+                                    },
+                                    "finishReason": "STOP",
+                                }
+                            ]
+                        },
+                        {
+                            "candidates": [
+                                {
+                                    "index": 0,
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{"text": " extra"}],
+                                    },
+                                }
+                            ]
+                        },
+                    ),
+                    headers={"content-type": "text/event-stream"},
+                ),
+                _request(scheduling=SchedulingParams(stream=True)),
+            )
+
+    @pytest.mark.anyio
+    async def test_streaming_allows_usage_only_event_after_candidate_finishes(
+        self,
+    ) -> None:
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                content=_sse(
+                    {
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "done"}],
+                                },
+                                "finishReason": "STOP",
+                            }
+                        ]
+                    },
+                    {
+                        "usageMetadata": {
+                            "promptTokenCount": 2,
+                            "candidatesTokenCount": 1,
+                            "totalTokenCount": 3,
+                        }
+                    },
+                ),
+                headers={"content-type": "text/event-stream"},
+            ),
+            _request(scheduling=SchedulingParams(stream=True)),
+        )
+
+        assert result.texts == ("done",)
+        assert result.finish_reasons == ("STOP",)
+        assert result.usage is not None
+        assert result.usage.total_tokens == 3
+
+    @pytest.mark.anyio
     async def test_streaming_merges_reasoning_deltas_without_crossing_boundaries(
         self,
     ) -> None:

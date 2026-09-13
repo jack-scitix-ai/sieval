@@ -2141,6 +2141,11 @@ class GoogleGenAIDialect:
                         "Google stream candidate index is invalid"
                     )
                 state = by_index.setdefault(index, {"parts": []})
+                if "finishReason" in state:
+                    raise OutputContractError(
+                        f"Google stream emitted candidate {index} after its "
+                        "terminal finishReason"
+                    )
                 content = _get(raw_candidate, "content")
                 if content is not None:
                     role = _get(content, "role")
