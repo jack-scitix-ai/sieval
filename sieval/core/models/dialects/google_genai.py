@@ -2160,11 +2160,6 @@ class GoogleGenAIDialect:
                     )
                 finish_reason = _get(raw_candidate, "finishReason")
                 if finish_reason is not None:
-                    previous = state.get("finishReason")
-                    if previous is not None and previous != finish_reason:
-                        raise OutputContractError(
-                            "Google stream changed a candidate finishReason"
-                        )
                     state["finishReason"] = finish_reason
                 for name in ("citationMetadata", "urlContextMetadata"):
                     value = _get(raw_candidate, name)
