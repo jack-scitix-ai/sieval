@@ -193,6 +193,7 @@ class TestDetectTruncatedOutput:
                 {0},
                 "model_context_window_exceeded",
             ),
+            (["MAX_TOKENS"], {0}, "MAX_TOKENS"),
             (["content_filter"], {0}, "content_filter"),
             (["stop"], set(), "stop"),
             (None, set(), "missing_finish_reasons"),

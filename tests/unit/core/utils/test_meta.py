@@ -307,14 +307,15 @@ class TestCountTruncatedRollouts:
     def test_every_provider_spelling_counts(self):
         # The IR keeps finish_reasons provider-verbatim: OpenAI-compatible
         # Chat/Completions and SGLang native say `length`, Responses says
-        # `max_output_tokens`, and Anthropic says either `max_tokens` or
-        # `model_context_window_exceeded`. A set holding only one spelling would
-        # silently read zero on another provider.
+        # `max_output_tokens`, Anthropic says `max_tokens` or
+        # `model_context_window_exceeded`, and Google says `MAX_TOKENS`. A set
+        # holding only one spelling would silently read zero on another provider.
         for reason in (
             "length",
             "max_output_tokens",
             "max_tokens",
             "model_context_window_exceeded",
+            "MAX_TOKENS",
             "content_filter",
         ):
             assert (
