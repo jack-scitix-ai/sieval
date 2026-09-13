@@ -96,6 +96,16 @@ class _BrokenVerifier:
         raise RuntimeError("verifier bug")
 
 
+@dataclass(frozen=True)
+class _OperationVerifier:
+    expected: str
+
+    def verify_prepared(self, prepared: PreparedRequest) -> str | None:
+        if prepared.operation != self.expected:
+            return f"operation {prepared.operation!r} does not match {self.expected!r}"
+        return None
+
+
 class TestLeafDerivation:
     def test_derives_nondefault_group_leaves_and_dynamic_none(self):
         req = Request(
@@ -313,6 +323,22 @@ class TestRequestAudit:
 
         assert thawed == {"extra_body": {"stop_ids": [1, 2, 3]}}
         assert prepared.body == {"extra_body": {"stop_ids": [1, 2]}}
+
+    def test_prepared_request_verifier_can_prove_operation_control_flow(self):
+        audit = RequestAudit({"scheduling.stream": True})
+        audit.consumed(
+            "scheduling.stream",
+            _OperationVerifier("models/model:streamGenerateContent"),
+        )
+
+        audit.finish(
+            PreparedRequest("models/model:streamGenerateContent", {"contents": []})
+        )
+
+        with pytest.raises(RequestAuditError, match="operation.*does not match"):
+            audit.finish(
+                PreparedRequest("models/model:generateContent", {"contents": []})
+            )
 
     def test_passthrough_destination_and_value_are_verified(self):
         audit = RequestAudit({"dialect_options.min_p": 0.1})

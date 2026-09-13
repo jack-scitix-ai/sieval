@@ -74,7 +74,14 @@ class WireVerifier(Protocol):
     def verify(self, body: Mapping[str, JSONValue]) -> str | None: ...
 
 
-type WireEvidence = WireObservation | WireVerifier
+@runtime_checkable
+class PreparedRequestVerifier(Protocol):
+    """Independently verify request evidence outside the JSON body."""
+
+    def verify_prepared(self, prepared: "PreparedRequest") -> str | None: ...
+
+
+type WireEvidence = WireObservation | WireVerifier | PreparedRequestVerifier
 
 
 @dataclass(frozen=True)
@@ -310,10 +317,16 @@ class RequestAudit:
                 f"consumed request leaf {path!r} requires wire evidence"
             )
         if not all(
-            isinstance(evidence, (WireObservation, WireVerifier))
+            isinstance(
+                evidence,
+                (WireObservation, WireVerifier, PreparedRequestVerifier),
+            )
             for evidence in wire_evidence
         ):
-            raise TypeError("wire evidence must be WireObservation or WireVerifier")
+            raise TypeError(
+                "wire evidence must be WireObservation, WireVerifier, or "
+                "PreparedRequestVerifier"
+            )
         self._record(path, Consumed(path, tuple(wire_evidence)))
 
     def rejected(self, path: str, reason: str) -> None:
@@ -382,7 +395,11 @@ class RequestAudit:
                 if verifier_id in verified:
                     continue
                 verified.add(verifier_id)
-                mismatch = evidence.verify(prepared.body)
+                mismatch = (
+                    evidence.verify_prepared(prepared)
+                    if isinstance(evidence, PreparedRequestVerifier)
+                    else evidence.verify(prepared.body)
+                )
                 if mismatch is not None and (
                     not isinstance(mismatch, str) or not mismatch.strip()
                 ):
