@@ -2296,3 +2296,819 @@ class TestStreamingAndAuditEvidence:
                 lambda _: httpx.Response(200, content=b"not-sse\n\n"),
                 _request(scheduling=SchedulingParams(stream=True)),
             )
+
+
+class TestAdditionalRequestContracts:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("req", "message"),
+        [
+            (
+                _request(
+                    input=_chat(ChatMessage("user", (TextPart("x"),), name="named"))
+                ),
+                "no ChatMessage.name",
+            ),
+            (
+                _request(input=_chat(ChatMessage("user", ()))),
+                "empty message",
+            ),
+            (
+                _request(input=_chat(ChatMessage("tool", (TextPart("x"),)))),
+                "only tool results",
+            ),
+            (
+                _request(input=_chat(ChatMessage("tool", (ImagePart(url="x"),)))),
+                "instruction/tool messages are text-only",
+            ),
+            (
+                _request(
+                    input=_chat(ChatMessage("user", (ToolCallPart("call", "f", {}),)))
+                ),
+                "require assistant role",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage("assistant", (ToolCallPart("", "f", {}),)),
+                        ChatMessage("user", (TextPart("continue"),)),
+                    ),
+                ),
+                "require id and name",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage(
+                            "assistant",
+                            (
+                                ToolCallPart("call", "f", {}),
+                                ToolCallPart("call", "f", {}),
+                            ),
+                        ),
+                        ChatMessage("user", (TextPart("continue"),)),
+                    )
+                ),
+                "duplicate Google function call id",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage("assistant", (ToolCallPart("call", "f", {}),)),
+                        ChatMessage("user", (ToolResultPart("call", {}),)),
+                    )
+                ),
+                "require tool role",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage("assistant", (ToolCallPart("call", "f", {}),)),
+                        ChatMessage("tool", (ToolResultPart("call", {}),)),
+                        ChatMessage("tool", (ToolResultPart("call", {}),)),
+                    )
+                ),
+                "duplicate Google function result",
+            ),
+            (
+                _request(input=_chat(ChatMessage("user", (ImagePart(url=""),)))),
+                "URLs must not be empty",
+            ),
+            (
+                _request(
+                    input=_chat(
+                        ChatMessage(
+                            "user", (ImagePart(data="", media_type="image/png"),)
+                        )
+                    )
+                ),
+                "inline images require data",
+            ),
+            (
+                _request(
+                    tools=ToolParams(
+                        functions=({"type": "function", "function": "wrong"},)
+                    )
+                ),
+                "invalid OpenAI-shaped function declaration",
+            ),
+            (
+                _request(
+                    tools=ToolParams(
+                        functions=({"name": "f", "parameters": {}, "future": True},)
+                    )
+                ),
+                "unsupported Google function declaration field",
+            ),
+            (
+                _request(tools=ToolParams(functions=({"parameters": {}},))),
+                "requires a name",
+            ),
+            (
+                _request(
+                    tools=ToolParams(
+                        functions=({"name": "f"},),
+                        choice="sometimes",
+                    )
+                ),
+                "unsupported Google tool choice",
+            ),
+            (
+                _request(tools=ToolParams(functions=({"name": "f"},), choice=1)),
+                "string or mapping",
+            ),
+            (
+                _request(
+                    tools=ToolParams(
+                        functions=({"name": "f"},),
+                        choice={"type": "function", "name": ""},
+                    )
+                ),
+                "requires a name",
+            ),
+            (
+                _request(
+                    tools=ToolParams(
+                        functions=({"name": "f"},),
+                        choice={"type": "function", "future": True},
+                    )
+                ),
+                "invalid Google function-specific tool choice",
+            ),
+            (
+                _request(tools=ToolParams(parallel=True)),
+                "parallel tool switch",
+            ),
+            (
+                _request(tools=ToolParams(hosted=(HostedToolSpec("code_execution"),))),
+                "unsupported Google hosted tool kind",
+            ),
+            (
+                _request(scoring=ScoringParams(sampled_logprobs=True, top_logprobs=21)),
+                "at most 20",
+            ),
+            (
+                _request(reasoning=ReasoningParams(effort="xhigh")),
+                "unsupported Google thinking level",
+            ),
+            (
+                _request(reasoning=ReasoningParams(summary="detailed")),
+                "supports only summary",
+            ),
+            (
+                _request(
+                    structured_output=StructuredOutputParams(
+                        format="json_schema", schema={}, name="named"
+                    )
+                ),
+                "schemas have no name",
+            ),
+            (
+                _request(
+                    structured_output=StructuredOutputParams(
+                        format="json_schema", schema={}, strict=True
+                    )
+                ),
+                "no JSON-schema strict switch",
+            ),
+            (
+                _request(dialect_options=DialectOptions("google_genai", {"": True})),
+                "keys must be non-empty",
+            ),
+        ],
+    )
+    async def test_invalid_request_is_rejected_before_io(
+        self, req: Request, message: str
+    ) -> None:
+        with pytest.raises((DialectError, RequestAuditError), match=message):
+            await _run(_no_io, req)
+
+    @pytest.mark.parametrize(
+        ("req", "message"),
+        [
+            (_request(input=CompletionInput("prompt")), "requires ChatInput"),
+            (
+                _request(scoring=ScoringParams(input_scoring=True)),
+                "cannot score input tokens",
+            ),
+            (
+                _request(session=SessionParams(previous_response_id="response")),
+                "not a continuation handle",
+            ),
+            (
+                _request(
+                    structured_output=cast(
+                        Any,
+                        StructuredOutputParams(
+                            format="json_object", schema={"type": "object"}
+                        ),
+                    )
+                ),
+                "requires format='json_schema'",
+            ),
+        ],
+    )
+    def test_low_level_validation_rejects_unsupported_or_conflicting_leaves(
+        self, req: Request, message: str
+    ) -> None:
+        connection = _connection(_no_io)
+        dialect = GoogleGenAIDialect(connection, "gemini-2.5-flash")
+        audit = RequestAudit(active_request_leaves(req))
+
+        dialect.validate_request(req, audit, cast(Any, SimpleNamespace()))
+
+        with pytest.raises(RequestAuditError, match=message):
+            audit.raise_rejections()
+
+
+class TestOpaqueContinuationBoundaries:
+    @staticmethod
+    def _payload() -> dict[str, object]:
+        return {
+            "version": 1,
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "text": "thought",
+                            "thought": True,
+                            "thoughtSignature": "signature",
+                        }
+                    ],
+                }
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        ("mutate", "message"),
+        [
+            (lambda value: value.update(version=2), "unsupported.*version"),
+            (lambda value: value.update(contents=[]), "has no contents"),
+            (lambda value: value.update(contents=["wrong"]), "invalid shape"),
+            (
+                lambda value: value.update(contents=[{"role": "tool", "parts": [{}]}]),
+                "invalid role",
+            ),
+            (
+                lambda value: value.update(contents=[{"role": "user", "parts": []}]),
+                "has no parts",
+            ),
+            (
+                lambda value: value.update(
+                    contents=[{"role": "user", "parts": ["wrong"]}]
+                ),
+                "is not an object",
+            ),
+            (
+                lambda value: value.update(
+                    contents=[
+                        {
+                            "role": "user",
+                            "parts": [{"text": "x", "future": True}],
+                        }
+                    ]
+                ),
+                "unsupported field",
+            ),
+            (
+                lambda value: value.update(
+                    contents=[
+                        {
+                            "role": "user",
+                            "parts": [{"text": "x", "fileData": {}}],
+                        }
+                    ]
+                ),
+                "one data field",
+            ),
+            (
+                lambda value: value.update(
+                    contents=[{"role": "user", "parts": [{"text": 1}]}]
+                ),
+                "text part must contain a string",
+            ),
+            (
+                lambda value: value.update(
+                    contents=[{"role": "user", "parts": [{"fileData": "x"}]}]
+                ),
+                "fileData must be an object",
+            ),
+            (
+                lambda value: value.update(
+                    contents=[
+                        {"role": "model", "parts": [{"text": "x", "thought": "yes"}]}
+                    ]
+                ),
+                "thought marker must be boolean",
+            ),
+            (
+                lambda value: value.update(
+                    contents=[
+                        {
+                            "role": "model",
+                            "parts": [{"text": "x", "thoughtSignature": ""}],
+                        }
+                    ]
+                ),
+                "thoughtSignature must be a non-empty string",
+            ),
+            (
+                lambda value: value.update(
+                    contents=[{"role": "model", "parts": [{"text": "x"}]}]
+                ),
+                "has no thought signature",
+            ),
+            (
+                lambda value: value.update(systemInstruction={}),
+                "systemInstruction has invalid shape",
+            ),
+            (
+                lambda value: value.update(systemInstruction={"parts": []}),
+                "systemInstruction has no parts",
+            ),
+            (
+                lambda value: value.update(systemInstruction={"parts": [{"text": 1}]}),
+                "systemInstruction must be text-only",
+            ),
+            (lambda value: value.update(future=True), "invalid.*envelope"),
+        ],
+    )
+    def test_malformed_opaque_continuation_is_rejected(
+        self, mutate: Callable[[dict[str, object]], None], message: str
+    ) -> None:
+        payload = self._payload()
+        mutate(payload)
+
+        with pytest.raises(DialectError, match=message):
+            google_genai._decode_opaque(json.dumps(payload))
+
+    @pytest.mark.parametrize(
+        ("contents", "message"),
+        [
+            (
+                [{"role": "model", "parts": [{"functionCall": {"name": "f"}}]}],
+                "functionCall requires a non-empty id",
+            ),
+            (
+                [{"role": "model", "parts": [{"functionCall": {"id": "c"}}]}],
+                "functionCall requires a non-empty name",
+            ),
+            (
+                [
+                    {
+                        "role": "model",
+                        "parts": [
+                            {"functionCall": {"id": "c", "name": "f"}},
+                            {"functionCall": {"id": "c", "name": "f"}},
+                        ],
+                    }
+                ],
+                "duplicate Google function call id",
+            ),
+            (
+                [{"role": "user", "parts": [{"functionResponse": {"name": "f"}}]}],
+                "functionResponse requires a non-empty id",
+            ),
+            (
+                [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "functionResponse": {
+                                    "id": "missing",
+                                    "name": "f",
+                                }
+                            }
+                        ],
+                    }
+                ],
+                "has no prior functionCall",
+            ),
+            (
+                [
+                    {
+                        "role": "model",
+                        "parts": [{"functionCall": {"id": "c", "name": "f"}}],
+                    },
+                    {
+                        "role": "user",
+                        "parts": [{"functionResponse": {"id": "c", "name": "g"}}],
+                    },
+                ],
+                "name changed",
+            ),
+            (
+                [{"role": "model", "parts": [{"toolCall": {"toolType": "SEARCH"}}]}],
+                "toolCall requires a non-empty id",
+            ),
+            (
+                [{"role": "model", "parts": [{"toolCall": {"id": "s"}}]}],
+                "toolCall requires a non-empty toolType",
+            ),
+            (
+                [{"role": "user", "parts": [{"toolResponse": {"toolType": "SEARCH"}}]}],
+                "toolResponse requires a non-empty id",
+            ),
+            (
+                [{"role": "user", "parts": [{"toolResponse": {"id": "s"}}]}],
+                "toolResponse requires a non-empty toolType",
+            ),
+        ],
+    )
+    def test_opaque_call_state_rejects_ambiguous_history(
+        self, contents: list[Mapping[str, object]], message: str
+    ) -> None:
+        with pytest.raises(DialectError, match=message):
+            google_genai._call_state_from_contents(cast(Any, contents))
+
+
+class TestAdditionalResponseContracts:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("payload", "message"),
+        [
+            ({"candidates": {}}, "response.candidates must be a sequence"),
+            ({"candidates": []}, "expected 1 Google candidates"),
+            (
+                _response(candidate_extra={"content": {"role": "user", "parts": []}}),
+                "content role is not model",
+            ),
+            (
+                _response(candidate_extra={"content": "wrong"}),
+                "content must be an object",
+            ),
+            (
+                _response(candidate_extra={"content": {"role": "model", "parts": [1]}}),
+                "response part must be an object",
+            ),
+            (
+                _response(parts=[{"text": "x", "future": True}]),
+                "unsupported field",
+            ),
+            (
+                _response(parts=[{"text": "x", "thought": "yes"}]),
+                "thought marker must be boolean",
+            ),
+            (
+                _response(parts=[{"text": "x", "thoughtSignature": ""}]),
+                "thoughtSignature must be a non-empty string",
+            ),
+            (
+                _response(parts=[{"text": "x", "functionCall": {}}]),
+                "unsupported shape",
+            ),
+            (
+                _response(parts=[{"text": 1}]),
+                "response text must be a string",
+            ),
+            (
+                _response(
+                    parts=[{"functionCall": "wrong"}],
+                    candidate_extra=None,
+                ),
+                "functionCall must be an object",
+            ),
+            (
+                _response(parts=[{"functionCall": {"name": "f", "args": []}}]),
+                "functionCall.args must be an object",
+            ),
+            (
+                _response(parts=[{"functionCall": {"name": "", "args": {}}}]),
+                "functionCall.name must be a non-empty string",
+            ),
+            (
+                _response(parts=[{"functionCall": {"id": 1, "name": "f", "args": {}}}]),
+                "functionCall.id must be a string",
+            ),
+            (
+                _response(parts=[{"toolCall": "wrong"}]),
+                "toolCall must be an object",
+            ),
+            (
+                _response(
+                    parts=[{"toolCall": {"id": "s", "toolType": "SEARCH", "args": []}}]
+                ),
+                "toolCall.args must be an object",
+            ),
+            (
+                _response(
+                    parts=[{"toolCall": {"id": 1, "toolType": "SEARCH", "args": {}}}]
+                ),
+                "toolCall.id must be a string",
+            ),
+            (
+                _response(parts=[{"toolResponse": "wrong"}]),
+                "toolResponse must be an object",
+            ),
+            (
+                _response(
+                    parts=[
+                        {
+                            "toolResponse": {
+                                "id": 1,
+                                "toolType": "SEARCH",
+                                "response": {},
+                            }
+                        }
+                    ]
+                ),
+                "toolResponse.id must be a string",
+            ),
+            (
+                _response(
+                    parts=[
+                        {
+                            "toolResponse": {
+                                "id": "s",
+                                "toolType": "SEARCH",
+                                "response": [],
+                            }
+                        }
+                    ]
+                ),
+                "toolResponse.response must be an object",
+            ),
+            (
+                _response(model_version=1),
+                "response.modelVersion must be a string or None",
+            ),
+            (
+                _response(usage=[]),
+                "usageMetadata must be an object",
+            ),
+        ],
+    )
+    async def test_malformed_provider_response_fails_loudly(
+        self, payload: Mapping[str, object], message: str
+    ) -> None:
+        request = _request(
+            tools=ToolParams(
+                functions=({"name": "f"},),
+                hosted=(HostedToolSpec("google_search"),),
+            )
+        )
+        with pytest.raises(OutputContractError, match=message):
+            await _run(lambda _: httpx.Response(200, json=payload), request)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("candidate_extra", "message"),
+        [
+            ({"citationMetadata": []}, "citationMetadata must be an object"),
+            (
+                {"citationMetadata": {"citationSources": [{}]}},
+                "uri is absent",
+            ),
+            ({"urlContextMetadata": []}, "urlContextMetadata must be an object"),
+            (
+                {"urlContextMetadata": {"urlMetadata": [{}]}},
+                "omitted its URL",
+            ),
+            ({"groundingMetadata": []}, "groundingMetadata must be an object"),
+            (
+                {"groundingMetadata": {"groundingChunks": [{}]}},
+                "is ambiguous",
+            ),
+            (
+                {"groundingMetadata": {"groundingChunks": [{"web": {}}]}},
+                "has no representable URI",
+            ),
+        ],
+    )
+    async def test_malformed_evidence_metadata_fails_loudly(
+        self, candidate_extra: Mapping[str, object], message: str
+    ) -> None:
+        with pytest.raises(OutputContractError, match=message):
+            await _run(
+                lambda _: httpx.Response(
+                    200, json=_response(candidate_extra=candidate_extra)
+                )
+            )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("usage", "message"),
+        [
+            ({"promptTokenCount": -1}, "non-negative integer"),
+            (
+                {"promptTokenCount": 1, "candidatesTokenCount": True},
+                "non-negative integer",
+            ),
+            (
+                {
+                    "promptTokenCount": 1,
+                    "candidatesTokenCount": 1,
+                    "totalTokenCount": -1,
+                },
+                "non-negative integer",
+            ),
+            (
+                {
+                    "promptTokenCount": 1,
+                    "candidatesTokenCount": 1,
+                    "thoughtsTokenCount": -1,
+                },
+                "non-negative integer",
+            ),
+            (
+                {
+                    "promptTokenCount": 1,
+                    "candidatesTokenCount": 1,
+                    "cachedContentTokenCount": -1,
+                },
+                "non-negative integer",
+            ),
+        ],
+    )
+    async def test_malformed_usage_fails_loudly(
+        self, usage: Mapping[str, object], message: str
+    ) -> None:
+        with pytest.raises(OutputContractError, match=message):
+            await _run(lambda _: httpx.Response(200, json=_response(usage=usage)))
+
+
+class TestAdditionalStreamingContracts:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("content", "message"),
+        [
+            (b": keep-alive\n\n", "no response chunks"),
+            (b"data: not-json\n\n", "not strict JSON"),
+            (b"future: x\n\n", "unsupported SSE field"),
+            (b"data\n\n", "malformed SSE line"),
+            (b"data: []\n\n", "non-empty response object"),
+            (b"data: {}\n\n", "non-empty response object"),
+        ],
+    )
+    async def test_stream_parser_rejects_malformed_events(
+        self, content: bytes, message: str
+    ) -> None:
+        with pytest.raises(OutputContractError, match=message):
+            await _run(
+                lambda _: httpx.Response(200, content=content),
+                _request(scheduling=SchedulingParams(stream=True)),
+            )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("chunks", "message"),
+        [
+            (
+                ({"candidates": [{"index": -1}]},),
+                "candidate index is invalid",
+            ),
+            (
+                (
+                    {
+                        "candidates": [
+                            {"index": 0, "content": {"role": "user", "parts": []}}
+                        ]
+                    },
+                ),
+                "candidate role is not model",
+            ),
+            (
+                ({"candidates": [{"index": 0, "groundingMetadata": []}]},),
+                "groundingMetadata must be an object",
+            ),
+            (
+                ({"candidates": [{"index": 0, "logprobsResult": []}]},),
+                "logprobsResult must be an object",
+            ),
+            (
+                (
+                    {"candidates": [{"index": 0, "finishReason": "STOP"}]},
+                    {"modelVersion": "changed"},
+                    {"modelVersion": "again"},
+                ),
+                "changed modelVersion",
+            ),
+        ],
+    )
+    async def test_stream_merge_rejects_invalid_state(
+        self, chunks: tuple[Mapping[str, object], ...], message: str
+    ) -> None:
+        with pytest.raises(OutputContractError, match=message):
+            await _run(
+                lambda _: httpx.Response(200, content=_sse(*chunks)),
+                _request(scheduling=SchedulingParams(stream=True)),
+            )
+
+
+class TestPreparedRequestAndVerifierContracts:
+    def test_all_wire_verifiers_reject_mutated_output(self) -> None:
+        assert (
+            google_genai._InputVerifier(None, ()).verify(
+                {"contents": [], "systemInstruction": {"parts": []}}
+            )
+            == "systemInstruction no longer matches system/developer messages"
+        )
+        assert (
+            google_genai._RootOptionVerifier("serviceTier", "priority").verify({})
+            == "Google dialect option 'serviceTier' changed"
+        )
+        assert (
+            google_genai._ThinkingEffortVerifier("high").verify({})
+            == "thinking level changed"
+        )
+        assert (
+            google_genai._ReasoningSummaryVerifier().verify({})
+            == "visible-thought request changed"
+        )
+        structured = google_genai._StructuredFormatVerifier("json_schema")
+        assert structured.verify({}) == "structured output MIME type changed"
+        assert (
+            structured.verify(
+                {"generationConfig": {"responseMimeType": "application/json"}}
+            )
+            == "structured output schema presence changed"
+        )
+        functions = google_genai._FunctionsVerifier(({"name": "f"},))
+        assert functions.verify({}) == "function tools changed"
+        hosted = google_genai._HostedToolsVerifier((HostedToolSpec("google_search"),))
+        assert hosted.verify({}) == "hosted tools changed"
+        assert (
+            hosted.verify({"tools": [{"googleSearch": {}}]})
+            == "hosted-tool invocation evidence was disabled"
+        )
+        assert (
+            google_genai._ToolChoiceVerifier(cast(Any, 1)).verify({})
+            == "source tool choice is invalid"
+        )
+        assert (
+            google_genai._ToolChoiceVerifier("auto").verify({}) == "tool choice changed"
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("mutation", "message"),
+        [
+            (lambda body: body.update(contents={}), "invalid contents"),
+            (lambda body: body.update(contents=["wrong"]), "invalid content items"),
+            (
+                lambda body: body.update(systemInstruction=[]),
+                "invalid systemInstruction",
+            ),
+        ],
+    )
+    async def test_execute_rejects_mutated_prepared_body_before_io(
+        self, mutation: Callable[[dict[str, object]], None], message: str
+    ) -> None:
+        connection = _connection(_no_io)
+        try:
+            dialect = GoogleGenAIDialect(connection, "gemini-2.5-flash")
+            req = _request()
+            audit = RequestAudit(active_request_leaves(req))
+            dialect.validate_request(req, audit, cast(Any, SimpleNamespace()))
+            prepared = dialect.prepare(req, audit)
+            body = cast(dict[str, object], prepared.thaw_body())
+            mutation(body)
+
+            with pytest.raises(DialectError, match=message):
+                await dialect.execute(
+                    PreparedRequest(
+                        prepared.operation, cast(Any, body), prepared.context
+                    )
+                )
+        finally:
+            await connection.aclose()
+
+    @pytest.mark.anyio
+    async def test_execute_rejects_invalid_prepared_context_before_io(self) -> None:
+        connection = _connection(_no_io)
+        try:
+            dialect = GoogleGenAIDialect(connection, "gemini-2.5-flash")
+            with pytest.raises(DialectError, match="invalid prepared context"):
+                await dialect.execute(
+                    PreparedRequest(
+                        "v1beta/models/gemini-2.5-flash:generateContent", {}
+                    )
+                )
+        finally:
+            await connection.aclose()
+
+    @pytest.mark.anyio
+    async def test_request_params_come_from_final_serialized_request(self) -> None:
+        connection = _connection(lambda _: httpx.Response(200, json=_response()))
+        try:
+            dialect = GoogleGenAIDialect(connection, "gemini-2.5-flash")
+            req = _request(sampling=SamplingParams(temperature=0.2))
+            audit = RequestAudit(active_request_leaves(req))
+            dialect.validate_request(req, audit, cast(Any, SimpleNamespace()))
+            prepared = dialect.prepare(req, audit)
+            body = cast(dict[str, object], prepared.thaw_body())
+            generation = cast(dict[str, object], body["generationConfig"])
+            generation["temperature"] = 0.9
+
+            response = await dialect.execute(
+                PreparedRequest(prepared.operation, cast(Any, body), prepared.context)
+            )
+        finally:
+            await connection.aclose()
+
+        assert response.request_params is not None
+        assert response.request_params["body"] == {
+            "generationConfig": {"temperature": 0.9}
+        }
