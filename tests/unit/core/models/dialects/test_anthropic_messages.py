@@ -26,6 +26,7 @@ from sieval.core.models.dialect import (
     DialectError,
     OutputContractError,
     PreparedRequest,
+    Rejected,
     RequestAudit,
     RequestAuditError,
     active_request_leaves,
@@ -40,6 +41,8 @@ from sieval.core.models.dialects.anthropic_messages import (
     _decode_continuation,
     _finish_stream_block,
     _LegacyPlan,
+    _lower_chat_input,
+    _part_to_wire,
     _ReasoningSummaryVerifier,
     _tool_history_state,
     _validate_history_block,
@@ -424,6 +427,32 @@ class TestLoweringAndLift:
                 ],
             },
         ]
+
+    @pytest.mark.anyio
+    async def test_supported_prefill_lowers_final_assistant_message(self) -> None:
+        decision = CAPABILITY_DECISIONS["prefill"]
+        assert isinstance(decision, Supported)
+
+        seen: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json=_response())
+
+        await _run(
+            handler,
+            _request(
+                input=_chat(
+                    ChatMessage("user", (TextPart("Complete this"),)),
+                    ChatMessage("assistant", (TextPart("Partial answer"),)),
+                )
+            ),
+        )
+
+        assert cast(list[object], seen["messages"])[-1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Partial answer"}],
+        }
 
     @pytest.mark.anyio
     async def test_functions_choice_parallel_and_tool_use_lift(self) -> None:
@@ -1166,6 +1195,14 @@ class TestPreIOGuards:
             ),
             (
                 _request(
+                    input=_chat(
+                        ChatMessage("user", (TextPart(cast(Any, 7)),)),
+                    )
+                ),
+                r"content\[0\]\.text must be a string",
+            ),
+            (
+                _request(
                     input=_chat(ChatMessage("assistant", (ImagePart(url="https://x"),)))
                 ),
                 "assistant messages",
@@ -1195,7 +1232,7 @@ class TestPreIOGuards:
                     sampling=SamplingParams(max_tokens=2048),
                     reasoning=ReasoningParams(budget_tokens=2048),
                 ),
-                "less than max_tokens",
+                "max_tokens must exceed reasoning.budget_tokens",
             ),
             (
                 _request(
@@ -1296,7 +1333,7 @@ class TestPreIOGuards:
                         "anthropic_messages", {"service_tier": "auto"}
                     )
                 ),
-                "no unaudited",
+                "no raw Anthropic request passthrough",
             ),
             (
                 _request(
@@ -1640,6 +1677,37 @@ class TestResponseGuards:
 
 
 class TestAuditAndLowLevelContract:
+    def test_low_level_system_lowering_rejects_non_text_content(self) -> None:
+        input_ = _chat(
+            ChatMessage("system", (ImagePart(url="https://example.com/image.png"),)),
+            ChatMessage("user", (TextPart("Hello"),)),
+        )
+
+        with pytest.raises(DialectError, match="system accepts text content only"):
+            _lower_chat_input(input_)
+
+    def test_low_level_text_lowering_rejects_non_string_content(self) -> None:
+        with pytest.raises(DialectError, match="text content must be a string"):
+            _part_to_wire(TextPart(cast(Any, 7)))
+
+    def test_budget_conflict_is_attributed_to_sampling_max_tokens(self) -> None:
+        connection = _connection(lambda _: httpx.Response(200, json=_response()))
+        dialect = AnthropicMessagesDialect(connection, "claude")
+        req = _request(
+            sampling=SamplingParams(max_tokens=2048),
+            reasoning=ReasoningParams(budget_tokens=2048),
+        )
+        audit = RequestAudit(active_request_leaves(req))
+
+        dialect.validate_request(req, audit, _LegacyPlan())
+
+        decision = audit.decisions["sampling.max_tokens"]
+        assert isinstance(decision, Rejected)
+        assert decision.reason == (
+            "Anthropic max_tokens must exceed reasoning.budget_tokens"
+        )
+        assert "reasoning.budget_tokens" not in audit.decisions
+
     def test_mutating_lowered_input_is_detected_by_independent_verifier(self) -> None:
         connection = _connection(lambda _: httpx.Response(200, json=_response()))
         dialect = AnthropicMessagesDialect(connection, "claude")
@@ -3254,6 +3322,26 @@ class TestAdditionalProviderResponseBoundaries:
                     }
                 ),
                 "output_tokens_details has unsupported fields",
+            ),
+            (
+                _response(
+                    usage={
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "output_tokens_details": "not-an-object",
+                    }
+                ),
+                "output_tokens_details must be an object",
+            ),
+            (
+                _response(
+                    usage={
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "output_tokens_details": [],
+                    }
+                ),
+                "output_tokens_details must be an object",
             ),
         ],
     )

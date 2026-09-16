@@ -57,6 +57,40 @@ used, not whether the service starts.
 
 Models with a `path` field (and no `api_base`) or an `infer` section in the YAML config are automatically launched by `sieval run` and stopped after evaluation completes.
 
+### Anthropic Messages
+
+To call the native Anthropic Messages API, select the dialect explicitly and
+provide an external endpoint and credential:
+
+```yaml
+models:
+  claude:
+    name: claude-sonnet-4-5
+    dialect: anthropic_messages
+    api_base: https://api.anthropic.com/v1
+    api_key: "<your Anthropic API key>"
+    args:
+      max_tokens: 1024
+```
+
+The dialect sends JSON or SSE requests to `POST /v1/messages`. Every request
+must specify `max_tokens`; set a model-wide default under `models.<name>.args`,
+as above, or override it for one task under `tasks.<name>.infer_args`.
+
+Anthropic Messages has no per-request `seed`. Deterministic mode therefore does
+not inject one for this dialect, and an explicit `seed` is rejected before any
+network I/O.
+
+Raw request passthrough is intentionally unavailable. `dialect_options` cannot
+inject arbitrary Anthropic body fields or HTTP headers; in particular, there is
+currently no way to send the `anthropic-beta` header. Features that require a
+beta header are unsupported until they receive an explicit, audited mapping.
+
+The YAML loader does not expand environment-variable expressions in `api_key`.
+Replace the placeholder above through your configuration/secret-management
+workflow; omit `api_key` only when the target endpoint does not require
+authentication.
+
 ## Environment Variables
 
 Custom environment variables can be passed through the YAML config's `infer.env` section. Values are injected into the inference engine process.

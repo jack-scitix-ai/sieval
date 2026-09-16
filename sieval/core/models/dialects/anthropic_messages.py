@@ -439,6 +439,8 @@ def _image_to_wire(part: ImagePart) -> dict[str, JSONValue]:
 
 def _part_to_wire(part: object) -> dict[str, JSONValue]:
     if isinstance(part, TextPart):
+        if not isinstance(part.text, str):
+            raise DialectError("Anthropic text content must be a string")
         return {"type": "text", "text": part.text}
     if isinstance(part, ImagePart):
         return _image_to_wire(part)
@@ -468,10 +470,12 @@ def _lower_chat_input(
     messages: list[dict[str, JSONValue]] = []
     for message in input_.messages:
         if message.role == "system":
-            system.extend(
-                {"type": "text", "text": cast(TextPart, part).text}
-                for part in message.content
-            )
+            for part in message.content:
+                if not isinstance(part, TextPart):
+                    raise DialectError(
+                        "Anthropic top-level system accepts text content only"
+                    )
+                system.append(_part_to_wire(part))
             continue
         role = "user" if message.role == "tool" else message.role
         messages.append(
@@ -701,7 +705,7 @@ def _decode_continuation(
         tools=tuple(tools) if tools is not None else None,
         open_turn=open_turn,
         thinking=thinking,
-        effort=cast(str | None, effort),
+        effort=effort,
     )
 
 
@@ -773,7 +777,7 @@ def _validate_replay_messages(messages: Sequence[Mapping[str, JSONValue]]) -> No
                     f"opaque.messages[{index}].content[{block_index}] must be an object"
                 )
             _validate_history_block(
-                cast(Mapping[str, JSONValue], block),
+                block,
                 f"opaque.messages[{index}].content[{block_index}]",
                 role=cast(str, message["role"]),
             )
@@ -1200,6 +1204,9 @@ def _message_rejection(input_: ChatInput) -> str | None:
     for index, message in enumerate(input_.messages):
         if not message.content:
             return f"messages[{index}] has empty content"
+        for part_index, part in enumerate(message.content):
+            if isinstance(part, TextPart) and not isinstance(part.text, str):
+                return f"messages[{index}].content[{part_index}].text must be a string"
         if message.name is not None:
             return "Anthropic Messages has no message name field"
         if message.role == "developer":
@@ -1373,9 +1380,11 @@ def _usage_stats(raw: object) -> UsageStats:
     if inference_geo is not None and not isinstance(inference_geo, str):
         raise OutputContractError("response.usage.inference_geo must be a string")
     reasoning_tokens: int | None = None
-    details = usage.get("output_tokens_details")
-    if details is not None:
-        details_mapping = _json_mapping(details, "response.usage.output_tokens_details")
+    raw_output_details = usage.get("output_tokens_details")
+    if raw_output_details is not None:
+        details_mapping = _json_mapping(
+            raw_output_details, "response.usage.output_tokens_details"
+        )
         if set(details_mapping) != {"thinking_tokens"}:
             raise OutputContractError(
                 "response.usage.output_tokens_details has unsupported fields"
@@ -2082,14 +2091,14 @@ class AnthropicMessagesDialect:
             ):
                 audit.rejected(path, "Anthropic thinking budget must be at least 1024")
             elif (
-                path == "reasoning.budget_tokens"
+                path == "sampling.max_tokens"
                 and req.reasoning.budget_tokens is not None
                 and req.sampling.max_tokens is not None
                 and req.reasoning.budget_tokens >= req.sampling.max_tokens
             ):
                 audit.rejected(
                     path,
-                    "Anthropic thinking budget must be less than max_tokens",
+                    "Anthropic max_tokens must exceed reasoning.budget_tokens",
                 )
             elif path == "reasoning.summary" and req.reasoning.summary not in {
                 "none",
@@ -2151,7 +2160,7 @@ class AnthropicMessagesDialect:
                 else:
                     audit.rejected(
                         path,
-                        "PR 3 exposes no unaudited Anthropic body/header passthrough",
+                        "PR 3 exposes no raw Anthropic request passthrough",
                     )
 
     def prepare(self, req: Request, audit: RequestAudit) -> PreparedRequest:
