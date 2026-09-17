@@ -38,7 +38,11 @@ ALLOWLIST=(
   "scripts/sanitize.sh"             # this script itself (contains the patterns)
   "docs/"                           # local design/planning docs
   "tests/"                          # test fixtures use example IPs/paths
-  "CLAUDE.md"                       # project guidelines
+  # Anchored to git grep's `path:lineno:` prefix, so these exempt the guideline
+  # files themselves, not every line that merely names one: unanchored, a
+  # comment like `BAD = "/home/u/x"  # see AGENTS.md` would exempt itself.
+  "^CLAUDE\.md:"                    # project guidelines
+  "^AGENTS\.md:"                    # project guidelines (source of truth)
   "\.git/"                          # git internals
   "127\.0\.0\.1"                    # localhost is fine
   "0\.0\.0\.0"                      # bind-all is fine
