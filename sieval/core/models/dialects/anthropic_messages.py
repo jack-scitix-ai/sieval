@@ -128,6 +128,10 @@ _STREAM_EVENT_KEYS: Mapping[str, frozenset[str]] = MappingProxyType(
 _MESSAGE_DELTA_KEYS = frozenset(
     {"stop_reason", "stop_sequence", "container", "stop_details"}
 )
+#: ``recommended_model``, ``fallback_credit_token`` and
+#: ``fallback_has_prefill_claim`` are omitted: each needs an ``anthropic-beta``
+#: header, which this dialect does not send, so all three are unreachable and
+#: rejected as unknown.  Adding header passthrough means mapping them here.
 _REFUSAL_DETAIL_KEYS = frozenset({"type", "category", "explanation"})
 
 
@@ -592,6 +596,12 @@ def _tool_choice(
 
 
 def _thinking_config(req: Request) -> dict[str, JSONValue] | None:
+    # ``display`` lives only on the ``thinking`` object, so "no visible
+    # summary" cannot be said without also saying "think": ``summary='none'``
+    # enables thinking on a model where it defaults off, and those tokens bill
+    # as output. Leaving ``summary`` unset is what sends no thinking at all.
+    # (On Responses ``summary='none'`` is a no-op -- the same field, a
+    # different meaning.)
     thinking: dict[str, JSONValue] | None = None
     if req.reasoning.budget_tokens is not None:
         thinking = {
@@ -2362,7 +2372,14 @@ class AnthropicMessagesDialect:
 
         usage = _usage_stats(message.get("usage"))
         if stop_reason == "refusal":
-            _sequence(message.get("content"), "response.content")
+            # Content is discarded: Anthropic documents a refusal as arriving
+            # before any output or mid-stream, and says to treat partial output
+            # as incomplete either way. Validated first anyway, so a shape this
+            # dialect cannot parse still raises here as it would anywhere else.
+            for index, raw_block in enumerate(
+                _sequence(message.get("content"), "response.content")
+            ):
+                _validated_content_block(raw_block, index)
             return Response(
                 texts=("",),
                 finish_reasons=(stop_reason,),

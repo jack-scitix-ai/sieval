@@ -1717,6 +1717,27 @@ class TestResponseGuards:
         assert result.usage is not None
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("content", "message"),
+        [
+            ([{"type": "quantum_widget"}], "has no shared-IR mapping"),
+            ([{"type": "text", "text": 5}], "must be a string"),
+            (["not an object"], "must be an object"),
+        ],
+    )
+    async def test_refusal_content_blocks_are_still_validated(
+        self, content: list[object], message: str
+    ) -> None:
+        """Discarding a refusal's content does not mean skipping its checks."""
+        response = {
+            **_response(cast(Any, content), stop_reason="refusal"),
+            "stop_details": {"type": "refusal"},
+        }
+
+        with pytest.raises(OutputContractError, match=message):
+            await _run(lambda _: httpx.Response(200, json=response))
+
+    @pytest.mark.anyio
     async def test_adaptive_summary_allows_a_turn_without_thinking(self) -> None:
         req = _request(reasoning=ReasoningParams(summary="auto"))
 
