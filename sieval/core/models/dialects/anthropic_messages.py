@@ -128,6 +128,7 @@ _STREAM_EVENT_KEYS: Mapping[str, frozenset[str]] = MappingProxyType(
 _MESSAGE_DELTA_KEYS = frozenset(
     {"stop_reason", "stop_sequence", "container", "stop_details"}
 )
+_REFUSAL_DETAIL_KEYS = frozenset({"type", "category", "explanation"})
 
 
 def _validate_reasoning_config(options: object) -> None:
@@ -338,6 +339,26 @@ def _optional_string(value: object, path: str) -> str | None:
     if value is None:
         return None
     return _required_string(value, path)
+
+
+def _validate_stop_details(stop_reason: str, raw: object) -> None:
+    if stop_reason != "refusal":
+        if raw is not None:
+            raise OutputContractError(
+                "response.stop_details must be null unless stop_reason is 'refusal'"
+            )
+        return
+
+    details = _json_mapping(raw, "response.stop_details")
+    _reject_unknown_fields(details, _REFUSAL_DETAIL_KEYS, "response.stop_details")
+    if details.get("type") != "refusal":
+        raise OutputContractError("response.stop_details.type must be 'refusal'")
+    for field in ("category", "explanation"):
+        value = details.get(field)
+        if value is not None and not isinstance(value, str):
+            raise OutputContractError(
+                f"response.stop_details.{field} must be a string or null"
+            )
 
 
 def _sequence(value: object, path: str) -> Sequence[object]:
@@ -1850,23 +1871,35 @@ async def _terminal_stream_message(response: httpx.Response) -> dict[str, JSONVa
                 raise OutputContractError(
                     "Anthropic stream emitted two message_delta events"
                 )
+            delta = _json_mapping(event.get("delta"), "message_delta.delta")
+            _reject_unknown_fields(delta, _MESSAGE_DELTA_KEYS, "message_delta.delta")
+            stop_reason = delta.get("stop_reason")
+            if not isinstance(stop_reason, str) or not stop_reason:
+                raise OutputContractError(
+                    "message_delta.delta.stop_reason must be a non-empty string"
+                )
+            _validate_stop_details(stop_reason, delta.get("stop_details"))
             saw_delta = True
-            if set(blocks) != stopped_blocks:
+            if stop_reason == "refusal":
+                # Refusal is a terminal non-success outcome.  Deliberately
+                # discard every earlier block, whether still open or already
+                # closed, so streamed and non-streamed refusals both lift to an
+                # empty scoreable answer and blocked partial content cannot
+                # enter task scoring.  This is a normalization policy, not an
+                # implication that Anthropic guarantees either stream shape.
+                blocks.clear()
+                stopped_blocks.clear()
+            elif set(blocks) != stopped_blocks:
                 raise OutputContractError(
                     "Anthropic message_delta preceded content_block_stop"
                 )
-            delta = _json_mapping(event.get("delta"), "message_delta.delta")
-            _reject_unknown_fields(delta, _MESSAGE_DELTA_KEYS, "message_delta.delta")
             if delta.get("container") is not None:
                 raise OutputContractError(
                     "Anthropic response container has no shared-IR mapping"
                 )
-            if delta.get("stop_details") is not None:
-                raise OutputContractError(
-                    "Anthropic response stop_details has no shared-IR mapping"
-                )
-            message["stop_reason"] = delta.get("stop_reason")
+            message["stop_reason"] = stop_reason
             message["stop_sequence"] = delta.get("stop_sequence")
+            message["stop_details"] = delta.get("stop_details")
             initial_usage = _json_mapping(
                 message.get("usage"), "message_start.message.usage"
             )
@@ -2316,10 +2349,7 @@ class AnthropicMessagesDialect:
             raise OutputContractError(
                 "Anthropic response container has no shared-IR mapping"
             )
-        if message.get("stop_details") is not None:
-            raise OutputContractError(
-                "Anthropic response stop_details has no shared-IR mapping"
-            )
+        _validate_stop_details(stop_reason, message.get("stop_details"))
         stop_sequence = message.get("stop_sequence")
         if stop_reason == "stop_sequence":
             _required_string(stop_sequence, "response.stop_sequence")
@@ -2328,6 +2358,17 @@ class AnthropicMessagesDialect:
             raise OutputContractError(
                 "response.stop_sequence must be null unless stop_reason is "
                 "'stop_sequence'"
+            )
+
+        usage = _usage_stats(message.get("usage"))
+        if stop_reason == "refusal":
+            _sequence(message.get("content"), "response.content")
+            return Response(
+                texts=("",),
+                finish_reasons=(stop_reason,),
+                usage=usage,
+                request_params=context.request_params,
+                response_model=response_model,
             )
 
         text_parts: list[str] = []
@@ -2392,10 +2433,12 @@ class AnthropicMessagesDialect:
             raise OutputContractError(
                 f"Anthropic reply produced invalid tool history: {history_rejection}"
             )
-        usage = _usage_stats(message.get("usage"))
         text = "".join(text_parts)
-        if context.request.reasoning.summary == "auto" and not any(
-            part.strip() for part in thinking_parts
+        if (
+            context.request.reasoning.summary == "auto"
+            and stop_reason not in {"max_tokens", "model_context_window_exceeded"}
+            and any(block.get("type") == "thinking" for block in canonical_content)
+            and not any(part.strip() for part in thinking_parts)
         ):
             raise OutputContractError(
                 "Anthropic reply omitted the requested visible thinking summary"
@@ -2406,7 +2449,7 @@ class AnthropicMessagesDialect:
             saw_opaque_reasoning=saw_opaque_reasoning,
             stop_reason=stop_reason,
         )
-        reasoning = None
+        reasoning: tuple[ReasoningOutput | None, ...] | None = None
         if opaque is not None:
             reasoning = (
                 ReasoningOutput(
@@ -2419,6 +2462,10 @@ class AnthropicMessagesDialect:
                     ),
                 ),
             )
+        elif context.request.reasoning.summary == "auto":
+            # Adaptive thinking is optional per turn.  Keep the choice-aligned
+            # channel present without inventing reasoning when Claude skips it.
+            reasoning = (None,)
         return Response(
             texts=(text,),
             reasoning=reasoning,
@@ -2458,6 +2505,8 @@ class AnthropicMessagesDialect:
             json=body,
             headers=stream_headers,
         ) as response:
+            if not response.is_success:
+                await response.aread()
             response.raise_for_status()
             terminal = await _terminal_stream_message(response)
         return self._lift(terminal, execution)

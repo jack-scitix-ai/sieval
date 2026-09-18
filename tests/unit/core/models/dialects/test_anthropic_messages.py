@@ -4,7 +4,7 @@ AI-Generated Code - GPT-5.6 (OpenAI)
 """
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -164,12 +164,27 @@ def _stream_delta(
     *,
     stop_reason: str = "end_turn",
     usage: Mapping[str, object] | None = None,
+    stop_details: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
+    delta: dict[str, object] = {
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+    }
+    if stop_details is not None:
+        delta["stop_details"] = stop_details
     return {
         "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "delta": delta,
         "usage": usage if usage is not None else {"output_tokens": 3},
     }
+
+
+class _UnbufferedAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes) -> None:
+        self._content = content
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._content
 
 
 class TestCapabilities:
@@ -1062,6 +1077,104 @@ class TestStreaming:
         assert result.usage.output_tokens == 12
 
     @pytest.mark.anyio
+    async def test_streaming_refusal_is_a_scoreable_terminal_outcome(self) -> None:
+        content = _sse(
+            _stream_start(),
+            _stream_delta(
+                stop_reason="refusal",
+                stop_details={
+                    "type": "refusal",
+                    "category": "safety",
+                    "explanation": "Request refused",
+                },
+            ),
+            {"type": "message_stop"},
+        )
+
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=content,
+            ),
+            _request(
+                reasoning=ReasoningParams(summary="auto"),
+                scheduling=SchedulingParams(stream=True),
+            ),
+        )
+
+        assert result.texts == ("",)
+        assert result.finish_reasons == ("refusal",)
+        assert result.reasoning is None
+
+    @pytest.mark.anyio
+    async def test_streaming_refusal_discards_unfinished_partial_output(self) -> None:
+        content = _sse(
+            _stream_start(),
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "partial"},
+            },
+            _stream_delta(
+                stop_reason="refusal",
+                stop_details={"type": "refusal"},
+            ),
+            {"type": "message_stop"},
+        )
+
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=content,
+            ),
+            _request(scheduling=SchedulingParams(stream=True)),
+        )
+
+        assert result.texts == ("",)
+        assert result.finish_reasons == ("refusal",)
+
+    @pytest.mark.anyio
+    async def test_streaming_refusal_discards_completed_partial_text(self) -> None:
+        content = _sse(
+            _stream_start(),
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "completed partial"},
+            },
+            {"type": "content_block_stop", "index": 0},
+            _stream_delta(
+                stop_reason="refusal",
+                stop_details={"type": "refusal"},
+            ),
+            {"type": "message_stop"},
+        )
+
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=content,
+            ),
+            _request(scheduling=SchedulingParams(stream=True)),
+        )
+
+        assert result.texts == ("",)
+        assert result.finish_reasons == ("refusal",)
+
+    @pytest.mark.anyio
     @pytest.mark.parametrize(
         ("events", "message"),
         [
@@ -1122,22 +1235,6 @@ class TestStreaming:
                 "unsupported field",
             ),
             (({"type": "ping", "future": True},), "unsupported field"),
-            (
-                (
-                    _stream_start(),
-                    {
-                        "type": "message_delta",
-                        "delta": {
-                            "stop_reason": "refusal",
-                            "stop_sequence": None,
-                            "stop_details": {"type": "refusal"},
-                        },
-                        "usage": {"output_tokens": 1},
-                    },
-                    {"type": "message_stop"},
-                ),
-                "stop_details has no shared-IR mapping",
-            ),
             (
                 (
                     _stream_start(usage={"input_tokens": 7, "output_tokens": 1}),
@@ -1470,15 +1567,39 @@ class TestResponseGuards:
                 "container has no shared-IR mapping",
             ),
             (
+                {**_response(), "stop_reason": "refusal"},
+                "response.stop_details must be an object",
+            ),
+            (
                 {
                     **_response(),
                     "stop_reason": "refusal",
-                    "stop_details": {
-                        "type": "refusal",
-                        "category": "reasoning_extraction",
-                    },
+                    "stop_details": {"type": "future"},
                 },
-                "stop_details has no shared-IR mapping",
+                "stop_details.type must be 'refusal'",
+            ),
+            (
+                {
+                    **_response(),
+                    "stop_reason": "refusal",
+                    "stop_details": {"type": "refusal", "category": 1},
+                },
+                "stop_details.category must be a string or null",
+            ),
+            (
+                {
+                    **_response(),
+                    "stop_reason": "refusal",
+                    "stop_details": {"type": "refusal", "future": True},
+                },
+                "stop_details has unsupported field",
+            ),
+            (
+                {
+                    **_response(),
+                    "stop_details": {"type": "refusal"},
+                },
+                "stop_details must be null unless stop_reason is 'refusal'",
             ),
             (
                 {**_response(), "stop_sequence": "unexpected"},
@@ -1564,22 +1685,119 @@ class TestResponseGuards:
             await _run(lambda _: httpx.Response(200, json=response))
 
     @pytest.mark.anyio
-    async def test_requested_visible_summary_requires_nonempty_thinking(self) -> None:
+    async def test_refusal_is_a_scoreable_terminal_outcome(self) -> None:
+        req = _request(
+            reasoning=ReasoningParams(summary="auto"),
+            structured_output=StructuredOutputParams(
+                format="json_schema", schema={"type": "object"}
+            ),
+        )
+        response = {
+            **_response(
+                [
+                    {"type": "thinking", "thinking": "partial", "signature": "sig"},
+                    {"type": "text", "text": "partial answer"},
+                ],
+                stop_reason="refusal",
+            ),
+            "stop_details": {
+                "type": "refusal",
+                "category": "reasoning_extraction",
+                "explanation": None,
+            },
+        }
+
+        result = await _run(lambda _: httpx.Response(200, json=response), req)
+
+        assert result.texts == ("",)
+        assert result.finish_reasons == ("refusal",)
+        assert result.reasoning is None
+        assert result.structured_output is None
+        assert result.tool_calls is None
+        assert result.usage is not None
+
+    @pytest.mark.anyio
+    async def test_adaptive_summary_allows_a_turn_without_thinking(self) -> None:
         req = _request(reasoning=ReasoningParams(summary="auto"))
 
-        with pytest.raises(OutputContractError, match="visible thinking summary"):
-            await _run(
-                lambda _: httpx.Response(
-                    200,
-                    json=_response(
-                        [
-                            {"type": "redacted_thinking", "data": "opaque"},
-                            {"type": "text", "text": "answer"},
-                        ]
-                    ),
+        result = await _run(
+            lambda _: httpx.Response(200, json=_response()),
+            req,
+        )
+
+        assert result.texts == ("Hi",)
+        assert result.reasoning == (None,)
+
+    @pytest.mark.anyio
+    async def test_low_effort_adaptive_summary_allows_no_thinking(self) -> None:
+        req = _request(reasoning=ReasoningParams(effort="low", summary="auto"))
+
+        result = await _run(
+            lambda _: httpx.Response(200, json=_response()),
+            req,
+        )
+
+        assert result.reasoning == (None,)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "stop_reason", ["max_tokens", "model_context_window_exceeded"]
+    )
+    async def test_truncated_adaptive_summary_allows_no_thinking(
+        self, stop_reason: str
+    ) -> None:
+        req = _request(reasoning=ReasoningParams(summary="auto"))
+
+        result = await _run(
+            lambda _: httpx.Response(200, json=_response(stop_reason=stop_reason)),
+            req,
+        )
+
+        assert result.finish_reasons == (stop_reason,)
+        assert result.reasoning == (None,)
+
+    @pytest.mark.anyio
+    async def test_truncated_adaptive_summary_allows_incomplete_thinking(self) -> None:
+        req = _request(reasoning=ReasoningParams(summary="auto"))
+
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                json=_response(
+                    [{"type": "thinking", "thinking": "   ", "signature": "sig"}],
+                    stop_reason="max_tokens",
                 ),
-                req,
-            )
+            ),
+            req,
+        )
+
+        assert result.finish_reasons == ("max_tokens",)
+        assert result.reasoning is not None
+        assert result.reasoning[0] is not None
+        assert result.reasoning[0].text == "   "
+
+    @pytest.mark.anyio
+    async def test_adaptive_summary_accepts_redacted_thinking(self) -> None:
+        req = _request(reasoning=ReasoningParams(summary="auto"))
+
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                json=_response(
+                    [
+                        {"type": "redacted_thinking", "data": "opaque"},
+                        {"type": "text", "text": "answer"},
+                    ]
+                ),
+            ),
+            req,
+        )
+
+        assert result.texts == ("answer",)
+        assert result.reasoning is not None
+        assert result.reasoning[0] is not None
+        assert result.reasoning[0].text is None
+        assert result.reasoning[0].opaque_roundtrip is not None
 
     @pytest.mark.anyio
     async def test_manual_thinking_requires_replayable_thinking_state(self) -> None:
@@ -1666,13 +1884,16 @@ class TestResponseGuards:
             await _run(
                 lambda _: httpx.Response(
                     429,
-                    content=b"event: error\ndata: not-json\n\n",
+                    stream=_UnbufferedAsyncByteStream(
+                        b'{"type":"error","error":{"type":"overloaded_error"}}'
+                    ),
                     headers={"content-type": "text/event-stream"},
                 ),
                 _request(scheduling=SchedulingParams(stream=True)),
             )
 
         assert exc_info.value.response.status_code == 429
+        assert "overloaded_error" in exc_info.value.response.text
         lift.assert_not_awaited()
 
 
@@ -3579,6 +3800,35 @@ class TestAdditionalProviderResponseBoundaries:
                     },
                 ),
                 "container has no shared-IR mapping",
+            ),
+            (
+                (
+                    _stream_start(),
+                    _stream_delta(stop_reason="refusal"),
+                    {"type": "message_stop"},
+                ),
+                "response.stop_details must be an object",
+            ),
+            (
+                (
+                    _stream_start(),
+                    _stream_delta(
+                        stop_reason="refusal",
+                        stop_details={"type": "future"},
+                    ),
+                    {"type": "message_stop"},
+                ),
+                "stop_details.type must be 'refusal'",
+            ),
+            (
+                (
+                    _stream_start(),
+                    _stream_delta(
+                        stop_details={"type": "refusal"},
+                    ),
+                    {"type": "message_stop"},
+                ),
+                "stop_details must be null unless stop_reason is 'refusal'",
             ),
             (
                 (

@@ -627,11 +627,17 @@ class OutputContract:
         # must be able to serve.  Only the projected request decides which
         # response channels this particular call must return.
         required = set(required_response_channels(req))
+        finish_reasons = response.finish_reasons
+        refused = (
+            finish_reasons is not None
+            and bool(finish_reasons)
+            and all(reason == "refusal" for reason in finish_reasons)
+        )
         for name, rule in self.rules.items():
             value = getattr(response, name)
             if rule.guarantee is Guarantee.NEVER and value is not None:
                 raise OutputContractError(f"dialect promised {name!r} would be absent")
-            if name in required:
+            if name in required and not refused:
                 if rule.guarantee is not Guarantee.PRESENT_OR_ERROR:
                     raise OutputContractError(
                         f"{name!r} is required but has {rule.guarantee.value} guarantee"
@@ -643,7 +649,7 @@ class OutputContract:
             if value is not None:
                 rule.validator(value)
 
-        if req.session.opaque_continuation is not None:
+        if req.session.opaque_continuation is not None and not refused:
             reasoning = response.reasoning
             if reasoning is None or any(
                 item is None
