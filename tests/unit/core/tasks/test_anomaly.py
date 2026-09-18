@@ -188,6 +188,11 @@ class TestDetectTruncatedOutput:
             (["length"], {0}, "length"),
             (["max_output_tokens"], {0}, "max_output_tokens"),
             (["max_tokens"], {0}, "max_tokens"),
+            (
+                ["model_context_window_exceeded"],
+                {0},
+                "model_context_window_exceeded",
+            ),
             (["content_filter"], {0}, "content_filter"),
             (["stop"], set(), "stop"),
             (None, set(), "missing_finish_reasons"),

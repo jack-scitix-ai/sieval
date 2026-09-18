@@ -461,10 +461,25 @@ class TestValidateModelCapabilities:
                 },
             )
         )
+        anthropic = validate_eval_config(
+            self._config(
+                dialect="anthropic_messages",
+                capabilities={
+                    "reasoning": {
+                        "budget_tokens": 2048,
+                        "summary": "auto",
+                    },
+                    "structured_output": {"formats": ["json_schema"]},
+                    "multimodal_input": {"modalities": ["image"]},
+                    "input_scoring": False,
+                },
+            )
+        )
 
         assert chat.ok, chat.errors
         assert completions.ok, completions.errors
         assert responses.ok, responses.errors
+        assert anthropic.ok, anthropic.errors
 
     @pytest.mark.parametrize("dialect", [None, "", 7, ["openai_chat"]])
     def test_explicit_malformed_dialect_is_rejected(self, dialect):
@@ -1656,6 +1671,43 @@ class TestRunDryRun:
         binding_plans = reconcile_check["plan"]["binding_plans"]
         assert len(binding_plans) == 1
         assert next(iter(binding_plans.values()))["dialect_id"] == "openai_responses"
+
+    def test_active_anthropic_dialect_reconciles_to_its_runtime_plan(self, tmp_path):
+        """Dry-run carries native Messages through schema and reconciliation."""
+        from sieval.cli.validation import run_dry_run
+
+        config = tmp_path / "anthropic-messages.yaml"
+        config.write_text(
+            "models:\n"
+            "  m:\n"
+            "    name: claude-sonnet-4-6\n"
+            "    type: chat\n"
+            "    dialect: anthropic_messages\n"
+            "    api_base: https://api.anthropic.com/v1\n"
+            "datasets:\n"
+            "  d:\n"
+            "    class: sieval.datasets.aime_2024.AIME2024Dataset\n"
+            "tasks:\n"
+            "  t:\n"
+            "    class: sieval.tasks.aime_2024_0shot_gen.AIME2024ZeroShotGenTask\n"
+            "    dataset: d\n"
+            "    model: m\n",
+            encoding="utf-8",
+        )
+        content = config.read_text(encoding="utf-8")
+
+        direct = validate_eval_config(yaml.safe_load(content))
+        dry_run = run_dry_run(config)
+        checks = {check["name"]: check for check in dry_run["checks"]}
+
+        assert direct.ok, direct.errors
+        assert checks["schema"]["ok"] is True
+        assert checks["capability_reconcile"]["ok"] is True
+        binding_plans = checks["capability_reconcile"]["plan"]["binding_plans"]
+        assert len(binding_plans) == 1
+        assert next(iter(binding_plans.values()))["dialect_id"] == (
+            "anthropic_messages"
+        )
 
     def test_schema_validation_failure(self, tmp_path):
         """Config with bad schema returns schema check failure."""

@@ -676,6 +676,43 @@ class TestOutputContract:
                 Response(("x",)),
             )
 
+    def test_refusal_skips_success_channel_and_continuation_requirements(self):
+        rules = _all_rules(Guarantee.BEST_EFFORT)
+        rules["reasoning"] = OutputRule(Guarantee.PRESENT_OR_ERROR)
+        rules["structured_output"] = OutputRule(Guarantee.PRESENT_OR_ERROR)
+        contract = OutputContract(rules)
+        req = Request(
+            input=CompletionInput("x"),
+            reasoning=ReasoningParams(summary="auto"),
+            structured_output=StructuredOutputParams(format="json_object"),
+            session=SessionParams(
+                opaque_continuation=OpaqueContinuation("future_dialect", "previous")
+            ),
+        )
+
+        contract.validate(
+            _Plan(),
+            req,
+            Response(("",), finish_reasons=("refusal",)),
+        )
+
+    def test_mixed_refusal_choices_still_require_success_channels(self):
+        rules = _all_rules(Guarantee.BEST_EFFORT)
+        rules["reasoning"] = OutputRule(Guarantee.PRESENT_OR_ERROR)
+        contract = OutputContract(rules)
+        req = Request(
+            input=CompletionInput("x"),
+            sampling=SamplingParams(n=2),
+            reasoning=ReasoningParams(summary="auto"),
+        )
+
+        with pytest.raises(OutputContractError, match="required.*absent"):
+            contract.validate(
+                _Plan(),
+                req,
+                Response(("", "answer"), finish_reasons=("refusal", "end_turn")),
+            )
+
     def test_required_best_effort_channel_is_not_a_guarantee(self):
         contract = OutputContract(_all_rules(Guarantee.BEST_EFFORT))
         with pytest.raises(OutputContractError, match="best_effort guarantee"):
