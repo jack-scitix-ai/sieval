@@ -2706,18 +2706,29 @@ tasks:
         assert deployment.deployment_id is None
         assert deployment.plan is None
 
+    @pytest.mark.parametrize(
+        ("dialect_id", "model_name"),
+        [
+            ("anthropic_messages", "claude"),
+            ("google_genai", "gemini-2.5-flash"),
+        ],
+    )
     def test_native_external_dialect_requires_explicit_api_base(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        dialect_id: str,
+        model_name: str,
     ) -> None:
         config_path = self._config(
             tmp_path,
-            """
+            f"""
 models:
   m:
-    name: claude
+    name: {model_name}
     type: chat
-    dialect: anthropic_messages
-tasks: {}
+    dialect: {dialect_id}
+tasks: {{}}
 """,
         )
         monkeypatch.setenv("OPENAI_BASE_URL", "https://wrong-family.example/v1")
@@ -2725,7 +2736,7 @@ tasks: {}
 
         with pytest.raises(
             ValueError,
-            match=r"anthropic_messages.*requires an explicit api_base",
+            match=rf"{dialect_id}.*requires an explicit api_base",
         ):
             session.prepare_prelaunch()
 
@@ -3933,6 +3944,49 @@ tasks:
             "model:candidate",
             grader.binding_id,
         }
+
+    @pytest.mark.parametrize("version_path", ["", "/v1", "/v1beta"])
+    def test_inline_google_binding_reconciles_without_provider_guessing(
+        self, tmp_path: Path, version_path: str
+    ) -> None:
+        config_path = self._config(
+            tmp_path,
+            f"""
+models:
+  candidate:
+    name: org/candidate
+tasks:
+  judged:
+    class: fake.JudgeTask
+    dataset:
+      class: fake.Dataset
+    model: candidate
+    args:
+      grader:
+        model: gemini-2.5-flash
+        dialect: google_genai
+        api_base: https://generativelanguage.googleapis.com{version_path}
+        api_key: google-secret
+""",
+        )
+        session = EvalSession(config_path)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=self.JudgeTask,
+        ):
+            result = session.prepare_prelaunch()
+
+        grader = session._task_requirement_contexts["judged"].model_bindings["grader"]
+        assert isinstance(grader, InlineModelBinding)
+        assert grader.dialect_id == "google_genai"
+        assert "api_key" not in grader.config
+        binding_plan = result.binding_plans[grader.binding_id]
+        assert binding_plan.dialect_id == "google_genai"
+        assert (
+            result.deployment_plans[binding_plan.root_deployment_key].engine_id
+            == "unknown"
+        )
 
     def test_nested_inline_secret_is_redacted_from_stable_binding_identity(
         self, tmp_path: Path

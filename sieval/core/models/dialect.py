@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, fields
 from enum import StrEnum
-from typing import Protocol, cast, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from sieval.core.types import JSONValue
 
@@ -74,14 +74,33 @@ class WireVerifier(Protocol):
     def verify(self, body: Mapping[str, JSONValue]) -> str | None: ...
 
 
-@runtime_checkable
 class PreparedRequestVerifier(Protocol):
     """Independently verify request evidence outside the JSON body."""
 
     def verify_prepared(self, prepared: "PreparedRequest") -> str | None: ...
 
 
-type WireEvidence = WireObservation | WireVerifier | PreparedRequestVerifier
+@dataclass(frozen=True)
+class PreparedRequestEvidence:
+    """Explicitly select verification against the complete prepared request.
+
+    A wrapper keeps structural ``WireVerifier`` objects on their historical
+    body-only path even when they happen to expose another similarly named
+    method.  It also validates the callable at evidence-admission time rather
+    than failing later with an unhelpful ``TypeError``.
+    """
+
+    verifier: PreparedRequestVerifier
+
+    def __post_init__(self) -> None:
+        if not callable(getattr(self.verifier, "verify_prepared", None)):
+            raise TypeError(
+                "PreparedRequestEvidence.verifier must provide callable "
+                "verify_prepared()"
+            )
+
+
+type WireEvidence = WireObservation | WireVerifier | PreparedRequestEvidence
 
 
 @dataclass(frozen=True)
@@ -238,7 +257,7 @@ def active_request_leaves(req: Request) -> dict[str, object]:
     }
     for group_name, group in grouped.items():
         default = type(group)()
-        for item in fields(group):
+        for item in fields(cast(Any, group)):
             value = getattr(group, item.name)
             if value != getattr(default, item.name):
                 active[f"{group_name}.{item.name}"] = value
@@ -316,17 +335,14 @@ class RequestAudit:
             raise RequestAuditError(
                 f"consumed request leaf {path!r} requires wire evidence"
             )
-        if not all(
-            isinstance(
-                evidence,
-                (WireObservation, WireVerifier, PreparedRequestVerifier),
-            )
-            for evidence in wire_evidence
-        ):
-            raise TypeError(
-                "wire evidence must be WireObservation, WireVerifier, or "
-                "PreparedRequestVerifier"
-            )
+        for evidence in wire_evidence:
+            if isinstance(evidence, WireObservation | PreparedRequestEvidence):
+                continue
+            if not callable(getattr(evidence, "verify", None)):
+                raise TypeError(
+                    "wire evidence must be WireObservation, a verifier with "
+                    "callable verify(), or PreparedRequestEvidence"
+                )
         self._record(path, Consumed(path, tuple(wire_evidence)))
 
     def rejected(self, path: str, reason: str) -> None:
@@ -357,7 +373,7 @@ class RequestAudit:
                 "unaccounted request leaves: " + ", ".join(sorted(missing))
             )
 
-        verified: set[int] = set()
+        verified: set[tuple[str, int]] = set()
         for path, decision in self._decisions.items():
             if isinstance(decision, Consumed):
                 evidence_items = decision.wire_evidence
@@ -391,24 +407,39 @@ class RequestAudit:
                         )
                     continue
 
-                verifier_id = id(evidence)
+                verifier = (
+                    evidence.verifier
+                    if isinstance(evidence, PreparedRequestEvidence)
+                    else evidence
+                )
+                verifier_id = (
+                    "prepared"
+                    if isinstance(evidence, PreparedRequestEvidence)
+                    else "body",
+                    id(verifier),
+                )
                 if verifier_id in verified:
                     continue
                 verified.add(verifier_id)
-                mismatch = (
-                    evidence.verify_prepared(prepared)
-                    if isinstance(evidence, PreparedRequestVerifier)
-                    else evidence.verify(prepared.body)
-                )
+                if isinstance(evidence, PreparedRequestEvidence):
+                    mismatch = evidence.verifier.verify_prepared(prepared)
+                else:
+                    verify = getattr(evidence, "verify", None)
+                    if not callable(verify):
+                        raise AssertionError(
+                            "admitted wire verifier lost its verify() method"
+                        )
+                    mismatch = verify(prepared.body)
                 if mismatch is not None and (
                     not isinstance(mismatch, str) or not mismatch.strip()
                 ):
                     raise TypeError(
-                        "WireVerifier.verify() must return None or a non-empty string"
+                        "request evidence verifier must return None or a non-empty "
+                        "string"
                     )
                 if mismatch is not None:
                     raise RequestAuditError(
-                        f"prepared wire mismatch for {path!r}: {mismatch}"
+                        f"prepared request evidence mismatch for {path!r}: {mismatch}"
                     )
 
 
@@ -480,10 +511,11 @@ def validate_runtime_binding_plan(plan: RuntimePlanView, req: Request) -> None:
             )
 
     minimum = plan.capability_minimums.get("top_logprobs", {}).get("minimum")
+    minimum_value = int(cast(int, minimum)) if minimum is not None else None
     if (
-        minimum is not None
+        minimum_value is not None
         and req.scoring.top_logprobs > 0
-        and req.scoring.top_logprobs < int(minimum)
+        and req.scoring.top_logprobs < minimum_value
     ):
         raise DialectError(
             f"top_logprobs={req.scoring.top_logprobs} weakens required "
@@ -623,9 +655,21 @@ class OutputRule:
 @dataclass(frozen=True)
 class OutputContract:
     rules: Mapping[str, OutputRule]
+    empty_outcome_finish_reasons: frozenset[str] = frozenset({"refusal"})
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "rules", dict(self.rules))
+        empty_outcome_finish_reasons = frozenset(self.empty_outcome_finish_reasons)
+        if not empty_outcome_finish_reasons or any(
+            not isinstance(reason, str) or not reason
+            for reason in empty_outcome_finish_reasons
+        ):
+            raise ValueError("empty-outcome finish reasons must be non-empty strings")
+        object.__setattr__(
+            self,
+            "empty_outcome_finish_reasons",
+            empty_outcome_finish_reasons,
+        )
         channels = {
             name
             for name, (role, _) in response_field_contract().items()
@@ -645,16 +689,18 @@ class OutputContract:
         # response channels this particular call must return.
         required = set(required_response_channels(req))
         finish_reasons = response.finish_reasons
-        refused = (
+        empty_outcome = (
             finish_reasons is not None
             and bool(finish_reasons)
-            and all(reason == "refusal" for reason in finish_reasons)
+            and all(
+                reason in self.empty_outcome_finish_reasons for reason in finish_reasons
+            )
         )
         for name, rule in self.rules.items():
             value = getattr(response, name)
             if rule.guarantee is Guarantee.NEVER and value is not None:
                 raise OutputContractError(f"dialect promised {name!r} would be absent")
-            if name in required and not refused:
+            if name in required and not empty_outcome:
                 if rule.guarantee is not Guarantee.PRESENT_OR_ERROR:
                     raise OutputContractError(
                         f"{name!r} is required but has {rule.guarantee.value} guarantee"
@@ -666,7 +712,7 @@ class OutputContract:
             if value is not None:
                 rule.validator(value)
 
-        if req.session.opaque_continuation is not None and not refused:
+        if req.session.opaque_continuation is not None and not empty_outcome:
             reasoning = response.reasoning
             if reasoning is None or any(
                 item is None

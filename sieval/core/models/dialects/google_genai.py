@@ -11,9 +11,11 @@ AI-Generated Code - GPT-5.6 (OpenAI)
 import hashlib
 import json
 import math
+import re
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import cast
 from urllib.parse import quote
@@ -43,6 +45,7 @@ from sieval.core.models.dialect import (
     OutputContractError,
     OutputRule,
     PreparedRequest,
+    PreparedRequestEvidence,
     RequestAudit,
     RuntimePlanView,
     WireEvidence,
@@ -77,6 +80,15 @@ from sieval.core.models.ir import (
 )
 from sieval.core.types import JSONValue
 
+from ._google_genai_wire import (
+    GoogleWireContract,
+    inspect_function_schema,
+    lower_function_schema,
+    resolve_wire_endpoint,
+    validate_function_parameters,
+    validate_wire_body,
+)
+
 _THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
 _HOSTED_TOOL_KINDS = frozenset({"google_search", "url_context"})
 _IMAGE_MEDIA_TYPES = frozenset(
@@ -92,6 +104,151 @@ _IMAGE_MEDIA_TYPES = frozenset(
     }
 )
 _OPAQUE_VERSION = 1
+_INT32_MIN = -(2**31)
+_INT32_MAX = 2**31 - 1
+_CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
+_FUNCTION_NAME_PATTERN = re.compile(r"[A-Za-z0-9_:.\-]{1,128}")
+_RFC3339_TIMESTAMP_PATTERN = re.compile(
+    r"(?P<date>\d{4}-\d{2}-\d{2})T"
+    r"(?P<time>\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?"
+    r"(?P<offset>Z|[+\-]\d{2}:\d{2})"
+)
+# Keep these family rows aligned with Google's public thinking table and
+# current-model migration guide; request validation must not infer support from
+# the presence of a protocol field alone.
+_GEMINI_3_MODEL_PATTERN = re.compile(r"gemini-3(?:[.\-]|$)")
+_GEMINI_PRE_3_MODEL_PATTERN = re.compile(r"gemini-[12](?:[.\-]|$)")
+_GEMINI_25_PRO_PATTERN = re.compile(r"gemini-2\.5-pro(?:[.\-]|$)")
+_GEMINI_25_FLASH_LITE_PATTERN = re.compile(r"gemini-2\.5-flash-lite(?:[.\-]|$)")
+_GEMINI_25_FLASH_PATTERN = re.compile(r"gemini-2\.5-flash(?:[.\-]|$)")
+_GEMINI_31_FLASH_LITE_IMAGE_PATTERN = re.compile(
+    r"gemini-3\.1-flash-lite-image(?:[.\-]|$)"
+)
+_GEMINI_31_PRO_PATTERN = re.compile(r"gemini-3\.1-pro(?:[.\-]|$)")
+_GEMINI_31_FLASH_LITE_PATTERN = re.compile(r"gemini-3\.1-flash-lite(?:[.\-]|$)")
+_GEMINI_35_36_FLASH_PATTERN = re.compile(r"gemini-3\.(?:5|6)-flash(?:[.\-]|$)")
+_GEMINI_37_38_FLASH_PATTERN = re.compile(r"gemini-3\.(?:7|8)-flash(?:[.\-]|$)")
+_GEMINI_3_FLASH_PATTERN = re.compile(r"gemini-3-flash(?:[.\-]|$)")
+_GEMINI_3_PRO_PREVIEW_PATTERN = re.compile(r"gemini-3-pro-preview(?:[.\-]|$)")
+_GEMINI_3_SAMPLING_PATHS = frozenset(
+    {"sampling.temperature", "sampling.top_p", "sampling.top_k"}
+)
+_GEMINI_3_SAMPLING_WIRE_KEYS = frozenset({"temperature", "topP", "topK"})
+_STANDARD_USER_PART_FIELDS = frozenset({"text", "inlineData", "fileData"})
+_CHANNEL_OPTIONAL_FINISH_REASONS = frozenset(
+    {
+        "MAX_TOKENS",
+        "SAFETY",
+        "RECITATION",
+        "LANGUAGE",
+        "OTHER",
+        "BLOCKLIST",
+        "PROHIBITED_CONTENT",
+        "SPII",
+        "MALFORMED_FUNCTION_CALL",
+        "IMAGE_SAFETY",
+        "IMAGE_PROHIBITED_CONTENT",
+        "IMAGE_OTHER",
+        "NO_IMAGE",
+        "IMAGE_RECITATION",
+        "UNEXPECTED_TOOL_CALL",
+        "TOO_MANY_TOOL_CALLS",
+        "MALFORMED_RESPONSE",
+        "ESCALATION",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _GoogleModelRequestConstraints:
+    """Documented request domains for one Google model family.
+
+    ``thinking_levels=None`` means the current Google documentation does not
+    publish a narrower level table for the model id.  An empty set means the
+    family does not support ``thinkingLevel`` at all.
+    """
+
+    thinking_levels: frozenset[str] | None = None
+    positive_thinking_budget_range: tuple[int, int] | None = None
+    omit_sampling_controls: bool = False
+    maximum_candidates: int | None = None
+    mixed_tools_supported: bool | None = None
+
+
+def _model_request_constraints(model_name: str) -> _GoogleModelRequestConstraints:
+    """Resolve Google-documented constraints without scattering model checks."""
+
+    if _GEMINI_25_PRO_PATTERN.match(model_name):
+        return _GoogleModelRequestConstraints(
+            thinking_levels=frozenset(),
+            positive_thinking_budget_range=(128, 32768),
+            mixed_tools_supported=False,
+        )
+    if _GEMINI_25_FLASH_LITE_PATTERN.match(model_name):
+        return _GoogleModelRequestConstraints(
+            thinking_levels=frozenset(),
+            positive_thinking_budget_range=(512, 24576),
+            mixed_tools_supported=False,
+        )
+    if _GEMINI_25_FLASH_PATTERN.match(model_name):
+        # Google also accepts 0 to disable thinking, but the shared IR keeps
+        # disablement separate from its positive token-budget field.
+        return _GoogleModelRequestConstraints(
+            thinking_levels=frozenset(),
+            positive_thinking_budget_range=(1, 24576),
+            mixed_tools_supported=False,
+        )
+
+    if not _GEMINI_3_MODEL_PATTERN.match(model_name):
+        return _GoogleModelRequestConstraints(
+            mixed_tools_supported=(
+                False if _GEMINI_PRE_3_MODEL_PATTERN.match(model_name) else None
+            )
+        )
+
+    levels: frozenset[str] | None = None
+    if _GEMINI_31_FLASH_LITE_IMAGE_PATTERN.match(model_name):
+        levels = frozenset({"minimal", "high"})
+    elif _GEMINI_31_PRO_PATTERN.match(model_name):
+        levels = frozenset({"low", "medium", "high"})
+    elif _GEMINI_3_PRO_PREVIEW_PATTERN.match(model_name):
+        levels = frozenset({"low", "high"})
+    elif (
+        _GEMINI_31_FLASH_LITE_PATTERN.match(model_name)
+        or _GEMINI_35_36_FLASH_PATTERN.match(model_name)
+        or _GEMINI_3_FLASH_PATTERN.match(model_name)
+    ):
+        levels = _THINKING_LEVELS
+    elif _GEMINI_37_38_FLASH_PATTERN.match(model_name):
+        levels = frozenset({"low", "medium", "high"})
+
+    return _GoogleModelRequestConstraints(
+        thinking_levels=levels,
+        omit_sampling_controls=True,
+        maximum_candidates=1,
+        mixed_tools_supported=True,
+    )
+
+
+def _requires_exact_function_call_ids(model_name: str) -> bool:
+    """Return whether Google guarantees provider-issued function call IDs."""
+
+    return _GEMINI_3_MODEL_PATTERN.match(model_name) is not None
+
+
+_FATAL_FINISH_REASON_MESSAGES = MappingProxyType(
+    {
+        "MISSING_THOUGHT_SIGNATURE": (
+            "Google rejected the request because continuation history omitted a "
+            "required thought signature"
+        ),
+        "PUP_LIMITED_DISABLED": (
+            "Google stopped generation because the account is limited or disabled "
+            "by Prohibited Use Policy"
+        ),
+    }
+)
 _IR_OWNED_KEYS = BINDING_RESOURCE_KEYS | frozenset(
     {
         "model",
@@ -100,9 +257,6 @@ _IR_OWNED_KEYS = BINDING_RESOURCE_KEYS | frozenset(
         "generationConfig",
         "tools",
         "toolConfig",
-        "cachedContent",
-        "serviceTier",
-        "store",
         "stream",
     }
 )
@@ -290,13 +444,24 @@ OUTPUT_CONTRACT = OutputContract(
         "grounding": OutputRule(Guarantee.BEST_EFFORT),
         "session_id": OutputRule(Guarantee.NEVER),
         "usage": OutputRule(Guarantee.BEST_EFFORT),
-    }
+    },
+    empty_outcome_finish_reasons=_CHANNEL_OPTIONAL_FINISH_REASONS,
 )
+
+type _SyntheticCallKey = tuple[int, int, str]
 
 
 @dataclass(frozen=True)
 class _GoogleContext:
     request: Request
+    synthetic_call_ids: Mapping[_SyntheticCallKey, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "synthetic_call_ids",
+            MappingProxyType(dict(self.synthetic_call_ids)),
+        )
 
 
 @dataclass(frozen=True)
@@ -305,6 +470,7 @@ class _GoogleExecutionContext:
     request_params: Mapping[str, JSONValue]
     system_instruction: Mapping[str, JSONValue] | None
     input_contents: tuple[Mapping[str, JSONValue], ...]
+    synthetic_call_ids: Mapping[_SyntheticCallKey, str]
     historical_function_call_ids: frozenset[str]
     historical_server_call_ids: frozenset[str]
 
@@ -326,23 +492,36 @@ class _LegacyPlan:
 @dataclass(frozen=True)
 class _OperationVerifier:
     model_name: str
+    api_version: str
     stream: bool
-    version_prefix: str
 
-    def expected_operation(self) -> str:
-        """Return the one relative operation this bound dialect may execute."""
+    def verify_prepared(self, prepared: PreparedRequest) -> str | None:
+        """Derive the expected route independently from request lowering."""
 
         method = "streamGenerateContent" if self.stream else "generateContent"
         expected = (
-            f"{self.version_prefix}models/{quote(self.model_name, safe='')}:{method}"
+            f"{self.api_version}/models/{quote(self.model_name, safe='')}:{method}"
         )
-        return f"{expected}?alt=sse" if self.stream else expected
-
-    def verify_prepared(self, prepared: PreparedRequest) -> str | None:
-        expected = self.expected_operation()
+        if self.stream:
+            expected = f"{expected}?alt=sse"
         if prepared.operation != expected:
             return f"operation {prepared.operation!r} does not match {expected!r}"
         return None
+
+    def verify_http(self, request: httpx.Request, endpoint_root: httpx.URL) -> None:
+        """Check the final HTTP target against the bound model and version."""
+
+        method = "streamGenerateContent" if self.stream else "generateContent"
+        expected = endpoint_root.join(
+            f"{self.api_version}/models/{quote(self.model_name, safe='')}:{method}"
+        )
+        if self.stream:
+            expected = expected.copy_with(query=b"alt=sse")
+        if request.method != "POST" or request.url != expected:
+            raise DialectError(
+                "final Google request URL or method does not match the bound "
+                f"{self.api_version} operation"
+            )
 
 
 @dataclass(frozen=True)
@@ -420,7 +599,7 @@ def _optional_nonnegative_int(raw: object, path: str) -> int | None:
     return _nonnegative_int(raw, path)
 
 
-def _function_declaration(raw: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+def _function_declaration_source(raw: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
     data = dict(raw)
     if data.get("type") == "function":
         nested = data.get("function")
@@ -440,17 +619,51 @@ def _function_declaration(raw: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
     name = data.get("name")
     if not isinstance(name, str) or not name:
         raise DialectError("Google function declaration requires a name")
-    result: dict[str, JSONValue] = {"name": name}
-    if "description" in data:
-        result["description"] = data["description"]
+    if _FUNCTION_NAME_PATTERN.fullmatch(name) is None:
+        raise DialectError(
+            "Google function name must be at most 128 characters and contain "
+            "only letters, digits, underscores, colons, dots, or dashes"
+        )
+    description = data.get("description")
+    if description is None:
+        raise DialectError(
+            "Google function declaration requires a non-empty description"
+        )
+    if not isinstance(description, str):
+        raise DialectError("Google function description must be a string")
+    if not description.strip():
+        raise DialectError("Google function description must not be empty")
+    result: dict[str, JSONValue] = {"name": name, "description": description}
     if "parameters" in data:
-        result["parametersJsonSchema"] = data["parameters"]
+        parameters = data["parameters"]
+        if not isinstance(parameters, Mapping):
+            raise DialectError("Google function parameters must be an object")
+        validate_function_parameters(parameters)
+        result["parameters"] = dict(parameters)
     return result
 
 
-def _tool_choice(raw: JSONValue) -> dict[str, JSONValue]:
+def _function_declaration(
+    raw: Mapping[str, JSONValue], contract: GoogleWireContract
+) -> dict[str, JSONValue]:
+    result = _function_declaration_source(raw)
+    if "parameters" in result:
+        parameters = result.pop("parameters")
+        if contract.function_schema_field == "parameters":
+            parameters = lower_function_schema(parameters)
+        result[contract.function_schema_field] = parameters
+    return result
+
+
+def _tool_choice(
+    raw: JSONValue, *, include_server_side_invocations: bool = False
+) -> dict[str, JSONValue]:
     if isinstance(raw, str):
-        modes = {"auto": "AUTO", "none": "NONE", "required": "ANY"}
+        modes = {
+            "auto": "VALIDATED" if include_server_side_invocations else "AUTO",
+            "none": "NONE",
+            "required": "ANY",
+        }
         try:
             return {"functionCallingConfig": {"mode": modes[raw]}}
         except KeyError as exc:
@@ -475,11 +688,449 @@ def _tool_choice(raw: JSONValue) -> dict[str, JSONValue]:
     }
 
 
+def _thinking_level_error(
+    model_name: str,
+    constraints: _GoogleModelRequestConstraints,
+    effort: str,
+) -> str | None:
+    levels = constraints.thinking_levels
+    if levels is None:
+        return None
+    if not levels:
+        return (
+            f"{model_name} does not support thinkingLevel; use reasoning.budget_tokens"
+        )
+    normalized = effort.lower()
+    if normalized in levels:
+        return None
+    return (
+        f"{model_name} supports reasoning.effort values "
+        f"{', '.join(sorted(levels))}; got {effort!r}"
+    )
+
+
+def _thinking_budget_error(
+    model_name: str,
+    constraints: _GoogleModelRequestConstraints,
+    budget_tokens: int,
+) -> str | None:
+    budget_range = constraints.positive_thinking_budget_range
+    if budget_range is None:
+        return None
+    minimum, maximum = budget_range
+    if minimum <= budget_tokens <= maximum:
+        return None
+    return (
+        f"{model_name} reasoning.budget_tokens must be between {minimum} and {maximum}"
+    )
+
+
+def _tool_combination_error(
+    model_name: str,
+    constraints: _GoogleModelRequestConstraints,
+    *,
+    has_functions: bool,
+    has_hosted: bool,
+) -> str | None:
+    # Google documents mixed built-in/custom tools for Gemini 3 only. Do not
+    # infer a model family from an unknown provider alias, or conflate this
+    # combination restriction with standalone hosted-tool support.
+    # https://ai.google.dev/gemini-api/docs/generate-content/tool-combination
+    if has_functions and has_hosted and constraints.mixed_tools_supported is False:
+        return (
+            f"{model_name} does not support combining hosted tools with custom "
+            "functions; Google tool combinations require Gemini 3"
+        )
+    return None
+
+
+def _rfc3339_timestamp_ns(value: str) -> int | None:
+    """Return a comparable UTC nanosecond value for a Google timestamp."""
+
+    match = _RFC3339_TIMESTAMP_PATTERN.fullmatch(value)
+    if match is None:
+        return None
+    offset = "+00:00" if match["offset"] == "Z" else match["offset"]
+    try:
+        parsed = datetime.fromisoformat(
+            f"{match['date']}T{match['time']}{offset}"
+        ).astimezone(UTC)
+    except ValueError:
+        return None
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    delta = parsed - epoch
+    whole_seconds = delta.days * 86400 + delta.seconds
+    fraction = (match["fraction"] or "").ljust(9, "0")
+    return whole_seconds * 1_000_000_000 + int(fraction or "0")
+
+
+def _hosted_tool_config_error(kind: str, config: object) -> str | None:
+    if not isinstance(config, Mapping):
+        return f"Google hosted tool {kind!r} config must be an object"
+    data = cast(Mapping[object, object], config)
+    if kind == "url_context":
+        if data:
+            return "Google url_context config must be an empty object"
+        return None
+    if kind != "google_search":
+        return f"unsupported Google hosted tool {kind!r}"
+
+    unknown = set(data) - {"timeRangeFilter", "searchTypes"}
+    if unknown:
+        return "Google google_search config has unsupported field(s): " + ", ".join(
+            sorted(str(key) for key in unknown)
+        )
+    time_range = data.get("timeRangeFilter")
+    if time_range is not None:
+        if not isinstance(time_range, Mapping):
+            return "Google google_search.timeRangeFilter must be an object"
+        interval = cast(Mapping[object, object], time_range)
+        interval_unknown = set(interval) - {"startTime", "endTime"}
+        if interval_unknown:
+            return (
+                "Google google_search.timeRangeFilter has unsupported field(s): "
+                + ", ".join(sorted(str(key) for key in interval_unknown))
+            )
+        has_start = "startTime" in interval
+        has_end = "endTime" in interval
+        if has_start != has_end:
+            return (
+                "Google google_search.timeRangeFilter requires startTime and "
+                "endTime together"
+            )
+        parsed_times: dict[str, int] = {}
+        for key in ("startTime", "endTime"):
+            if key in interval and (
+                not isinstance(interval[key], str) or not interval[key]
+            ):
+                return (
+                    f"Google google_search.timeRangeFilter.{key} must be a "
+                    "non-empty timestamp string"
+                )
+            if key in interval:
+                value = cast(str, interval[key])
+                parsed = _rfc3339_timestamp_ns(value)
+                if parsed is None:
+                    return (
+                        f"Google google_search.timeRangeFilter.{key} must be an "
+                        "RFC3339 timestamp with an explicit UTC offset"
+                    )
+                parsed_times[key] = parsed
+        if (
+            "startTime" in parsed_times
+            and "endTime" in parsed_times
+            and parsed_times["startTime"] > parsed_times["endTime"]
+        ):
+            return (
+                "Google google_search.timeRangeFilter.startTime must not be after "
+                "endTime"
+            )
+
+    search_types = data.get("searchTypes")
+    if search_types is not None:
+        if not isinstance(search_types, Mapping):
+            return "Google google_search.searchTypes must be an object"
+        search_mapping = cast(Mapping[object, object], search_types)
+        search_unknown = set(search_mapping) - {"webSearch", "imageSearch"}
+        if search_unknown:
+            return (
+                "Google google_search.searchTypes has unsupported field(s): "
+                + ", ".join(sorted(str(key) for key in search_unknown))
+            )
+        for key in ("webSearch", "imageSearch"):
+            if key in search_mapping and (
+                not isinstance(search_mapping[key], Mapping)
+                or bool(search_mapping[key])
+            ):
+                return f"Google google_search.searchTypes.{key} must be an empty object"
+    return None
+
+
+def _validate_final_hosted_tools(body: Mapping[str, JSONValue]) -> None:
+    raw_tools = body.get("tools")
+    if not isinstance(raw_tools, Sequence) or isinstance(raw_tools, str | bytes):
+        return
+    for index, raw_tool in enumerate(raw_tools):
+        if not isinstance(raw_tool, Mapping):
+            continue
+        for field_name, kind in (
+            ("googleSearch", "google_search"),
+            ("urlContext", "url_context"),
+        ):
+            if field_name not in raw_tool:
+                continue
+            error = _hosted_tool_config_error(kind, raw_tool[field_name])
+            if error is not None:
+                raise DialectError(f"final Google tools[{index}]: {error}")
+
+
+def _validate_final_function_call_ids(
+    body: Mapping[str, JSONValue],
+    model_name: str,
+) -> None:
+    if not _requires_exact_function_call_ids(model_name):
+        return
+    contents = body.get("contents")
+    if not isinstance(contents, Sequence) or isinstance(contents, str | bytes):
+        return
+    for content_index, content in enumerate(contents):
+        if not isinstance(content, Mapping):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, Sequence) or isinstance(parts, str | bytes):
+            continue
+        for part_index, part in enumerate(parts):
+            if not isinstance(part, Mapping):
+                continue
+            for field_name in ("functionCall", "functionResponse"):
+                if field_name not in part:
+                    continue
+                raw_call = part[field_name]
+                if not isinstance(raw_call, Mapping):
+                    raise DialectError(
+                        f"final Google contents[{content_index}].parts[{part_index}]."
+                        f"{field_name} must be an object"
+                    )
+                call_id = raw_call.get("id")
+                if not isinstance(call_id, str) or not call_id:
+                    raise DialectError(
+                        f"{model_name} requires every {field_name} to contain the "
+                        "exact non-empty provider call id"
+                    )
+
+
+def _validate_final_function_call_signatures(
+    body: Mapping[str, JSONValue],
+    model_name: str,
+) -> None:
+    """Validate Gemini 3 signatures only within Google's current turn."""
+
+    if _GEMINI_3_MODEL_PATTERN.match(model_name) is None:
+        return
+    contents = body.get("contents")
+    if not isinstance(contents, Sequence) or isinstance(contents, str | bytes):
+        return
+
+    current_turn_start = 0
+    for content_index, raw_content in enumerate(contents):
+        if not isinstance(raw_content, Mapping):
+            continue
+        content = cast(Mapping[str, object], raw_content)
+        if content.get("role") != "user":
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, Sequence) or isinstance(parts, str | bytes):
+            continue
+        if any(
+            isinstance(part, Mapping) and bool(_STANDARD_USER_PART_FIELDS & part.keys())
+            for part in parts
+        ):
+            current_turn_start = content_index
+
+    for content_index in range(current_turn_start, len(contents)):
+        raw_content = contents[content_index]
+        if not isinstance(raw_content, Mapping):
+            continue
+        content = cast(Mapping[str, object], raw_content)
+        if content.get("role") != "model":
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, Sequence) or isinstance(parts, str | bytes):
+            continue
+        for part_index, part in enumerate(parts):
+            if not isinstance(part, Mapping) or "functionCall" not in part:
+                continue
+            signature = part.get("thoughtSignature")
+            if not isinstance(signature, str) or not signature:
+                raise DialectError(
+                    f"{model_name} current-turn functionCall at "
+                    f"contents[{content_index}].parts[{part_index}] must preserve "
+                    "the exact non-empty thoughtSignature; replay the returned "
+                    "opaque continuation instead of reconstructing Gemini 3 "
+                    "tool history"
+                )
+            break
+
+
+def _server_tool_signature_error(part: Mapping[str, object], path: str) -> str | None:
+    for field_name in ("toolCall", "toolResponse"):
+        if field_name not in part:
+            continue
+        signature = part.get("thoughtSignature")
+        if not isinstance(signature, str) or not signature:
+            return (
+                f"{path}.{field_name} must preserve a non-empty thoughtSignature "
+                "for Gemini 3 tool-context circulation"
+            )
+    return None
+
+
+def _validate_server_tool_history_signatures(
+    body: Mapping[str, JSONValue], model_name: str
+) -> None:
+    """Check circulated server state, including before the current user turn.
+
+    A subsequent request need not enable hosted tools again. The server-tool
+    parts themselves identify circulated history, so omitting the current
+    invocation flag must not bypass this check. Ordinary functionCall parts
+    retain their separate first-call/current-turn signature contract.
+    """
+
+    if _GEMINI_3_MODEL_PATTERN.match(model_name) is None:
+        return
+    contents = body.get("contents")
+    if not isinstance(contents, Sequence) or isinstance(contents, str | bytes):
+        return
+    for content_index, content in enumerate(contents):
+        if not isinstance(content, Mapping):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, Sequence) or isinstance(parts, str | bytes):
+            continue
+        for part_index, part in enumerate(parts):
+            if not isinstance(part, Mapping):
+                continue
+            error = _server_tool_signature_error(
+                part, f"Google contents[{content_index}].parts[{part_index}]"
+            )
+            if error is not None:
+                raise DialectError(error)
+
+
+def _validate_final_request_constraints(
+    body: Mapping[str, JSONValue], model_name: str
+) -> None:
+    constraints = _model_request_constraints(model_name)
+    _validate_final_function_call_ids(body, model_name)
+    _validate_final_function_call_signatures(body, model_name)
+    _validate_server_tool_history_signatures(body, model_name)
+    generation = body.get("generationConfig")
+    if isinstance(generation, Mapping):
+        generation_mapping = cast(Mapping[str, object], generation)
+        if constraints.omit_sampling_controls:
+            present = sorted(_GEMINI_3_SAMPLING_WIRE_KEYS & generation_mapping.keys())
+            if present:
+                raise DialectError(
+                    f"{model_name} final request contains sampling controls Google "
+                    f"says to omit: {', '.join(present)}"
+                )
+        candidate_count = generation_mapping.get("candidateCount")
+        if (
+            constraints.maximum_candidates is not None
+            and isinstance(candidate_count, int)
+            and not isinstance(candidate_count, bool)
+            and candidate_count > constraints.maximum_candidates
+        ):
+            raise DialectError(
+                "Gemini 3 models do not support candidateCount greater than 1"
+            )
+        thinking = generation_mapping.get("thinkingConfig")
+        if isinstance(thinking, Mapping):
+            thinking_mapping = cast(Mapping[str, object], thinking)
+            level = thinking_mapping.get("thinkingLevel")
+            if isinstance(level, str) and (
+                error := _thinking_level_error(model_name, constraints, level.lower())
+            ):
+                raise DialectError(error)
+            budget = thinking_mapping.get("thinkingBudget")
+            if (
+                isinstance(budget, int)
+                and not isinstance(budget, bool)
+                and (error := _thinking_budget_error(model_name, constraints, budget))
+            ):
+                raise DialectError(error)
+
+    _validate_final_hosted_tools(body)
+    tools = body.get("tools")
+    if isinstance(tools, Sequence) and not isinstance(tools, str | bytes):
+        error = _tool_combination_error(
+            model_name,
+            constraints,
+            has_functions=any(
+                isinstance(tool, Mapping) and bool(_get(tool, "functionDeclarations"))
+                for tool in tools
+            ),
+            has_hosted=any(
+                isinstance(tool, Mapping)
+                and ("googleSearch" in tool or "urlContext" in tool)
+                for tool in tools
+            ),
+        )
+        if error is not None:
+            raise DialectError(error)
+
+    tool_config = body.get("toolConfig")
+    if not isinstance(tool_config, Mapping):
+        return
+    tool_config_mapping = cast(Mapping[str, object], tool_config)
+    function_config = tool_config_mapping.get("functionCallingConfig")
+    function_mode = (
+        cast(Mapping[str, object], function_config).get("mode")
+        if isinstance(function_config, Mapping)
+        else None
+    )
+    if (
+        tool_config_mapping.get("includeServerSideToolInvocations") is True
+        and function_mode == "AUTO"
+    ):
+        raise DialectError(
+            "Google server-side tool invocation circulation does not support "
+            "function calling mode AUTO; use VALIDATED"
+        )
+
+
+def _allowed_function_call_names(req: Request) -> frozenset[str]:
+    declared = frozenset(
+        cast(str, _function_declaration_source(item)["name"])
+        for item in req.tools.functions
+    )
+    choice = req.tools.choice
+    if choice is None:
+        return declared
+    if isinstance(choice, str):
+        return frozenset() if choice == "none" else declared
+    normalized = _tool_choice(choice)
+    allowed = _get(
+        _get(normalized, "functionCallingConfig"),
+        "allowedFunctionNames",
+        [],
+    )
+    return frozenset(
+        _required_string(name, "tool choice allowed function")
+        for name in _sequence(allowed, "tool choice allowed functions")
+    )
+
+
+def _allowed_server_tool_types(req: Request) -> frozenset[str]:
+    allowed: set[str] = set()
+    for tool in req.tools.hosted:
+        if tool.kind == "url_context":
+            allowed.add("URL_CONTEXT")
+            continue
+        if tool.kind != "google_search":
+            continue
+        search_types = tool.config.get("searchTypes")
+        if search_types is None:
+            allowed.add("GOOGLE_SEARCH_WEB")
+            continue
+        if not isinstance(search_types, Mapping):
+            continue
+        search_types_mapping = cast(Mapping[str, object], search_types)
+        if search_types_mapping.get("webSearch") is not None:
+            allowed.add("GOOGLE_SEARCH_WEB")
+        if search_types_mapping.get("imageSearch") is not None:
+            allowed.add("GOOGLE_SEARCH_IMAGE")
+    return frozenset(allowed)
+
+
 def _hosted_tool(spec: object) -> dict[str, JSONValue]:
     kind = getattr(spec, "kind", None)
     config = getattr(spec, "config", None)
-    if kind not in _HOSTED_TOOL_KINDS or not isinstance(config, Mapping):
+    if not isinstance(kind, str):
         raise DialectError(f"unsupported Google hosted tool {kind!r}")
+    if error := _hosted_tool_config_error(kind, config):
+        raise DialectError(error)
+    assert isinstance(config, Mapping)
     key = "googleSearch" if kind == "google_search" else "urlContext"
     return {key: dict(config)}
 
@@ -516,8 +1167,11 @@ def _content_parts(
     message: ChatMessage,
     call_names: dict[str, str],
     answered_calls: set[str],
-) -> list[dict[str, JSONValue]]:
-    parts: list[dict[str, JSONValue]] = []
+    call_wire_ids: dict[str, str | None],
+    synthetic_call_ids: dict[_SyntheticCallKey, str],
+    content_index: int | None,
+) -> list[JSONValue]:
+    parts: list[JSONValue] = []
     for part in message.content:
         if isinstance(part, TextPart):
             if message.role == "tool":
@@ -541,6 +1195,7 @@ def _content_parts(
                     f"duplicate Google function call id {part.call_id!r}"
                 )
             call_names[part.call_id] = part.name
+            call_wire_ids[part.call_id] = part.call_id
             parts.append(
                 {
                     "functionCall": {
@@ -564,15 +1219,22 @@ def _content_parts(
                     f"duplicate Google function result for {part.call_id!r}"
                 )
             answered_calls.add(part.call_id)
-            parts.append(
-                {
-                    "functionResponse": {
-                        "id": part.call_id,
-                        "name": name,
-                        "response": _tool_result_payload(part),
-                    }
-                }
-            )
+            wire_id = call_wire_ids[part.call_id]
+            response: dict[str, JSONValue] = {
+                "name": name,
+                "response": _tool_result_payload(part),
+            }
+            if wire_id is not None:
+                response["id"] = wire_id
+            parts.append({"functionResponse": response})
+            if wire_id is None:
+                if content_index is None:
+                    raise AssertionError(
+                        "Google function responses require a conversation index"
+                    )
+                synthetic_call_ids[
+                    (content_index, len(parts) - 1, "functionResponse")
+                ] = part.call_id
         else:
             raise DialectError(f"unsupported Google content part {type(part).__name__}")
     if not parts:
@@ -591,6 +1253,25 @@ _OPAQUE_PART_FIELDS = frozenset(
         "toolResponse",
     }
 )
+_PART_AUXILIARY_FIELDS = frozenset(
+    {"partMetadata", "mediaResolution", "mediaProcessing", "videoMetadata"}
+)
+_SYNTHETIC_CALL_FIELDS = frozenset(
+    {"functionCall", "functionResponse", "toolCall", "toolResponse"}
+)
+
+
+def _part_auxiliary_error(part: Mapping[str, object], path: str) -> str | None:
+    for field_name in ("partMetadata", "mediaResolution", "videoMetadata"):
+        value = part.get(field_name)
+        if value is not None and not isinstance(value, Mapping):
+            return f"{path}.{field_name} must be an object"
+    media_processing = part.get("mediaProcessing")
+    if media_processing is not None and (
+        not isinstance(media_processing, str) or not media_processing
+    ):
+        return f"{path}.mediaProcessing must be a non-empty string"
+    return None
 
 
 def _validate_opaque_contents(raw: object) -> list[dict[str, JSONValue]]:
@@ -600,7 +1281,6 @@ def _validate_opaque_contents(raw: object) -> list[dict[str, JSONValue]]:
     if not isinstance(copied, list):
         raise AssertionError("copied Google contents must remain a list")
     result: list[dict[str, JSONValue]] = []
-    saw_signature = False
     for content_index, content in enumerate(copied):
         if not isinstance(content, dict) or set(content) != {"role", "parts"}:
             raise DialectError(
@@ -619,7 +1299,9 @@ def _validate_opaque_contents(raw: object) -> list[dict[str, JSONValue]]:
                     f"Google opaque part {content_index}.{part_index} is not an object"
                 )
             unknown = set(part) - (
-                _OPAQUE_PART_FIELDS | {"thought", "thoughtSignature"}
+                _OPAQUE_PART_FIELDS
+                | _PART_AUXILIARY_FIELDS
+                | {"thought", "thoughtSignature"}
             )
             if unknown:
                 raise DialectError(
@@ -634,20 +1316,37 @@ def _validate_opaque_contents(raw: object) -> list[dict[str, JSONValue]]:
             for key in data_fields - {"text"}:
                 if not isinstance(part[key], dict):
                     raise DialectError(f"Google opaque {key} must be an object")
+            if error := _part_auxiliary_error(
+                part, f"Google opaque part {content_index}.{part_index}"
+            ):
+                raise DialectError(error)
             thought = part.get("thought")
             if thought is not None and not isinstance(thought, bool):
                 raise DialectError("Google opaque thought marker must be boolean")
             signature = part.get("thoughtSignature")
-            if signature is not None:
-                if not isinstance(signature, str) or not signature:
-                    raise DialectError(
-                        "Google opaque thoughtSignature must be a non-empty string"
-                    )
-                saw_signature = True
+            if signature is not None and (
+                not isinstance(signature, str) or not signature
+            ):
+                raise DialectError(
+                    "Google opaque thoughtSignature must be a non-empty string"
+                )
         result.append(content)
-    if not saw_signature:
-        raise DialectError("Google opaque continuation has no thought signature")
     return result
+
+
+def _has_thought_signature(contents: Sequence[Mapping[str, JSONValue]]) -> bool:
+    for content in contents:
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for raw_part in parts:
+            if not isinstance(raw_part, Mapping):
+                continue
+            part = cast(Mapping[str, object], raw_part)
+            signature = part.get("thoughtSignature")
+            if isinstance(signature, str) and signature:
+                return True
+    return False
 
 
 def _validate_opaque_system(
@@ -671,9 +1370,89 @@ def _validate_opaque_system(
     return cast(dict[str, JSONValue], copied)
 
 
+def _validate_synthetic_call_ids(
+    raw: object,
+    contents: Sequence[Mapping[str, JSONValue]],
+) -> dict[_SyntheticCallKey, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, list):
+        raise DialectError("Google opaque syntheticCallIds must be a list")
+    result: dict[_SyntheticCallKey, str] = {}
+    for index, raw_item in enumerate(raw):
+        if not isinstance(raw_item, Mapping) or set(raw_item) != {
+            "contentIndex",
+            "partIndex",
+            "field",
+            "id",
+        }:
+            raise DialectError(
+                f"Google opaque syntheticCallIds[{index}] has invalid shape"
+            )
+        item = cast(Mapping[str, object], raw_item)
+        content_index = item["contentIndex"]
+        part_index = item["partIndex"]
+        field_name = item["field"]
+        call_id = item["id"]
+        if (
+            isinstance(content_index, bool)
+            or not isinstance(content_index, int)
+            or content_index < 0
+            or isinstance(part_index, bool)
+            or not isinstance(part_index, int)
+            or part_index < 0
+        ):
+            raise DialectError(
+                f"Google opaque syntheticCallIds[{index}] indexes must be "
+                "non-negative integers"
+            )
+        if not isinstance(field_name, str) or field_name not in _SYNTHETIC_CALL_FIELDS:
+            raise DialectError(
+                f"Google opaque syntheticCallIds[{index}] has invalid field"
+            )
+        if not isinstance(call_id, str) or not call_id:
+            raise DialectError(
+                f"Google opaque syntheticCallIds[{index}].id must be non-empty"
+            )
+        try:
+            parts = contents[content_index]["parts"]
+            if not isinstance(parts, list):
+                raise TypeError
+            part = parts[part_index]
+        except (IndexError, KeyError, TypeError) as exc:
+            raise DialectError(
+                f"Google opaque syntheticCallIds[{index}] points outside contents"
+            ) from exc
+        if not isinstance(part, Mapping) or field_name not in part:
+            raise DialectError(
+                f"Google opaque syntheticCallIds[{index}] points to the wrong part"
+            )
+        part_mapping = cast(Mapping[str, object], part)
+        raw_call = part_mapping[field_name]
+        if not isinstance(raw_call, Mapping):
+            raise DialectError(
+                f"Google opaque syntheticCallIds[{index}] requires a call without id"
+            )
+        call_mapping = cast(Mapping[str, object], raw_call)
+        raw_id = call_mapping.get("id")
+        if raw_id is not None and raw_id != "":
+            raise DialectError(
+                f"Google opaque syntheticCallIds[{index}] requires a call without id"
+            )
+        key = (content_index, part_index, field_name)
+        if key in result:
+            raise DialectError("Google opaque syntheticCallIds contains a duplicate")
+        result[key] = call_id
+    return result
+
+
 def _decode_opaque(
     value: str,
-) -> tuple[dict[str, JSONValue] | None, list[dict[str, JSONValue]]]:
+) -> tuple[
+    dict[str, JSONValue] | None,
+    list[dict[str, JSONValue]],
+    dict[_SyntheticCallKey, str],
+]:
     try:
         raw = json.loads(
             value,
@@ -685,39 +1464,85 @@ def _decode_opaque(
     if (
         not isinstance(raw, dict)
         or not {"version", "contents"}.issubset(raw)
-        or set(raw) - {"version", "contents", "systemInstruction"}
+        or set(raw) - {"version", "contents", "systemInstruction", "syntheticCallIds"}
     ):
         raise DialectError("invalid Google opaque continuation envelope")
     if raw.get("version") != _OPAQUE_VERSION:
         raise DialectError("unsupported Google opaque continuation version")
-    return (
-        _validate_opaque_system(raw.get("systemInstruction")),
-        _validate_opaque_contents(raw.get("contents")),
+    system = _validate_opaque_system(raw.get("systemInstruction"))
+    contents = _validate_opaque_contents(raw.get("contents"))
+    synthetic_call_ids = _validate_synthetic_call_ids(
+        raw.get("syntheticCallIds"), contents
     )
+    if not _has_thought_signature(contents) and not synthetic_call_ids:
+        raise DialectError(
+            "Google opaque continuation has no thought signature or synthetic "
+            "call correlation"
+        )
+    return system, contents, synthetic_call_ids
+
+
+def _local_call_id(
+    raw_call: Mapping[str, object],
+    key: _SyntheticCallKey,
+    synthetic_call_ids: Mapping[_SyntheticCallKey, str],
+    path: str,
+) -> tuple[str, str | None]:
+    raw_call_id = raw_call.get("id")
+    if raw_call_id is None or raw_call_id == "":
+        try:
+            return synthetic_call_ids[key], None
+        except KeyError as exc:
+            raise DialectError(
+                f"{path} without a provider id has no synthetic correlation id"
+            ) from exc
+    if not isinstance(raw_call_id, str):
+        raise DialectError(f"{path}.id must be a string when present")
+    return raw_call_id, raw_call_id
 
 
 def _call_state_from_contents(
     contents: Sequence[Mapping[str, JSONValue]],
-) -> tuple[dict[str, str], set[str]]:
+    synthetic_call_ids: Mapping[_SyntheticCallKey, str],
+) -> tuple[
+    dict[str, str],
+    set[str],
+    dict[str, str | None],
+    dict[str, str],
+]:
     names: dict[str, str] = {}
     answered: set[str] = set()
+    wire_ids: dict[str, str | None] = {}
+    pending_calls: dict[str, str] = {}
     server_types: dict[str, str] = {}
     answered_server_calls: set[str] = set()
     for content_index, content in enumerate(contents):
+        role = content.get("role")
         parts = content.get("parts")
         if not isinstance(parts, list):
             continue
+        turn_calls: dict[str, str] = {}
+        turn_responses: set[str] = set()
+        response_only_turn = True
         for part_index, part in enumerate(parts):
             if not isinstance(part, dict):
+                response_only_turn = False
                 continue
+            if set(part) & _OPAQUE_PART_FIELDS != {"functionResponse"}:
+                response_only_turn = False
             call = part.get("functionCall")
             if isinstance(call, dict):
-                call_id = call.get("id")
-                name = call.get("name")
-                if not isinstance(call_id, str) or not call_id:
+                if role != "model":
                     raise DialectError(
-                        "Google opaque functionCall requires a non-empty id"
+                        "Google functionCall history requires a model turn"
                     )
+                call_id, wire_id = _local_call_id(
+                    call,
+                    (content_index, part_index, "functionCall"),
+                    synthetic_call_ids,
+                    "Google opaque functionCall",
+                )
+                name = call.get("name")
                 if not isinstance(name, str) or not name:
                     raise DialectError(
                         "Google opaque functionCall requires a non-empty name"
@@ -725,14 +1550,21 @@ def _call_state_from_contents(
                 if call_id in names:
                     raise DialectError(f"duplicate Google function call id {call_id!r}")
                 names[call_id] = name
+                wire_ids[call_id] = wire_id
+                turn_calls[call_id] = name
             response = part.get("functionResponse")
             if isinstance(response, dict):
-                call_id = response.get("id")
-                name = response.get("name")
-                if not isinstance(call_id, str) or not call_id:
+                if role != "user":
                     raise DialectError(
-                        "Google opaque functionResponse requires a non-empty id"
+                        "Google functionResponse history requires a user turn"
                     )
+                call_id, _ = _local_call_id(
+                    response,
+                    (content_index, part_index, "functionResponse"),
+                    synthetic_call_ids,
+                    "Google opaque functionResponse",
+                )
+                name = response.get("name")
                 try:
                     expected_name = names[call_id]
                 except KeyError as exc:
@@ -749,12 +1581,16 @@ def _call_state_from_contents(
                         f"duplicate Google function result for {call_id!r}"
                     )
                 answered.add(call_id)
+                turn_responses.add(call_id)
             server_call = part.get("toolCall")
             if isinstance(server_call, dict):
-                call_id = server_call.get("id")
+                call_id, _ = _local_call_id(
+                    server_call,
+                    (content_index, part_index, "toolCall"),
+                    synthetic_call_ids,
+                    "Google opaque toolCall",
+                )
                 tool_type = server_call.get("toolType")
-                if not isinstance(call_id, str) or not call_id:
-                    raise DialectError("Google opaque toolCall requires a non-empty id")
                 if not isinstance(tool_type, str) or not tool_type:
                     raise DialectError(
                         "Google opaque toolCall requires a non-empty toolType"
@@ -767,10 +1603,13 @@ def _call_state_from_contents(
             server_response = part.get("toolResponse")
             if not isinstance(server_response, dict):
                 continue
-            call_id = server_response.get("id")
+            call_id, _ = _local_call_id(
+                server_response,
+                (content_index, part_index, "toolResponse"),
+                synthetic_call_ids,
+                "Google opaque toolResponse",
+            )
             tool_type = server_response.get("toolType")
-            if not isinstance(call_id, str) or not call_id:
-                raise DialectError("Google opaque toolResponse requires a non-empty id")
             if not isinstance(tool_type, str) or not tool_type:
                 raise DialectError(
                     "Google opaque toolResponse requires a non-empty toolType"
@@ -791,11 +1630,56 @@ def _call_state_from_contents(
                     f"duplicate Google server tool result for {call_id!r}"
                 )
             answered_server_calls.add(call_id)
-    return names, answered
+
+        if pending_calls:
+            expected = set(pending_calls)
+            missing = sorted(expected - turn_responses)
+            unexpected = sorted(turn_responses - expected)
+            if role != "user" or not response_only_turn or missing or unexpected:
+                details: list[str] = []
+                if missing:
+                    details.append(
+                        "unanswered function call id(s): "
+                        + ", ".join(repr(call_id) for call_id in missing)
+                    )
+                if unexpected:
+                    details.append(
+                        "response id(s) outside the immediately preceding calls: "
+                        + ", ".join(repr(call_id) for call_id in unexpected)
+                    )
+                if role != "user" or not response_only_turn:
+                    details.append(
+                        "the next content turn must contain only matching "
+                        "functionResponse parts"
+                    )
+                raise DialectError(
+                    "Google function responses must immediately follow and exactly "
+                    "match the preceding function calls; " + "; ".join(details)
+                )
+            pending_calls = {}
+        elif turn_responses:
+            raise DialectError(
+                "Google functionResponse must answer the immediately preceding "
+                "model functionCall turn"
+            )
+
+        if turn_calls:
+            pending_calls = turn_calls
+    return names, answered, wire_ids, pending_calls
+
+
+def _require_answered_function_calls(
+    pending_calls: Mapping[str, str], path: str
+) -> None:
+    unanswered = sorted(pending_calls)
+    if unanswered:
+        rendered = ", ".join(repr(call_id) for call_id in unanswered)
+        raise DialectError(f"{path} has unanswered function call id(s): {rendered}")
 
 
 def _historical_output_call_ids(
     contents: Sequence[Mapping[str, JSONValue]],
+    synthetic_call_ids: Mapping[_SyntheticCallKey, str],
 ) -> tuple[frozenset[str], frozenset[str]]:
     """Recover conversation-scoped call ids from the final request body."""
 
@@ -824,11 +1708,12 @@ def _historical_output_call_ids(
                     raise DialectError(
                         f"final Google {field_name} history must be an object"
                     )
-                call_id = call.get("id")
-                if not isinstance(call_id, str) or not call_id:
-                    raise DialectError(
-                        f"final Google {field_name} history requires a non-empty id"
-                    )
+                call_id, _ = _local_call_id(
+                    cast(Mapping[str, object], call),
+                    (content_index, part_index, field_name),
+                    synthetic_call_ids,
+                    f"final Google {field_name} history",
+                )
                 if call_id in ids:
                     raise DialectError(
                         f"final Google history duplicates {field_name} id {call_id!r}"
@@ -840,6 +1725,41 @@ def _historical_output_call_ids(
 def _chat_shape_error(request_input: ChatInput) -> str | None:
     """Return a lossless-mapping error for Google chat history, if any."""
 
+    if not request_input.messages:
+        return "Google chat input must contain at least one message"
+    for message_index, message in enumerate(request_input.messages):
+        if message.role not in _CHAT_ROLES:
+            return f"Google message {message_index} has invalid role {message.role!r}"
+        for part_index, part in enumerate(message.content):
+            path = f"messages[{message_index}].content[{part_index}]"
+            if isinstance(part, TextPart):
+                if not isinstance(part.text, str):
+                    return f"{path}.text must be a string"
+            elif isinstance(part, ImagePart):
+                if (part.url is None) == (part.data is None):
+                    return f"{path} must contain exactly one of url or data"
+                if part.url is not None and not isinstance(part.url, str):
+                    return f"{path}.url must be a string"
+                if part.data is not None and not isinstance(part.data, str):
+                    return f"{path}.data must be a string"
+                if part.media_type is not None and not isinstance(part.media_type, str):
+                    return f"{path}.media_type must be a string"
+                if part.detail is not None and not isinstance(part.detail, str):
+                    return f"{path}.detail must be a string"
+            elif isinstance(part, ToolCallPart):
+                if not isinstance(part.call_id, str) or not part.call_id:
+                    return f"{path}.call_id must be a non-empty string"
+                if not isinstance(part.name, str) or not part.name:
+                    return f"{path}.name must be a non-empty string"
+                if not isinstance(part.arguments, Mapping):
+                    return f"{path}.arguments must be an object"
+            elif isinstance(part, ToolResultPart):
+                if not isinstance(part.call_id, str) or not part.call_id:
+                    return f"{path}.call_id must be a non-empty string"
+                if not isinstance(part.is_error, bool):
+                    return f"{path}.is_error must be a boolean"
+            else:
+                return f"{path} has unsupported type {type(part).__name__}"
     if any(message.role == "developer" for message in request_input.messages):
         return (
             "Google systemInstruction cannot preserve the distinct developer "
@@ -859,15 +1779,22 @@ def _require_generation_turn(contents: Sequence[JSONValue]) -> None:
 
 def _input_to_wire(
     request_input: ChatInput, opaque: str | None
-) -> tuple[dict[str, JSONValue] | None, list[JSONValue]]:
+) -> tuple[
+    dict[str, JSONValue] | None,
+    list[JSONValue],
+    dict[_SyntheticCallKey, str],
+]:
     if error := _chat_shape_error(request_input):
         raise DialectError(error)
     system_parts: list[JSONValue] = []
-    opaque_system, opaque_contents = (
-        _decode_opaque(opaque) if opaque is not None else (None, [])
+    opaque_system, opaque_contents, opaque_call_ids = (
+        _decode_opaque(opaque) if opaque is not None else (None, [], {})
     )
     contents: list[JSONValue] = list(opaque_contents)
-    call_names, answered_calls = _call_state_from_contents(opaque_contents)
+    synthetic_call_ids = dict(opaque_call_ids)
+    call_names, answered_calls, call_wire_ids, _ = _call_state_from_contents(
+        opaque_contents, synthetic_call_ids
+    )
     saw_conversation = False
     for message in request_input.messages:
         if message.name is not None:
@@ -879,15 +1806,37 @@ def _input_to_wire(
                 )
             if any(not isinstance(part, TextPart) for part in message.content):
                 raise DialectError("Google systemInstruction is text-only")
-            parts = _content_parts(message, call_names, answered_calls)
+            parts = _content_parts(
+                message,
+                call_names,
+                answered_calls,
+                call_wire_ids,
+                synthetic_call_ids,
+                None,
+            )
             system_parts.extend(parts)
             continue
         saw_conversation = True
-        parts = _content_parts(message, call_names, answered_calls)
+        content_index = len(contents)
+        parts = _content_parts(
+            message,
+            call_names,
+            answered_calls,
+            call_wire_ids,
+            synthetic_call_ids,
+            content_index,
+        )
         role = "model" if message.role == "assistant" else "user"
         contents.append({"role": role, "parts": parts})
+    _, _, _, pending_calls = _call_state_from_contents(
+        tuple(cast(list[Mapping[str, JSONValue]], contents)),
+        synthetic_call_ids,
+    )
+    _require_answered_function_calls(pending_calls, "Google conversation history")
     _require_generation_turn(contents)
-    current_system = {"parts": system_parts} if system_parts else None
+    current_system: dict[str, JSONValue] | None = (
+        {"parts": system_parts} if system_parts else None
+    )
     if (
         opaque_system is not None
         and current_system is not None
@@ -898,7 +1847,7 @@ def _input_to_wire(
             "the current request"
         )
     system = current_system if current_system is not None else opaque_system
-    return system, contents
+    return system, contents, synthetic_call_ids
 
 
 def _verification_input_to_wire(
@@ -908,15 +1857,17 @@ def _verification_input_to_wire(
 
     if error := _chat_shape_error(request_input):
         raise DialectError(error)
-    opaque_system, opaque_contents = (
-        _decode_opaque(opaque) if opaque is not None else (None, [])
+    opaque_system, opaque_contents, synthetic_call_ids = (
+        _decode_opaque(opaque) if opaque is not None else (None, [], {})
     )
     contents: list[JSONValue] = [
         copy_json_value(item, "verified Google opaque content")
         for item in opaque_contents
     ]
     system_parts: list[JSONValue] = []
-    call_names, answered = _call_state_from_contents(opaque_contents)
+    call_names, answered, call_wire_ids, _ = _call_state_from_contents(
+        opaque_contents, synthetic_call_ids
+    )
     saw_conversation = False
 
     for message in request_input.messages:
@@ -982,6 +1933,7 @@ def _verification_input_to_wire(
                         f"duplicate Google function call id {part.call_id!r}"
                     )
                 call_names[part.call_id] = part.name
+                call_wire_ids[part.call_id] = part.call_id
                 expected_parts.append(
                     {
                         "functionCall": {
@@ -1016,15 +1968,18 @@ def _verification_input_to_wire(
                     response = raw_result
                 else:
                     response = {"result": raw_result}
-                expected_parts.append(
-                    {
-                        "functionResponse": {
-                            "id": part.call_id,
-                            "name": call_names[part.call_id],
-                            "response": response,
-                        }
-                    }
-                )
+                function_response: dict[str, JSONValue] = {
+                    "name": call_names[part.call_id],
+                    "response": response,
+                }
+                wire_id = call_wire_ids[part.call_id]
+                if wire_id is not None:
+                    function_response["id"] = wire_id
+                expected_parts.append({"functionResponse": function_response})
+                if wire_id is None:
+                    synthetic_call_ids[
+                        (len(contents), len(expected_parts) - 1, "functionResponse")
+                    ] = part.call_id
                 continue
             raise DialectError(f"unsupported Google content part {type(part).__name__}")
 
@@ -1038,8 +1993,17 @@ def _verification_input_to_wire(
             role = "model" if message.role == "assistant" else "user"
             contents.append({"role": role, "parts": expected_parts})
 
+    _, _, _, pending_calls = _call_state_from_contents(
+        tuple(cast(list[Mapping[str, JSONValue]], contents)),
+        synthetic_call_ids,
+    )
+    _require_answered_function_calls(
+        pending_calls, "verified Google conversation history"
+    )
     _require_generation_turn(contents)
-    current_system = {"parts": system_parts} if system_parts else None
+    current_system: dict[str, JSONValue] | None = (
+        {"parts": system_parts} if system_parts else None
+    )
     if (
         opaque_system is not None
         and current_system is not None
@@ -1361,6 +2325,7 @@ def _synthetic_call_id(
 def _opaque_history(
     system_instruction: Mapping[str, JSONValue] | None,
     input_contents: Sequence[Mapping[str, JSONValue]],
+    input_synthetic_call_ids: Mapping[_SyntheticCallKey, str],
     output_content: Mapping[str, JSONValue],
     opaque_call_ids: Mapping[int, tuple[str, str]],
 ) -> str | None:
@@ -1373,6 +2338,8 @@ def _opaque_history(
     copied_parts = copied_output.get("parts")
     if not isinstance(copied_parts, list):
         raise AssertionError("copied Google output content must retain parts")
+    synthetic_call_ids = dict(input_synthetic_call_ids)
+    output_content_index = len(history)
     for part_index, (field_name, call_id) in opaque_call_ids.items():
         try:
             copied_part = copied_parts[part_index]
@@ -1383,24 +2350,15 @@ def _opaque_history(
         copied_call = copied_part.get(field_name)
         if not isinstance(copied_call, dict):
             raise AssertionError("Google call payload changed shape")
-        copied_call["id"] = call_id
+        copied_id = copied_call.get("id")
+        if copied_id is not None and copied_id != "":
+            raise AssertionError("synthetic Google call unexpectedly gained an id")
+        synthetic_call_ids[(output_content_index, part_index, field_name)] = call_id
     history.append(copied_output)
-    saw_signature = False
-    for content in history:
-        if not isinstance(content, dict):
-            continue
-        parts = content.get("parts")
-        if not isinstance(parts, list):
-            continue
-        if any(
-            isinstance(part, dict)
-            and isinstance(part.get("thoughtSignature"), str)
-            and bool(part.get("thoughtSignature"))
-            for part in parts
-        ):
-            saw_signature = True
-            break
-    if not saw_signature:
+    if (
+        not _has_thought_signature(cast(Sequence[Mapping[str, JSONValue]], history))
+        and not synthetic_call_ids
+    ):
         return None
     envelope: dict[str, JSONValue] = {
         "version": _OPAQUE_VERSION,
@@ -1410,6 +2368,18 @@ def _opaque_history(
         envelope["systemInstruction"] = copy_json_value(
             system_instruction, "Google system history"
         )
+    if synthetic_call_ids:
+        envelope["syntheticCallIds"] = [
+            {
+                "contentIndex": content_index,
+                "partIndex": part_index,
+                "field": field_name,
+                "id": call_id,
+            }
+            for (content_index, part_index, field_name), call_id in sorted(
+                synthetic_call_ids.items()
+            )
+        ]
     return json.dumps(
         envelope,
         ensure_ascii=False,
@@ -1452,8 +2422,9 @@ class GoogleGenAIDialect:
         self._connection = connection
         self._requested_model_id = requested_model_id
         self._model_name = model_name
-        base_path = connection.client.base_url.path.rstrip("/")
-        self._version_prefix = "" if base_path.endswith("/v1beta") else "v1beta/"
+        self._wire_contract, self._endpoint_root = resolve_wire_endpoint(
+            connection.client.base_url
+        )
 
     @property
     def capabilities(self) -> frozenset[Capability]:
@@ -1464,26 +2435,45 @@ class GoogleGenAIDialect:
     ) -> None:
         audit.require_matches_request(req)
         del plan
-        has_named_message = isinstance(req.input, ChatInput) and any(
-            message.name is not None for message in req.input.messages
+        constraints = _model_request_constraints(self._model_name)
+        tool_combination_error = _tool_combination_error(
+            self._model_name,
+            constraints,
+            has_functions=bool(req.tools.functions),
+            has_hosted=bool(req.tools.hosted),
         )
         chat_shape_error = (
             _chat_shape_error(req.input) if isinstance(req.input, ChatInput) else None
         )
+        invalid_option_paths = (
+            {
+                f"dialect_options.{key}"
+                for key in req.dialect_options.values
+                if not isinstance(key, str)
+            }
+            if req.dialect_options is not None
+            else set()
+        )
         for path in audit.active_paths:
             if path == "input.chat":
-                if has_named_message:
-                    audit.rejected(
-                        path, "Google contents have no ChatMessage.name field"
-                    )
-                elif chat_shape_error is not None:
+                if chat_shape_error is not None:
                     audit.rejected(path, chat_shape_error)
+            elif path == "input.chat.message.name":
+                audit.rejected(path, "Google contents have no ChatMessage.name field")
             elif path.startswith("input.completion"):
                 audit.rejected(path, "google_genai requires ChatInput")
             elif path == "input.modality.image.detail":
                 audit.rejected(path, "Google images have no per-image detail field")
             elif path == "scoring.input_scoring":
                 audit.rejected(path, "Gemini cannot score input tokens")
+            elif (
+                path in _GEMINI_3_SAMPLING_PATHS and constraints.omit_sampling_controls
+            ):
+                audit.rejected(
+                    path,
+                    "Google's Gemini 3 guidance says to omit temperature, top_p, "
+                    f"and top_k for {self._model_name}",
+                )
             elif path == "sampling.temperature" and not (
                 0 <= cast(float, req.sampling.temperature) <= 2
             ):
@@ -1495,9 +2485,35 @@ class GoogleGenAIDialect:
             elif path == "sampling.top_k" and cast(int, req.sampling.top_k) < 1:
                 audit.rejected(path, "Google top_k must be positive")
             elif (
+                path == "sampling.top_k" and cast(int, req.sampling.top_k) > _INT32_MAX
+            ):
+                audit.rejected(path, "Google top_k must fit a signed 32-bit integer")
+            elif (
                 path == "sampling.max_tokens" and cast(int, req.sampling.max_tokens) < 1
             ):
                 audit.rejected(path, "Google max_tokens must be positive")
+            elif (
+                path == "sampling.max_tokens"
+                and cast(int, req.sampling.max_tokens) > _INT32_MAX
+            ):
+                audit.rejected(
+                    path,
+                    "Google max_tokens must fit a signed 32-bit integer",
+                )
+            elif path == "sampling.seed" and not (
+                _INT32_MIN <= cast(int, req.sampling.seed) <= _INT32_MAX
+            ):
+                audit.rejected(path, "Google seed must fit a signed 32-bit integer")
+            elif path == "sampling.n" and req.sampling.n > _INT32_MAX:
+                audit.rejected(path, "Google n must fit a signed 32-bit integer")
+            elif (
+                path == "sampling.n"
+                and req.sampling.n > 1
+                and constraints.maximum_candidates == 1
+            ):
+                audit.rejected(
+                    path, "Gemini 3 models do not support candidateCount greater than 1"
+                )
             elif (
                 path == "sampling.stop"
                 and len(cast(tuple[str, ...], req.sampling.stop)) > 5
@@ -1510,19 +2526,56 @@ class GoogleGenAIDialect:
                 or req.reasoning.effort.lower() not in _THINKING_LEVELS
             ):
                 audit.rejected(path, "unsupported Google thinking level")
+            elif path == "reasoning.effort" and (
+                error := _thinking_level_error(
+                    self._model_name,
+                    constraints,
+                    cast(str, req.reasoning.effort),
+                )
+            ):
+                audit.rejected(path, error)
             elif path == "reasoning.summary" and req.reasoning.summary not in {
                 "none",
                 "auto",
             }:
                 audit.rejected(path, "Google supports only summary='auto'")
+            elif (
+                path == "reasoning.budget_tokens"
+                and cast(int, req.reasoning.budget_tokens) > _INT32_MAX
+            ):
+                audit.rejected(
+                    path,
+                    "Google reasoning budget_tokens must fit a signed 32-bit integer",
+                )
+            elif path == "reasoning.budget_tokens" and (
+                error := _thinking_budget_error(
+                    self._model_name,
+                    constraints,
+                    cast(int, req.reasoning.budget_tokens),
+                )
+            ):
+                audit.rejected(path, error)
             elif path == "tools.parallel":
                 audit.rejected(path, "Google has no per-request parallel tool switch")
+            elif (
+                path in {"tools.functions", "tools.hosted"}
+                and tool_combination_error is not None
+            ):
+                audit.rejected(path, tool_combination_error)
+            elif path == "tools.functions":
+                try:
+                    for function in req.tools.functions:
+                        _function_declaration(function, self._wire_contract)
+                except DialectError as exc:
+                    audit.rejected(path, str(exc))
             elif path == "tools.choice" and not req.tools.functions:
                 audit.rejected(path, "Google tool choice requires function tools")
-            elif path == "tools.hosted" and any(
-                tool.kind not in _HOSTED_TOOL_KINDS for tool in req.tools.hosted
-            ):
-                audit.rejected(path, "unsupported Google hosted tool kind")
+            elif path == "tools.hosted":
+                for tool in req.tools.hosted:
+                    error = _hosted_tool_config_error(tool.kind, tool.config)
+                    if error is not None:
+                        audit.rejected(path, error)
+                        break
             elif path == "session.previous_response_id":
                 audit.rejected(path, "Gemini responseId is not a continuation handle")
             elif (
@@ -1546,16 +2599,31 @@ class GoogleGenAIDialect:
                 audit.rejected(path, "Google exposes no JSON-schema strict switch")
             elif path.startswith("dialect_options."):
                 key = path.removeprefix("dialect_options.")
-                if not key:
+                if path in invalid_option_paths:
+                    audit.rejected(path, "Google dialect option keys must be strings")
+                elif not key:
                     audit.rejected(path, "dialect option keys must be non-empty")
                 elif key in _IR_OWNED_KEYS:
                     audit.rejected(path, f"{key!r} must use its provider-neutral field")
+                elif key in self._wire_contract.unavailable_fields.get("request", ()):
+                    audit.rejected(
+                        path,
+                        f"{key!r} is unavailable in Google "
+                        f"{self._wire_contract.api_version}",
+                    )
 
     def prepare(self, req: Request, audit: RequestAudit) -> PreparedRequest:
         audit.require_matches_request(req)
         audit.raise_rejections()
         if not isinstance(req.input, ChatInput):
             raise DialectError("google_genai requires ChatInput")
+        if error := _tool_combination_error(
+            self._model_name,
+            _model_request_constraints(self._model_name),
+            has_functions=bool(req.tools.functions),
+            has_hosted=bool(req.tools.hosted),
+        ):
+            raise DialectError(error)
         active = frozenset(audit.active_paths)
 
         def consume(path: str, *evidence: WireEvidence) -> None:
@@ -1568,12 +2636,20 @@ class GoogleGenAIDialect:
             else None
         )
         input_verifier = _InputVerifier.from_request(req.input, opaque)
-        system, contents = _input_to_wire(req.input, opaque)
+        operation_verifier = _OperationVerifier(
+            self._model_name,
+            self._wire_contract.api_version,
+            req.scheduling.stream,
+        )
+        system, contents, synthetic_call_ids = _input_to_wire(req.input, opaque)
         body: dict[str, JSONValue] = {"contents": contents}
         if system is not None:
             body["systemInstruction"] = system
+        _validate_server_tool_history_signatures(body, self._model_name)
+        consume(
+            "input.chat", input_verifier, PreparedRequestEvidence(operation_verifier)
+        )
         for path in (
-            "input.chat",
             "input.modality.text",
             "input.modality.image",
             "input.modality.image.media_type",
@@ -1668,41 +2744,54 @@ class GoogleGenAIDialect:
             tools.append(
                 {
                     "functionDeclarations": [
-                        _function_declaration(item) for item in req.tools.functions
+                        _function_declaration(item, self._wire_contract)
+                        for item in req.tools.functions
                     ]
                 }
             )
-            consume("tools.functions", _FunctionsVerifier(req.tools.functions))
+            consume(
+                "tools.functions",
+                _FunctionsVerifier(req.tools.functions, self._wire_contract),
+            )
         if req.tools.hosted:
             tools.extend(_hosted_tool(tool) for tool in req.tools.hosted)
             consume("tools.hosted", _HostedToolsVerifier(req.tools.hosted))
         if tools:
             body["tools"] = tools
         if req.tools.choice is not None:
-            tool_config = _tool_choice(req.tools.choice)
+            tool_config = _tool_choice(
+                req.tools.choice,
+                include_server_side_invocations=bool(req.tools.hosted),
+            )
             allowed = _get(
                 _get(tool_config, "functionCallingConfig"),
                 "allowedFunctionNames",
                 [],
             )
             declared = {
-                _get(_function_declaration(item), "name")
+                _get(_function_declaration_source(item), "name")
                 for item in req.tools.functions
             }
             if any(name not in declared for name in _sequence(allowed, "tool choice")):
                 raise DialectError("Google tool choice names an undeclared function")
             body["toolConfig"] = tool_config
-            consume("tools.choice", _ToolChoiceVerifier(req.tools.choice))
+            consume(
+                "tools.choice",
+                _ToolChoiceVerifier(
+                    req.tools.choice,
+                    include_server_side_invocations=bool(req.tools.hosted),
+                ),
+            )
         if req.tools.hosted:
             existing_tool_config = body.get("toolConfig")
             if existing_tool_config is None:
-                tool_config: dict[str, JSONValue] = {}
+                merged_tool_config: dict[str, JSONValue] = {}
             elif isinstance(existing_tool_config, Mapping):
-                tool_config = dict(existing_tool_config)
+                merged_tool_config = dict(existing_tool_config)
             else:
                 raise AssertionError("Google toolConfig must remain an object")
-            tool_config["includeServerSideToolInvocations"] = True
-            body["toolConfig"] = tool_config
+            merged_tool_config["includeServerSideToolInvocations"] = True
+            body["toolConfig"] = merged_tool_config
 
         options = req.dialect_options
         if options is not None:
@@ -1711,27 +2800,40 @@ class GoogleGenAIDialect:
                     "dialect_options", "empty matching options have no wire semantics"
                 )
             for key, value in options.values.items():
+                if not isinstance(key, str):
+                    raise DialectError("Google dialect option keys must be strings")
                 path = f"dialect_options.{key}"
                 if path in audit.decisions:
                     continue
                 body[key] = value
                 audit.consumed(path, _RootOptionVerifier(key, value))
 
-        operation_verifier = _OperationVerifier(
-            self._model_name,
-            req.scheduling.stream,
-            self._version_prefix,
+        validate_wire_body(body, self._wire_contract)
+        method = "streamGenerateContent" if req.scheduling.stream else "generateContent"
+        operation = (
+            f"{self._wire_contract.api_version}/models/"
+            f"{quote(self._model_name, safe='')}:{method}"
         )
-        operation = operation_verifier.expected_operation()
+        if req.scheduling.stream:
+            operation = f"{operation}?alt=sse"
         if req.scheduling.stream:
             consume(
                 "scheduling.stream",
-                operation_verifier,
+                PreparedRequestEvidence(operation_verifier),
             )
-        return PreparedRequest(operation, body, _GoogleContext(deepcopy(req)))
+        return PreparedRequest(
+            operation,
+            body,
+            _GoogleContext(deepcopy(req), synthetic_call_ids),
+        )
 
     def _lift(self, raw: object, context: _GoogleExecutionContext) -> Response:
         req = context.request
+        prior_opaque = (
+            req.session.opaque_continuation.value
+            if req.session.opaque_continuation is not None
+            else None
+        )
         block_reason = _prompt_block_reason(raw)
         raw_candidates = _get(raw, "candidates")
         candidates = (
@@ -1745,7 +2847,15 @@ class GoogleGenAIDialect:
                     "Google response is contradictory: prompt was blocked "
                     f"with reason {block_reason}, but candidates were returned"
                 )
-            raise OutputContractError(f"Google prompt was blocked: {block_reason}")
+            return Response(
+                texts=("",) * req.sampling.n,
+                finish_reasons=(block_reason,) * req.sampling.n,
+                usage=_usage(_get(raw, "usageMetadata")),
+                request_params=context.request_params,
+                response_model=_optional_string(
+                    _get(raw, "modelVersion"), "response.modelVersion"
+                ),
+            )
         if len(candidates) != req.sampling.n:
             raise OutputContractError(
                 f"expected {req.sampling.n} Google candidates, "
@@ -1754,6 +2864,7 @@ class GoogleGenAIDialect:
         texts: list[str] = []
         finish_reasons: list[str] = []
         reasoning: list[ReasoningOutput | None] = []
+        saw_thought_parts: list[bool] = []
         calls: list[FunctionToolCall] = []
         call_ids = set(context.historical_function_call_ids)
         server_call_ids = set(context.historical_server_call_ids)
@@ -1763,10 +2874,30 @@ class GoogleGenAIDialect:
         groundings: list[GroundingMetadata] = []
         sampled: list[TokenLogprob] = []
         top: list[tuple[TopKEntry, ...]] = []
+        saw_logprobs = False
+        allowed_function_names = _allowed_function_call_names(req)
+        allowed_server_tool_types = _allowed_server_tool_types(req)
+        require_server_signatures = (
+            _GEMINI_3_MODEL_PATTERN.match(self._model_name) is not None
+            and _get(
+                _get(_get(context.request_params, "body"), "toolConfig"),
+                "includeServerSideToolInvocations",
+            )
+            is True
+        )
         for index, candidate in enumerate(candidates):
             candidate_index = _get(candidate, "index", index)
             if candidate_index != index:
                 raise OutputContractError("Google candidate indexes are not ordered")
+            finish_reason = _required_string(
+                _get(candidate, "finishReason"), "candidate.finishReason"
+            )
+            if finish_reason == "FINISH_REASON_UNSPECIFIED":
+                raise OutputContractError("Google candidate is not terminal")
+            fatal_message = _FATAL_FINISH_REASON_MESSAGES.get(finish_reason)
+            if fatal_message is not None:
+                raise OutputContractError(fatal_message)
+            finish_reasons.append(finish_reason)
             content = _get(candidate, "content")
             if content is None:
                 content_mapping: Mapping[str, JSONValue] | None = None
@@ -1792,18 +2923,25 @@ class GoogleGenAIDialect:
             text_parts: list[str] = []
             thought_text: list[str] = []
             opaque_call_ids: dict[int, tuple[str, str]] = {}
+            saw_function_call = False
             for part_index, raw_part in enumerate(parts):
                 if not isinstance(raw_part, Mapping):
                     raise OutputContractError("Google response part must be an object")
                 part = cast(Mapping[str, JSONValue], raw_part)
                 unknown_part = set(part) - (
-                    _OPAQUE_PART_FIELDS | {"thought", "thoughtSignature"}
+                    _OPAQUE_PART_FIELDS
+                    | _PART_AUXILIARY_FIELDS
+                    | {"thought", "thoughtSignature"}
                 )
                 if unknown_part:
                     raise OutputContractError(
                         "Google response part has unsupported field(s): "
                         + ", ".join(sorted(unknown_part))
                     )
+                if error := _part_auxiliary_error(
+                    part, f"candidates[{index}].parts[{part_index}]"
+                ):
+                    raise OutputContractError(error)
                 thought_marker = part.get("thought")
                 if thought_marker is not None and not isinstance(thought_marker, bool):
                     raise OutputContractError(
@@ -1816,6 +2954,12 @@ class GoogleGenAIDialect:
                     raise OutputContractError(
                         "Google response thoughtSignature must be a non-empty string"
                     )
+                if require_server_signatures:
+                    error = _server_tool_signature_error(
+                        part, f"candidates[{index}].parts[{part_index}]"
+                    )
+                    if error is not None:
+                        raise OutputContractError(error)
                 known = [
                     name
                     for name in ("text", "functionCall", "toolCall", "toolResponse")
@@ -1835,10 +2979,8 @@ class GoogleGenAIDialect:
                 if known[0] == "text":
                     text_parts.append(_string(part["text"], "response text"))
                 elif known[0] == "functionCall":
-                    if not req.tools.functions:
-                        raise OutputContractError(
-                            "Google returned an unrequested function call"
-                        )
+                    is_first_function_call = not saw_function_call
+                    saw_function_call = True
                     raw_call = part["functionCall"]
                     if not isinstance(raw_call, Mapping):
                         raise OutputContractError("functionCall must be an object")
@@ -1849,8 +2991,22 @@ class GoogleGenAIDialect:
                     if not isinstance(arguments, dict):
                         raise OutputContractError("functionCall.args must be an object")
                     name = _required_string(_get(call, "name"), "functionCall.name")
+                    if name not in allowed_function_names:
+                        if not req.tools.functions:
+                            raise OutputContractError(
+                                "Google returned an unrequested function call"
+                            )
+                        raise OutputContractError(
+                            f"Google returned function {name!r} outside the "
+                            "request's allowed function set"
+                        )
                     raw_call_id = _get(call, "id")
                     if raw_call_id is None or raw_call_id == "":
+                        if _requires_exact_function_call_ids(self._model_name):
+                            raise OutputContractError(
+                                f"{self._model_name} response omitted the required "
+                                "functionCall.id"
+                            )
                         call_id = _synthetic_call_id(
                             context.input_contents,
                             index,
@@ -1865,12 +3021,23 @@ class GoogleGenAIDialect:
                         raise OutputContractError(
                             "functionCall.id must be a string when present"
                         )
+                    if (
+                        is_first_function_call
+                        and _GEMINI_3_MODEL_PATTERN.match(self._model_name) is not None
+                        and signature is None
+                    ):
+                        raise OutputContractError(
+                            f"{self._model_name} function-call response omitted "
+                            "the required thoughtSignature on its first "
+                            "functionCall part"
+                        )
                     if call_id in call_ids:
                         raise OutputContractError(
                             f"duplicate Google function call id {call_id!r}"
                         )
                     call_ids.add(call_id)
-                    opaque_call_ids[part_index] = ("functionCall", call_id)
+                    if raw_call_id is None or raw_call_id == "":
+                        opaque_call_ids[part_index] = ("functionCall", call_id)
                     calls.append(
                         FunctionToolCall(
                             call_id,
@@ -1879,10 +3046,6 @@ class GoogleGenAIDialect:
                         )
                     )
                 elif known[0] == "toolCall":
-                    if not req.tools.hosted:
-                        raise OutputContractError(
-                            "Google returned an unrequested server tool call"
-                        )
                     raw_item = part["toolCall"]
                     if not isinstance(raw_item, Mapping):
                         raise OutputContractError("toolCall must be an object")
@@ -1909,13 +3072,23 @@ class GoogleGenAIDialect:
                         raise OutputContractError(
                             "toolCall.id must be a string when present"
                         )
+                    if tool_type not in allowed_server_tool_types:
+                        if not req.tools.hosted:
+                            raise OutputContractError(
+                                "Google returned an unrequested server tool call"
+                            )
+                        raise OutputContractError(
+                            f"Google returned server tool type {tool_type!r} "
+                            "outside the request's allowed hosted-tool set"
+                        )
                     if tool_id in server_call_ids:
                         raise OutputContractError(
                             f"duplicate Google server tool call id {tool_id!r}"
                         )
                     server_call_ids.add(tool_id)
                     server_calls[tool_id] = (tool_type, raw_args)
-                    opaque_call_ids[part_index] = ("toolCall", tool_id)
+                    if raw_tool_id is None or raw_tool_id == "":
+                        opaque_call_ids[part_index] = ("toolCall", tool_id)
                 else:
                     if not req.tools.hosted:
                         raise OutputContractError(
@@ -1958,28 +3131,29 @@ class GoogleGenAIDialect:
                             "toolResponse.response must be an object"
                         )
                     server_results[tool_id] = (tool_type, tool_result)
-                    opaque_call_ids[part_index] = ("toolResponse", tool_id)
+                    if raw_tool_id is None or raw_tool_id == "":
+                        opaque_call_ids[part_index] = ("toolResponse", tool_id)
             text = "".join(text_parts)
             texts.append(text)
-            finish_reason = _required_string(
-                _get(candidate, "finishReason"), "candidate.finishReason"
-            )
-            if finish_reason == "FINISH_REASON_UNSPECIFIED":
-                raise OutputContractError("Google candidate is not terminal")
-            finish_reasons.append(finish_reason)
-            opaque = (
-                _opaque_history(
+            if content_mapping is not None and parts:
+                opaque = _opaque_history(
                     context.system_instruction,
                     context.input_contents,
+                    context.synthetic_call_ids,
                     content_mapping,
                     opaque_call_ids,
                 )
-                if content_mapping is not None and parts
-                else None
-            )
+            else:
+                # No provider part means there is no new state to append.  The
+                # previous signed history is still the exact continuation state,
+                # including when thinking consumes the output budget before a
+                # visible part is emitted.
+                opaque = prior_opaque
+            saw_thought_parts.append(bool(thought_text))
             reasoning.append(
                 ReasoningOutput(
-                    text="\n".join(thought_text) or None, opaque_roundtrip=opaque
+                    text="\n".join(thought_text) or None,
+                    opaque_roundtrip=opaque,
                 )
                 if thought_text or opaque is not None
                 else None
@@ -2000,7 +3174,10 @@ class GoogleGenAIDialect:
             raw_logprobs = _get(candidate, "logprobsResult")
             if req.scoring.sampled_logprobs:
                 if raw_logprobs is None:
+                    if finish_reason in _CHANNEL_OPTIONAL_FINISH_REASONS:
+                        continue
                     raise OutputContractError("Google reply omitted requested logprobs")
+                saw_logprobs = True
                 chosen, alternatives = _logprobs(
                     raw_logprobs,
                     "candidate.logprobsResult",
@@ -2012,13 +3189,22 @@ class GoogleGenAIDialect:
                     )
                 sampled.extend(chosen)
                 top.extend(alternatives)
-        if req.reasoning.summary == "auto" and any(
-            item is None or item.text is None or not item.text.strip()
-            for item in reasoning
-        ):
-            raise OutputContractError(
-                "Google reply omitted requested thoughts for one or more candidates"
-            )
+        if req.reasoning.summary == "auto":
+            for finish_reason, reasoning_item, saw_thought in zip(
+                finish_reasons, reasoning, saw_thought_parts, strict=True
+            ):
+                if (
+                    finish_reason not in _CHANNEL_OPTIONAL_FINISH_REASONS
+                    and saw_thought
+                    and (
+                        reasoning_item is None
+                        or reasoning_item.text is None
+                        or not reasoning_item.text.strip()
+                    )
+                ):
+                    raise OutputContractError(
+                        "Google reply returned an empty requested thought summary"
+                    )
         if req.sampling.n > 1 and (citations or groundings):
             raise OutputContractError(
                 "Google singular citation/grounding metadata cannot represent choices"
@@ -2047,15 +3233,30 @@ class GoogleGenAIDialect:
             raise OutputContractError(
                 "Google returned a server tool response without its call"
             )
+        all_channels_optional = bool(finish_reasons) and all(
+            reason in _CHANNEL_OPTIONAL_FINISH_REASONS for reason in finish_reasons
+        )
         return Response(
             texts=tuple(texts),
-            reasoning=tuple(reasoning) if any(reasoning) else None,
+            reasoning=(
+                tuple(reasoning)
+                if any(reasoning) or req.reasoning.summary == "auto"
+                else None
+            ),
             finish_reasons=tuple(finish_reasons),
             tool_calls=tuple(calls) or None,
             server_tool_uses=tuple(server_uses) or None,
-            structured_output=_structured_output(req, text),
-            logprobs=tuple(sampled) if req.scoring.sampled_logprobs else None,
-            top_logprobs=tuple(top) if req.scoring.top_logprobs > 0 else None,
+            structured_output=(
+                None if all_channels_optional else _structured_output(req, text)
+            ),
+            logprobs=(
+                tuple(sampled)
+                if req.scoring.sampled_logprobs and saw_logprobs
+                else None
+            ),
+            top_logprobs=(
+                tuple(top) if req.scoring.top_logprobs > 0 and saw_logprobs else None
+            ),
             citations=tuple(citations) or None,
             grounding=groundings[0] if groundings else None,
             usage=_usage(_get(raw, "usageMetadata")),
@@ -2246,11 +3447,12 @@ class GoogleGenAIDialect:
         context = prepared.context
         if not isinstance(context, _GoogleContext):
             raise DialectError("google_genai received invalid prepared context")
-        operation_mismatch = _OperationVerifier(
+        operation_verifier = _OperationVerifier(
             self._model_name,
+            self._wire_contract.api_version,
             context.request.scheduling.stream,
-            self._version_prefix,
-        ).verify_prepared(prepared)
+        )
+        operation_mismatch = operation_verifier.verify_prepared(prepared)
         if operation_mismatch is not None:
             raise DialectError(
                 f"google_genai received the wrong prepared operation: "
@@ -2271,23 +3473,42 @@ class GoogleGenAIDialect:
             headers["x-goog-api-key"] = credential
         request = self._connection.client.build_request(
             "POST",
-            prepared.operation,
+            self._endpoint_root.join(prepared.operation),
             headers=headers,
             json=body,
         )
+        operation_verifier.verify_http(request, self._endpoint_root)
         actual_body = _strict_json_loads(
             request.content.decode("utf-8"), "final Google request body"
         )
         if not isinstance(actual_body, dict):
             raise DialectError("final Google request body must be an object")
+        validate_wire_body(actual_body, self._wire_contract)
+        mismatch = _FunctionsVerifier(
+            context.request.tools.functions, self._wire_contract
+        ).verify(actual_body)
+        if mismatch is not None:
+            raise DialectError(f"final Google request: {mismatch}")
+        _validate_final_request_constraints(actual_body, self._model_name)
         actual_contents = actual_body.get("contents")
         if not isinstance(actual_contents, list) or not all(
             isinstance(item, dict) for item in actual_contents
         ):
             raise DialectError("final Google request body has invalid contents")
+        actual_content_tuple = tuple(
+            cast(list[Mapping[str, JSONValue]], actual_contents)
+        )
+        _, _, _, pending_calls = _call_state_from_contents(
+            actual_content_tuple,
+            context.synthetic_call_ids,
+        )
+        _require_answered_function_calls(
+            pending_calls, "final Google conversation history"
+        )
         historical_function_call_ids, historical_server_call_ids = (
             _historical_output_call_ids(
-                tuple(cast(list[Mapping[str, JSONValue]], actual_contents))
+                actual_content_tuple,
+                context.synthetic_call_ids,
             )
         )
         raw_system = actual_body.get("systemInstruction")
@@ -2315,14 +3536,22 @@ class GoogleGenAIDialect:
             request=context.request,
             request_params=request_params,
             system_instruction=actual_system,
-            input_contents=tuple(cast(list[Mapping[str, JSONValue]], actual_contents)),
+            input_contents=actual_content_tuple,
+            synthetic_call_ids=context.synthetic_call_ids,
             historical_function_call_ids=historical_function_call_ids,
             historical_server_call_ids=historical_server_call_ids,
         )
+        if context.request.scheduling.stream:
+            response = await self._connection.client.send(request, stream=True)
+            try:
+                if not response.is_success:
+                    await response.aread()
+                response.raise_for_status()
+                return await self._lift_stream(response, execution_context)
+            finally:
+                await response.aclose()
         response = await self._connection.client.send(request)
         response.raise_for_status()
-        if context.request.scheduling.stream:
-            return await self._lift_stream(response, execution_context)
         payload = _strict_json_loads(response.text, "Google response body")
         return self._lift(payload, execution_context)
 
@@ -2398,6 +3627,7 @@ class _StructuredFormatVerifier:
 @dataclass(frozen=True)
 class _FunctionsVerifier:
     functions: tuple[Mapping[str, JSONValue], ...]
+    contract: GoogleWireContract
 
     def __post_init__(self) -> None:
         copied: list[Mapping[str, JSONValue]] = []
@@ -2423,11 +3653,56 @@ class _FunctionsVerifier:
             if "parameters" in source:
                 declaration["parametersJsonSchema"] = source["parameters"]
             declarations.append(declaration)
-        expected = {"functionDeclarations": declarations}
-        tools = _get(body, "tools")
+        # Inspect actual declarations; never run the lowering encoder on the
+        # source schema. In v1, decode only Schema nodes before comparison.
+        tools = body.get("tools", [])
+        if not isinstance(tools, Sequence) or isinstance(tools, str | bytes):
+            return "function tools changed"
+        actual: list[JSONValue] = []
+        saw_declarations = False
+        for tool in tools:
+            if not isinstance(tool, Mapping) or "functionDeclarations" not in tool:
+                continue
+            if (
+                saw_declarations
+                or not self.functions
+                or set(tool) != {"functionDeclarations"}
+            ):
+                return "function tools changed"
+            saw_declarations = True
+            raw_declarations = _get(tool, "functionDeclarations")
+            if not isinstance(raw_declarations, Sequence) or isinstance(
+                raw_declarations, str | bytes
+            ):
+                return "function tools changed"
+            for raw in raw_declarations:
+                if not isinstance(raw, Mapping):
+                    return "function tools changed"
+                try:
+                    declaration = dict(
+                        cast(Mapping[str, JSONValue], copy_json_value(raw, "function"))
+                    )
+                except (TypeError, ValueError):
+                    return "function tools changed"
+                selected = self.contract.function_schema_field
+                other = (
+                    "parametersJsonSchema" if selected == "parameters" else "parameters"
+                )
+                if other in declaration:
+                    return "function tools changed"
+                if selected in declaration and selected == "parameters":
+                    try:
+                        declaration["parametersJsonSchema"] = inspect_function_schema(
+                            declaration.pop("parameters")
+                        )
+                    except DialectError:
+                        return "function tools changed"
+                actual.append(declaration)
+        # JSON comparison distinguishes booleans from numeric constraints.
         return (
             None
-            if isinstance(tools, Sequence) and expected in tools
+            if json.dumps(actual, sort_keys=True)
+            == json.dumps(declarations, sort_keys=True)
             else "function tools changed"
         )
 
@@ -2461,10 +3736,17 @@ class _HostedToolsVerifier:
 @dataclass(frozen=True)
 class _ToolChoiceVerifier:
     choice: JSONValue
+    include_server_side_invocations: bool = False
 
     def verify(self, body: Mapping[str, JSONValue]) -> str | None:
         if isinstance(self.choice, str):
-            mode = {"auto": "AUTO", "none": "NONE", "required": "ANY"}.get(self.choice)
+            mode = {
+                "auto": (
+                    "VALIDATED" if self.include_server_side_invocations else "AUTO"
+                ),
+                "none": "NONE",
+                "required": "ANY",
+            }.get(self.choice)
             expected: JSONValue = {"functionCallingConfig": {"mode": mode}}
         elif isinstance(self.choice, dict):
             nested = self.choice.get("function")

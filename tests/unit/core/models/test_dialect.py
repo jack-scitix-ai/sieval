@@ -15,6 +15,7 @@ from sieval.core.models.dialect import (
     OutputContractError,
     OutputRule,
     PreparedRequest,
+    PreparedRequestEvidence,
     RequestAudit,
     RequestAuditError,
     WireObservation,
@@ -104,6 +105,20 @@ class _OperationVerifier:
         if prepared.operation != self.expected:
             return f"operation {prepared.operation!r} does not match {self.expected!r}"
         return None
+
+
+class _DualVerifier:
+    def __init__(self) -> None:
+        self.wire_calls = 0
+        self.prepared_calls = 0
+
+    def verify(self, body: Mapping[str, JSONValue]) -> str | None:
+        self.wire_calls += 1
+        return None if body.get("stream") is True else "wire stream changed"
+
+    def verify_prepared(self, prepared: PreparedRequest) -> str | None:
+        self.prepared_calls += 1
+        return None if prepared.operation == "stream" else "operation changed"
 
 
 class TestLeafDerivation:
@@ -328,7 +343,9 @@ class TestRequestAudit:
         audit = RequestAudit({"scheduling.stream": True})
         audit.consumed(
             "scheduling.stream",
-            _OperationVerifier("models/model:streamGenerateContent"),
+            PreparedRequestEvidence(
+                _OperationVerifier("models/model:streamGenerateContent")
+            ),
         )
 
         audit.finish(
@@ -338,6 +355,44 @@ class TestRequestAudit:
         with pytest.raises(RequestAuditError, match="operation.*does not match"):
             audit.finish(
                 PreparedRequest("models/model:generateContent", {"contents": []})
+            )
+
+    def test_prepared_evidence_is_explicit_and_does_not_shadow_wire_verification(
+        self,
+    ) -> None:
+        verifier = _DualVerifier()
+        audit = RequestAudit({"scheduling.stream": True})
+        audit.consumed("scheduling.stream", verifier)
+
+        audit.finish(PreparedRequest("wrong-operation", {"stream": True}))
+
+        assert verifier.wire_calls == 1
+        assert verifier.prepared_calls == 0
+
+    def test_same_verifier_can_prove_body_and_prepared_request_independently(
+        self,
+    ) -> None:
+        verifier = _DualVerifier()
+        audit = RequestAudit({"wire": True, "operation": True})
+        audit.consumed("wire", verifier)
+        audit.consumed("operation", PreparedRequestEvidence(verifier))
+
+        audit.finish(PreparedRequest("stream", {"stream": True}))
+
+        assert verifier.wire_calls == 1
+        assert verifier.prepared_calls == 1
+
+    def test_noncallable_evidence_is_rejected_when_admitted(self) -> None:
+        audit = RequestAudit({"scheduling.stream": True})
+
+        with pytest.raises(TypeError, match=r"callable verify\(\)"):
+            audit.consumed(
+                "scheduling.stream",
+                cast(Any, type("Sneaky", (), {"verify": True})()),
+            )
+        with pytest.raises(TypeError, match=r"callable verify_prepared\(\)"):
+            PreparedRequestEvidence(
+                cast(Any, type("SneakyPrepared", (), {"verify_prepared": True})())
             )
 
     def test_passthrough_destination_and_value_are_verified(self):
@@ -721,6 +776,30 @@ class TestOutputContract:
             req,
             Response(("",), finish_reasons=("refusal",)),
         )
+
+    def test_dialect_can_preserve_provider_refusal_spelling(self):
+        rules = _all_rules(Guarantee.BEST_EFFORT)
+        rules["reasoning"] = OutputRule(Guarantee.PRESENT_OR_ERROR)
+        contract = OutputContract(
+            rules,
+            empty_outcome_finish_reasons=frozenset({"SAFETY"}),
+        )
+
+        contract.validate(
+            _Plan(),
+            Request(
+                input=CompletionInput("x"),
+                reasoning=ReasoningParams(summary="auto"),
+            ),
+            Response(("",), finish_reasons=("SAFETY",)),
+        )
+
+    @pytest.mark.parametrize("reasons", [frozenset(), frozenset({""})])
+    def test_empty_outcome_finish_reasons_must_be_nonempty_strings(
+        self, reasons: frozenset[str]
+    ) -> None:
+        with pytest.raises(ValueError, match="empty-outcome finish reasons"):
+            OutputContract(_all_rules(), empty_outcome_finish_reasons=reasons)
 
     def test_mixed_refusal_choices_still_require_success_channels(self):
         rules = _all_rules(Guarantee.BEST_EFFORT)

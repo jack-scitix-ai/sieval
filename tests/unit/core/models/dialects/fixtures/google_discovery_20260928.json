@@ -1,0 +1,321 @@
+{
+  "_description": "Reduced official Discovery revision 20260928: full Schema property signatures, function-parameter descriptors, and complete property names at version-sensitive request locations. Fetched once for offline tests, never at runtime.",
+  "function_parameter_fields": {
+    "v1": {
+      "parameters": {
+        "$ref": "Schema",
+        "description": "Optional. Describes the parameters to this function. Reflects the Open API 3.03 Parameter Object string Key: the name of the parameter. Parameter names are case sensitive. Schema Value: the Schema defining the type used for the parameter."
+      }
+    },
+    "v1beta": {
+      "parameters": {
+        "$ref": "Schema",
+        "description": "Optional. Describes the parameters to this function. Reflects the Open API 3.03 Parameter Object string Key: the name of the parameter. Parameter names are case sensitive. Schema Value: the Schema defining the type used for the parameter."
+      },
+      "parametersJsonSchema": {
+        "description": "Optional. Describes the parameters to the function in JSON Schema format. The schema must describe an object where the properties are the parameters to the function. For example: ``` { \"type\": \"object\", \"properties\": { \"name\": { \"type\": \"string\" }, \"age\": { \"type\": \"integer\" } }, \"additionalProperties\": false, \"required\": [\"name\", \"age\"], \"propertyOrdering\": [\"name\", \"age\"] } ``` This field is mutually exclusive with `parameters`.",
+        "type": "any"
+      }
+    }
+  },
+  "revision": "20260928",
+  "schema_properties": {
+    "anyOf": {
+      "items": {
+        "$ref": "Schema"
+      },
+      "type": "array"
+    },
+    "default": {
+      "description": "Optional. Default value of the field. Per JSON Schema, this field is intended for documentation generators and doesn't affect validation. Thus it's included here and ignored so that developers who send schemas with a `default` field don't get unknown-field errors.",
+      "type": "any"
+    },
+    "description": {
+      "type": "string"
+    },
+    "enum": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "example": {
+      "description": "Optional. Example of the object. Will only populated when the object is the root.",
+      "type": "any"
+    },
+    "format": {
+      "type": "string"
+    },
+    "items": {
+      "$ref": "Schema"
+    },
+    "maxItems": {
+      "format": "int64",
+      "type": "string"
+    },
+    "maxLength": {
+      "format": "int64",
+      "type": "string"
+    },
+    "maxProperties": {
+      "format": "int64",
+      "type": "string"
+    },
+    "maximum": {
+      "format": "double",
+      "type": "number"
+    },
+    "minItems": {
+      "format": "int64",
+      "type": "string"
+    },
+    "minLength": {
+      "format": "int64",
+      "type": "string"
+    },
+    "minProperties": {
+      "format": "int64",
+      "type": "string"
+    },
+    "minimum": {
+      "format": "double",
+      "type": "number"
+    },
+    "nullable": {
+      "type": "boolean"
+    },
+    "pattern": {
+      "type": "string"
+    },
+    "properties": {
+      "additionalProperties": {
+        "$ref": "Schema"
+      },
+      "type": "object"
+    },
+    "propertyOrdering": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "required": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "title": {
+      "type": "string"
+    },
+    "type": {
+      "enum": [
+        "TYPE_UNSPECIFIED",
+        "STRING",
+        "NUMBER",
+        "INTEGER",
+        "BOOLEAN",
+        "ARRAY",
+        "OBJECT",
+        "NULL"
+      ],
+      "enumDescriptions": [
+        "Not specified, should not be used.",
+        "String type.",
+        "Number type.",
+        "Integer type.",
+        "Boolean type.",
+        "Array type.",
+        "Object type.",
+        "Null type."
+      ],
+      "type": "string"
+    }
+  },
+  "sources": {
+    "v1": "https://generativelanguage.googleapis.com/$discovery/rest?version=v1",
+    "v1beta": "https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta"
+  },
+  "versioned_fields": {
+    "v1": {
+      "Blob": [
+        "data",
+        "mimeType"
+      ],
+      "FileData": [
+        "fileUri",
+        "mimeType"
+      ],
+      "FunctionDeclaration": [
+        "description",
+        "name",
+        "parameters",
+        "response"
+      ],
+      "FunctionResponse": [
+        "id",
+        "name",
+        "response"
+      ],
+      "GenerateContentRequest": [
+        "contents",
+        "generationConfig",
+        "model",
+        "safetySettings",
+        "serviceTier",
+        "store",
+        "systemInstruction",
+        "toolConfig",
+        "tools"
+      ],
+      "GenerationConfig": [
+        "_responseJsonSchema",
+        "candidateCount",
+        "enableEnhancedCivicAnswers",
+        "frequencyPenalty",
+        "imageConfig",
+        "logprobs",
+        "maxOutputTokens",
+        "mediaResolution",
+        "presencePenalty",
+        "responseFormat",
+        "responseJsonSchema",
+        "responseLogprobs",
+        "responseMimeType",
+        "responseModalities",
+        "responseSchema",
+        "seed",
+        "stopSequences",
+        "temperature",
+        "thinkingConfig",
+        "topK",
+        "topP"
+      ],
+      "Part": [
+        "codeExecutionResult",
+        "executableCode",
+        "fileData",
+        "functionCall",
+        "functionResponse",
+        "inlineData",
+        "mediaProcessing",
+        "mediaResolution",
+        "partMetadata",
+        "text",
+        "thought",
+        "thoughtSignature",
+        "toolCall",
+        "toolResponse",
+        "videoMetadata"
+      ],
+      "Tool": [
+        "codeExecution",
+        "fileSearch",
+        "functionDeclarations",
+        "googleMaps",
+        "googleSearch",
+        "googleSearchRetrieval",
+        "urlContext"
+      ]
+    },
+    "v1beta": {
+      "Blob": [
+        "data",
+        "displayName",
+        "mimeType"
+      ],
+      "FileData": [
+        "displayName",
+        "fileUri",
+        "mimeType"
+      ],
+      "FunctionDeclaration": [
+        "behavior",
+        "description",
+        "name",
+        "parameters",
+        "parametersJsonSchema",
+        "response",
+        "responseJsonSchema"
+      ],
+      "FunctionResponse": [
+        "id",
+        "name",
+        "parts",
+        "response",
+        "scheduling",
+        "willContinue"
+      ],
+      "GenerateContentRequest": [
+        "cachedContent",
+        "contents",
+        "generationConfig",
+        "labels",
+        "model",
+        "safetySettings",
+        "serviceTier",
+        "store",
+        "systemInstruction",
+        "toolConfig",
+        "tools"
+      ],
+      "GenerationConfig": [
+        "_responseJsonSchema",
+        "audioTranscriptionConfig",
+        "candidateCount",
+        "enableAffectiveDialog",
+        "enableEnhancedCivicAnswers",
+        "frequencyPenalty",
+        "imageConfig",
+        "logprobs",
+        "maxOutputTokens",
+        "mediaResolution",
+        "presencePenalty",
+        "responseFormat",
+        "responseJsonSchema",
+        "responseLogprobs",
+        "responseMimeType",
+        "responseModalities",
+        "responseSchema",
+        "seed",
+        "speechConfig",
+        "stopSequences",
+        "temperature",
+        "thinkingConfig",
+        "topK",
+        "topP",
+        "translationConfig"
+      ],
+      "Part": [
+        "audioTranscription",
+        "codeExecutionResult",
+        "executableCode",
+        "fileData",
+        "functionCall",
+        "functionResponse",
+        "inlineData",
+        "mediaProcessing",
+        "mediaResolution",
+        "partMetadata",
+        "speechMetadata",
+        "text",
+        "thought",
+        "thoughtSignature",
+        "toolCall",
+        "toolResponse",
+        "videoMetadata"
+      ],
+      "Tool": [
+        "codeExecution",
+        "computerUse",
+        "fileSearch",
+        "functionDeclarations",
+        "googleMaps",
+        "googleSearch",
+        "googleSearchRetrieval",
+        "mcpServers",
+        "urlContext"
+      ]
+    }
+  }
+}

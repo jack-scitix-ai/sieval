@@ -1732,7 +1732,10 @@ class TestRunDryRun:
             "anthropic_messages"
         )
 
-    def test_active_google_dialect_reconciles_to_its_runtime_plan(self, tmp_path):
+    @pytest.mark.parametrize("version_path", ["", "/v1", "/v1beta"])
+    def test_active_google_dialect_reconciles_to_its_runtime_plan(
+        self, tmp_path, version_path
+    ):
         """Static validation and dry-run carry Google through reconciliation."""
         from sieval.cli.validation import run_dry_run
 
@@ -1743,7 +1746,7 @@ class TestRunDryRun:
             "    name: gemini-2.5-flash\n"
             "    type: chat\n"
             "    dialect: google_genai\n"
-            "    api_base: https://generativelanguage.googleapis.com\n"
+            f"    api_base: https://generativelanguage.googleapis.com{version_path}\n"
             "    api_key: test-key\n"
             "datasets:\n"
             "  d:\n"
@@ -1770,6 +1773,50 @@ class TestRunDryRun:
         binding_plans = checks["capability_reconcile"]["plan"]["binding_plans"]
         assert len(binding_plans) == 1
         assert next(iter(binding_plans.values()))["dialect_id"] == "google_genai"
+
+    def test_google_capability_is_static_valid_but_requires_profile_evidence(
+        self, tmp_path
+    ):
+        """Deep dry-run owns model-specific Google capability admission."""
+        from sieval.cli.validation import run_dry_run
+
+        config = tmp_path / "google-genai-capability.yaml"
+        config.write_text(
+            "models:\n"
+            "  m:\n"
+            "    name: gemini-2.5-flash\n"
+            "    type: chat\n"
+            "    dialect: google_genai\n"
+            "    api_base: https://generativelanguage.googleapis.com\n"
+            "    capabilities:\n"
+            "      reasoning:\n"
+            "        summary: auto\n"
+            "datasets:\n"
+            "  d:\n"
+            "    class: sieval.datasets.aime_2024.AIME2024Dataset\n"
+            "tasks:\n"
+            "  t:\n"
+            "    class: sieval.tasks.aime_2024_0shot_gen.AIME2024ZeroShotGenTask\n"
+            "    dataset: d\n"
+            "    model: m\n",
+            encoding="utf-8",
+        )
+
+        direct = validate_eval_config(
+            yaml.safe_load(config.read_text(encoding="utf-8"))
+        )
+        dry_run = run_dry_run(config)
+        checks = {check["name"]: check for check in dry_run["checks"]}
+
+        assert direct.ok, direct.errors
+        assert checks["schema"]["ok"] is True
+        assert checks["capability_reconcile"]["ok"] is False
+        assert "model_outcome_missing" in checks["capability_reconcile"]["detail"]
+        assert (
+            "model profile provides no support outcome"
+            in checks["capability_reconcile"]["detail"]
+        )
+        assert dry_run["n_errors"] == 1
 
     def test_schema_validation_failure(self, tmp_path):
         """Config with bad schema returns schema check failure."""
