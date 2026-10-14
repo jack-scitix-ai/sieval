@@ -139,6 +139,7 @@ _STANDARD_USER_PART_FIELDS = frozenset({"text", "inlineData", "fileData"})
 _CHANNEL_OPTIONAL_FINISH_REASONS = frozenset(
     {
         "MAX_TOKENS",
+        "CONTINUATION",
         "SAFETY",
         "RECITATION",
         "LANGUAGE",
@@ -310,7 +311,9 @@ def _validate_top_logprobs_config(options: object) -> None:
 def _validate_reasoning_config(options: object) -> None:
     assert isinstance(options, ReasoningOptions)
     if options.summary not in {None, "none", "auto"}:
-        raise ValueError("google_genai supports only reasoning summary 'auto'")
+        raise ValueError(
+            "google_genai supports only reasoning summary 'none' or 'auto'"
+        )
     if options.effort is not None and options.effort.lower() not in _THINKING_LEVELS:
         raise ValueError(f"unsupported Google thinking level {options.effort!r}")
 
@@ -1905,6 +1908,8 @@ def _verification_input_to_wire(
                         f"unsupported Google image media type {part.media_type!r}"
                     )
                 if part.url is not None:
+                    if not part.url:
+                        raise DialectError("Google image URLs must not be empty")
                     file_data: dict[str, JSONValue] = {"fileUri": part.url}
                     if part.media_type is not None:
                         file_data["mimeType"] = part.media_type
@@ -2538,7 +2543,7 @@ class GoogleGenAIDialect:
                 "none",
                 "auto",
             }:
-                audit.rejected(path, "Google supports only summary='auto'")
+                audit.rejected(path, "Google supports only summary='none' or 'auto'")
             elif (
                 path == "reasoning.budget_tokens"
                 and cast(int, req.reasoning.budget_tokens) > _INT32_MAX
@@ -2755,7 +2760,12 @@ class GoogleGenAIDialect:
             )
         if req.tools.hosted:
             tools.extend(_hosted_tool(tool) for tool in req.tools.hosted)
-            consume("tools.hosted", _HostedToolsVerifier(req.tools.hosted))
+            consume(
+                "tools.hosted",
+                _HostedToolsVerifier(
+                    req.tools.hosted, has_functions=bool(req.tools.functions)
+                ),
+            )
         if tools:
             body["tools"] = tools
         if req.tools.choice is not None:
@@ -3710,6 +3720,7 @@ class _FunctionsVerifier:
 @dataclass(frozen=True)
 class _HostedToolsVerifier:
     hosted: tuple[object, ...]
+    has_functions: bool = False
 
     def verify(self, body: Mapping[str, JSONValue]) -> str | None:
         tools = _get(body, "tools")
@@ -3721,9 +3732,28 @@ class _HostedToolsVerifier:
                 return "hosted tool config is invalid"
             key = "googleSearch" if kind == "google_search" else "urlContext"
             expected.append({key: dict(config)})
-        if not isinstance(tools, Sequence) or not all(
-            item in tools for item in expected
-        ):
+        if not isinstance(tools, Sequence) or isinstance(tools, str | bytes):
+            return "hosted tools changed"
+        if self.has_functions:
+            if (
+                not tools
+                or not isinstance(tools[0], Mapping)
+                or set(tools[0]) != {"functionDeclarations"}
+            ):
+                return "hosted tools changed"
+            actual = tools[1:]
+        else:
+            actual = tools
+        try:
+            matches = json.dumps(
+                copy_json_value(actual, "verified Google hosted tools"), sort_keys=True
+            ) == json.dumps(
+                copy_json_value(expected, "requested Google hosted tools"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            matches = False
+        if not matches:
             return "hosted tools changed"
         if (
             _get(_get(body, "toolConfig"), "includeServerSideToolInvocations")

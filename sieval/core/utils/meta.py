@@ -16,7 +16,7 @@ from sieval.core.tasks.context import TaskStageMeta
 #: set holding only ``length`` (OpenAI-compatible Chat/Completions and SGLang
 #: native) would read zero against ``max_output_tokens`` (OpenAI Responses),
 #: ``max_tokens`` or ``model_context_window_exceeded`` (Anthropic), or
-#: ``MAX_TOKENS`` (Google generateContent).
+#: ``MAX_TOKENS`` or ``CONTINUATION`` (Google generateContent).
 #: ``content_filter`` is in because the output is cut short the same way;
 #: separating causes is what the raw ``finish_reasons`` are for. Shared with
 #: :func:`sieval.core.tasks.anomaly.detect_truncated_output` so the rule and the
@@ -28,6 +28,7 @@ TRUNCATION_FINISH_REASONS = frozenset(
         "max_tokens",
         "model_context_window_exceeded",
         "MAX_TOKENS",
+        "CONTINUATION",
         "content_filter",
     }
 )

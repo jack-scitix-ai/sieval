@@ -179,7 +179,11 @@ class TestCapabilities:
         ("key", "options", "message"),
         [
             ("top_logprobs", TopLogprobsOptions(21), "20"),
-            ("reasoning", ReasoningOptions(summary="detailed"), "summary"),
+            (
+                "reasoning",
+                ReasoningOptions(summary="detailed"),
+                "reasoning summary 'none' or 'auto'",
+            ),
             ("reasoning", ReasoningOptions(effort="xhigh"), "thinking level"),
             (
                 "hosted_tools",
@@ -194,6 +198,11 @@ class TestCapabilities:
         decision = cast(Supported, CAPABILITY_DECISIONS[cast(Any, key)])
         with pytest.raises(ValueError, match=message):
             decision.binding.validate_config(cast(Any, options))
+
+    @pytest.mark.parametrize("summary", ["none", "auto"])
+    def test_reasoning_config_accepts_both_summary_modes(self, summary: str) -> None:
+        decision = cast(Supported, CAPABILITY_DECISIONS["reasoning"])
+        decision.binding.validate_config(ReasoningOptions(summary=summary))
 
 
 class TestRequestLowering:
@@ -2705,6 +2714,26 @@ class TestResponseLifting:
         assert result.structured_output is None
 
     @pytest.mark.anyio
+    async def test_continuation_is_a_scoreable_truncated_empty_outcome(self) -> None:
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                json=_response(parts=[], finish_reason="CONTINUATION"),
+            ),
+            _request(
+                reasoning=ReasoningParams(summary="auto"),
+                scoring=ScoringParams(sampled_logprobs=True),
+                structured_output=StructuredOutputParams(format="json_object"),
+            ),
+        )
+
+        assert result.texts == ("",)
+        assert result.finish_reasons == ("CONTINUATION",)
+        assert result.reasoning == (None,)
+        assert result.logprobs is None
+        assert result.structured_output is None
+
+    @pytest.mark.anyio
     @pytest.mark.parametrize("finish_reason", ["OTHER", "MALFORMED_FUNCTION_CALL"])
     async def test_non_normal_finish_reason_preserves_returned_text(
         self, finish_reason: str
@@ -4995,7 +5024,7 @@ class TestAdditionalRequestContracts:
             ),
             (
                 _request(reasoning=ReasoningParams(summary="detailed")),
-                "supports only summary",
+                "supports only summary='none' or 'auto'",
             ),
             (
                 _request(
@@ -5593,6 +5622,97 @@ class TestAdditionalStreamingContracts:
 
 
 class TestPreparedRequestAndVerifierContracts:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("extra_tool", "with_functions"),
+        [
+            ({"urlContext": {}}, False),
+            ({"googleSearch": {}}, False),
+            ({"urlContext": {}}, True),
+        ],
+    )
+    async def test_request_audit_rejects_extra_hosted_tools(
+        self, extra_tool: dict[str, object], with_functions: bool
+    ) -> None:
+        connection = _connection(_no_io)
+        try:
+            dialect = GoogleGenAIDialect(connection, "gemini-3.8-flash")
+            req = _request(
+                tools=ToolParams(
+                    functions=({"name": "lookup", "description": "Lookup"},)
+                    if with_functions
+                    else (),
+                    hosted=(HostedToolSpec("google_search"),),
+                )
+            )
+            audit = RequestAudit(active_request_leaves(req))
+            dialect.validate_request(req, audit, cast(Any, SimpleNamespace()))
+            prepared = dialect.prepare(req, audit)
+            audit.finish(prepared)
+            body = prepared.thaw_body()
+            cast(list[Any], body["tools"]).append(extra_tool)
+
+            with pytest.raises(RequestAuditError, match="hosted tools changed"):
+                audit.finish(
+                    PreparedRequest(prepared.operation, body, prepared.context)
+                )
+        finally:
+            await connection.aclose()
+
+    @pytest.mark.parametrize(
+        ("tools", "has_functions", "expected_mismatch"),
+        [
+            ([{"googleSearch": {}}], False, None),
+            ([{"googleSearch": {}}, {"urlContext": {}}], False, "hosted tools changed"),
+            (
+                [{"googleSearch": {}}, {"googleSearch": {}}],
+                False,
+                "hosted tools changed",
+            ),
+            (
+                [
+                    {"functionDeclarations": [{"name": "unexpected"}]},
+                    {"googleSearch": {}},
+                ],
+                False,
+                "hosted tools changed",
+            ),
+            (
+                [{"functionDeclarations": [{"name": "lookup"}]}, {"googleSearch": {}}],
+                True,
+                None,
+            ),
+            (
+                [
+                    {"functionDeclarations": [{"name": "lookup"}]},
+                    {"googleSearch": {}},
+                    {"urlContext": {}},
+                ],
+                True,
+                "hosted tools changed",
+            ),
+        ],
+    )
+    def test_hosted_tools_verifier_requires_exact_tools(
+        self,
+        tools: list[dict[str, object]],
+        has_functions: bool,
+        expected_mismatch: str | None,
+    ) -> None:
+        verifier = google_genai._HostedToolsVerifier(
+            (HostedToolSpec("google_search"),), has_functions=has_functions
+        )
+        body = {
+            "tools": tools,
+            "toolConfig": {"includeServerSideToolInvocations": True},
+        }
+        assert verifier.verify(cast(Any, body)) == expected_mismatch
+
+    def test_verification_input_rejects_empty_image_url(self) -> None:
+        request_input = _chat(ChatMessage("user", (ImagePart(url=""),)))
+        with pytest.raises(DialectError, match="URLs must not be empty"):
+            google_genai._verification_input_to_wire(request_input, None)
+
     def test_all_wire_verifiers_reject_mutated_output(self) -> None:
         assert (
             google_genai._InputVerifier(None, ()).verify(
