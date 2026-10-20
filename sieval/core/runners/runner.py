@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import anyio
+import anyio.to_thread
 import orjson
 from anyio.abc import TaskGroup
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -56,6 +57,7 @@ from sieval.core.tasks.run_meta import (
     judge_identities,
     prompt_of,
     request_digest,
+    validate_judge_model_ref,
 )
 from sieval.core.tasks.saver import TaskSaver
 from sieval.core.tasks.task import Task
@@ -336,6 +338,9 @@ class TaskRunner:
         model is not served by SiEval. *resume_config_diff* is the
         resume-mutable config change a resume made, for ``runs[].config``.
         """
+        # A malformed judge reference would leave every grader identity
+        # unknown; refuse it before any work.
+        validate_judge_model_ref()
         self._task = task
         self._config = config or TaskRunnerConfig()
         self._inference_recipe = inference_recipe
@@ -493,6 +498,16 @@ class TaskRunner:
         # If report.json exists and is valid, we consider the task completed.
         if self._auto_resume:
             cached_report = await self._loader.load_cached_report()
+            if cached_report is not None and not await self._last_run_ended():
+                # The run that wrote this report never ended (`end_run`
+                # failed, or a later run stopped short): finalize again
+                # through the full path, which reruns `report()` on the
+                # shards instead of trusting the cached one.
+                logger.info(
+                    "report.json found, but the run that wrote it never ended; "
+                    "finalizing again"
+                )
+                cached_report = None
             if cached_report is not None:
                 # Check if we need to retry failures
                 has_failures, all_final = await self._loader.get_manifest_status()
@@ -547,7 +562,9 @@ class TaskRunner:
             await self._task.setup()
 
             if self._resumed_from_existing:
-                self._seed_judge_versions(_read_run_meta(self._root_dir))
+                self._seed_judge_versions(
+                    await anyio.to_thread.run_sync(_read_run_meta, self._root_dir)
+                )
             # Record the run before any work, so an interrupted run is resumed
             # and the resume gates have a meta.json to read. Inference and
             # grader identities are known now; data and prompt once every
@@ -699,8 +716,10 @@ class TaskRunner:
                 finals, fails = self._final_and_failed()
                 report = await self._task.report(finals, fails)
                 # Always save report on completion
-                await self._save_report_with_diagnostics(report, finals, fails)
-                await self._end_run()
+                reported = await self._save_report_with_diagnostics(
+                    report, finals, fails
+                )
+                await self._end_run(reported=reported)
                 return report
 
             # 6. Setup Progress Tracker
@@ -729,39 +748,24 @@ class TaskRunner:
             storage_send, storage_recv = anyio.create_memory_object_stream(
                 self._stream_buffer_capacity
             )
+            # Outlives the storage worker's own receiver, so what was sent to
+            # storage but never received can still be written.
+            storage_leftover = storage_recv.clone()
 
-            async with anyio.create_task_group() as tg:
-                # Setup Concurrency: Always create local limiters
-                # This ensures task-specific limits are always respected
-                self._local_limiter, self._local_stage_limiters = prepare_limiters(
-                    self._local_limit, self._local_stage_limits_cfg
+            try:
+                await self._run_streams(
+                    compute_send, compute_recv, storage_recv, storage_send, pending_ids
                 )
-
-                # Start Storage Worker
-                tg.start_soon(self._saver.consume_stream, storage_recv)
-
-                # Start Compute Dispatcher
-                tg.start_soon(
-                    self._compute_dispatcher,
-                    compute_recv,
-                    compute_send,
-                    storage_send,
-                    tg,
-                )
-
-                # Seed resumed non-terminal contexts (backfill raw_sample if needed)
-                for ctx in self._contexts.values():
-                    if not ctx.is_terminal():
-                        if ctx.raw_sample is None:
-                            ctx = self._ensure_raw_sample(ctx)
-                            self._contexts[ctx.sample_id] = ctx
-                        await compute_send.send(ctx)
-
-                # Seed new pending samples — create context on demand
-                for sid in pending_ids:
-                    ctx = self._task.make_context(sid)
-                    self._contexts[sid] = ctx
-                    await compute_send.send(ctx)
+            finally:
+                # A stage that raised (a failed `meta.json` write) cancels the
+                # storage worker before its final flush; samples already done,
+                # whether buffered by it or still in the stream, reach disk. A
+                # no-op after a clean exit.
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await self._saver.drain(storage_leftover)
+                    except Exception as exc:
+                        logger.error("Flush after the run stopped failed: {}", exc)
 
             # 8. Finalize
             self._profiler.aggregate_stage_timings(self._contexts)
@@ -773,8 +777,11 @@ class TaskRunner:
             report = await self._task.report(finals, fails)
             # Always save report on completion
             refusal: UnreadableIntervalError | None = None
+            reported = False
             try:
-                await self._save_report_with_diagnostics(report, finals, fails)
+                reported = await self._save_report_with_diagnostics(
+                    report, finals, fails
+                )
             except UnreadableIntervalError as exc:
                 # HELD, not swallowed. `report.json` is already on disk and the run
                 # itself finished, so the remaining artifacts are written before
@@ -784,7 +791,7 @@ class TaskRunner:
                 # type is deferred, so every other failure still aborts here.
                 refusal = exc
             if refusal is None:
-                await self._end_run()
+                await self._end_run(reported=reported)
             # Generate anomaly report
             if self._config.detect_anomalies:
                 await self._anomaly_detector.generate_and_save_from_results(
@@ -830,6 +837,49 @@ class TaskRunner:
         finally:
             # X. Lifecycle Shutdown
             await self._task.shutdown()
+
+    async def _run_streams(
+        self,
+        compute_send: MemoryObjectSendStream[TaskContext],
+        compute_recv: MemoryObjectReceiveStream[TaskContext],
+        storage_recv: MemoryObjectReceiveStream[TaskContext],
+        storage_send: MemoryObjectSendStream[TaskContext],
+        pending_ids: list[int],
+    ) -> None:
+        """Run the compute dispatcher and the storage worker until every sample
+        is terminal, seeding resumed and new samples."""
+        async with anyio.create_task_group() as tg:
+            # Setup Concurrency: Always create local limiters
+            # This ensures task-specific limits are always respected
+            self._local_limiter, self._local_stage_limiters = prepare_limiters(
+                self._local_limit, self._local_stage_limits_cfg
+            )
+
+            # Start Storage Worker
+            tg.start_soon(self._saver.consume_stream, storage_recv)
+
+            # Start Compute Dispatcher
+            tg.start_soon(
+                self._compute_dispatcher,
+                compute_recv,
+                compute_send,
+                storage_send,
+                tg,
+            )
+
+            # Seed resumed non-terminal contexts (backfill raw_sample if needed)
+            for ctx in self._contexts.values():
+                if not ctx.is_terminal():
+                    if ctx.raw_sample is None:
+                        ctx = self._ensure_raw_sample(ctx)
+                        self._contexts[ctx.sample_id] = ctx
+                    await compute_send.send(ctx)
+
+            # Seed new pending samples — create context on demand
+            for sid in pending_ids:
+                ctx = self._task.make_context(sid)
+                self._contexts[sid] = ctx
+                await compute_send.send(ctx)
 
     async def _compute_dispatcher(
         self,
@@ -1139,7 +1189,7 @@ class TaskRunner:
         report: JSONValue,
         finals: list[TaskContext],
         fails: list[TaskContext],
-    ) -> None:
+    ) -> bool:
         """Inject the run-level diagnostics into a dict report, then save.
 
         All aggregate over the in-memory terminal contexts' ``stage_meta`` at zero
@@ -1182,7 +1232,8 @@ class TaskRunner:
         is left, and re-raises it unchanged. The early-return path has nothing
         after it and lets it propagate straight out.
 
-        Non-dict reports are saved unchanged; ``None`` skips the save.
+        Non-dict reports are saved unchanged; ``None`` skips the save. Returns
+        whether ``report.json`` was written.
 
         Raises:
             UnreadableIntervalError: if the saved report publishes a ``*_ci95``
@@ -1192,7 +1243,7 @@ class TaskRunner:
                 one interval while publishing two different numbers.
         """
         if report is None:
-            return
+            return False
         if isinstance(report, dict):
             as_dict = cast(dict[str, JSONValue], report)
             as_dict["sieval_versions"] = report_versions(
@@ -1221,10 +1272,24 @@ class TaskRunner:
                     "interval-bearing fragments with `merge_metrics`, not `|` -- a "
                     "plain merge replaces the whole declaration."
                 )
+        return True
 
     # ------------------------------------------------------------------
     # meta.json: stage identities and run history
     # ------------------------------------------------------------------
+
+    async def _last_run_ended(self) -> bool:
+        """Whether the latest ``runs[]`` entry ended with a ``reran`` list.
+
+        A directory from before ``runs[]`` has no entry, and its ``report.json``
+        is trusted as before.
+        """
+        meta = await anyio.to_thread.run_sync(_read_run_meta, self._root_dir)
+        runs = (meta or {}).get("runs")
+        if not isinstance(runs, list) or not runs:
+            return True
+        last = runs[-1]
+        return isinstance(last, dict) and "reran" in last
 
     def _model_name(self) -> str:
         return self._task.model.meta()["model"]
@@ -1409,8 +1474,11 @@ class TaskRunner:
             return ctx.error_action not in (TaskAction.PREPROCESS, TaskAction.INFER)
         return ctx.stage not in (TaskStage.INITIAL, TaskStage.PREPROCESSED)
 
-    async def _end_run(self) -> None:
-        """Finish this run's ``runs[]`` entry once its ``report.json`` is saved.
+    async def _end_run(self, *, reported: bool) -> None:
+        """Finish this run's ``runs[]`` entry once its report is settled.
+
+        *reported* says ``report.json`` was written; ``report()`` returning
+        ``None`` writes none.
 
         Writes the data and prompt identities if a sample never reached
         preprocess, folds what the candidate was sent into the inference
@@ -1436,7 +1504,7 @@ class TaskRunner:
         # `report()` has no identity: only the stages that grade count.
         if ran & {TaskAction.POSTPROCESS, TaskAction.FEEDBACK}:
             reran.add("grader")
-        await self._saver.end_run(reran, reported=True)
+        await self._saver.end_run(reran, reported=reported)
 
     def _resolve_result_dir(
         self, result_dir: str | None, task: Task, auto_resume: bool

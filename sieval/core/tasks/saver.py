@@ -1,12 +1,15 @@
 """Buffered async shard writer with atomic manifest, report and meta persistence."""
 
 import contextlib
+import os
+import tempfile
 import time
 from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import anyio
+import anyio.to_thread
 import orjson
 import xxhash
 from anyio.streams.memory import MemoryObjectReceiveStream
@@ -36,17 +39,27 @@ class _Unset:
 _UNSET = _Unset()
 
 
-async def _atomic_write(path: Path, data: bytes) -> None:
-    """Write *data* to a sibling temporary file, then replace *path* with it."""
-    tmp_path = path.with_suffix(".tmp")
+def _atomic_write_sync(path: Path, data: bytes) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        async with await anyio.open_file(tmp_path, "wb") as f:
-            await f.write(data)
-        await anyio.Path(tmp_path).replace(path)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
-            await anyio.Path(tmp_path).unlink(missing_ok=True)
+            os.unlink(tmp)
         raise
+
+
+async def _atomic_write(path: Path, data: bytes) -> None:
+    """Write *data* to a unique temporary file beside *path*, fsync, then replace.
+
+    The temporary name is unique per call, so two writers never share one, and
+    the data is on disk before the rename makes it visible.
+    """
+    await anyio.to_thread.run_sync(_atomic_write_sync, path, data)
 
 
 class TaskSaver:
@@ -124,12 +137,31 @@ class TaskSaver:
         # Final flush on stream close
         await self.flush()
 
+    async def drain(self, stream: MemoryObjectReceiveStream[TaskContext]) -> None:
+        """Take every context *stream* still holds, flush, and close it.
+
+        For a run that stopped before :meth:`consume_stream` reached the end of
+        its stream: *stream* is a clone of that receiver, so the contexts sent
+        but never received are still in it.
+        """
+        with stream:
+            while True:
+                try:
+                    ctx = stream.receive_nowait()
+                except (anyio.WouldBlock, anyio.EndOfStream):
+                    break
+                self._update_manifest_entry(ctx)
+                self._stage_queue.append(ctx)
+        await self.flush()
+
     async def flush(self) -> None:
         """Flush the current buffer to disk.
 
         Buffered contexts are grouped by ``(iteration, stage, shard_id)`` and
         each group is written in parallel.  After all shard writes complete
-        the manifest is atomically updated.
+        the manifest is atomically updated. A flush that fails or is cancelled
+        puts its batch back in the queue for the next one; a shard group it had
+        already written is appended again, and the loader keeps the later line.
         """
         if not self._stage_queue:
             return
@@ -137,24 +169,31 @@ class TaskSaver:
         async with TaskProfilerContext(self._profiler, "flush"):
             batch = self._stage_queue
             self._stage_queue = []
-
-            groups = {}
-            for c in batch:
-                shard_id = self._shard_id_for(c.sample_id)
-                groups.setdefault((c.iteration, c.stage, shard_id), []).append(c)
-
-            limiter = anyio.CapacityLimiter(self._shard_write_concurrency)
-
-            async def _write_group(iteration, stage, shard_id, ctxs):
-                async with limiter:
-                    await self._write_shard(iteration, stage, shard_id, ctxs)
-
-            async with anyio.create_task_group() as tg:
-                for (iteration, stage, shard_id), ctxs in groups.items():
-                    tg.start_soon(_write_group, iteration, stage, shard_id, ctxs)
-
-            await self._write_manifest()
+            try:
+                await self._write_batch(batch)
+            except BaseException:
+                self._stage_queue = batch + self._stage_queue
+                raise
             self._last_flush_time = time.perf_counter()
+
+    async def _write_batch(self, batch: list[TaskContext]) -> None:
+        """Write *batch* to its shards, then the manifest."""
+        groups = {}
+        for c in batch:
+            shard_id = self._shard_id_for(c.sample_id)
+            groups.setdefault((c.iteration, c.stage, shard_id), []).append(c)
+
+        limiter = anyio.CapacityLimiter(self._shard_write_concurrency)
+
+        async def _write_group(iteration, stage, shard_id, ctxs):
+            async with limiter:
+                await self._write_shard(iteration, stage, shard_id, ctxs)
+
+        async with anyio.create_task_group() as tg:
+            for (iteration, stage, shard_id), ctxs in groups.items():
+                tg.start_soon(_write_group, iteration, stage, shard_id, ctxs)
+
+        await self._write_manifest()
 
     async def save_report(self, report: JSONValue) -> None:
         """Atomically write ``report.json`` via a temporary file and replace.
@@ -188,8 +227,9 @@ class TaskSaver:
 
         ``version``, ``deterministic`` and ``task`` describe the run that
         created the directory: a resume keeps the persisted values and never
-        backfills a missing ``task`` block, since it would describe the
-        resuming process rather than the run that produced the samples. A
+        backfills a missing ``deterministic`` or ``task``, since either would
+        describe the resuming process rather than the run that produced the
+        samples. A
         fresh run writes its own. A stage identity given here replaces the
         carried one (``None`` sets it unknown); a stage not given is carried
         from a resumed ``meta.json`` of the same identity schema.
@@ -200,10 +240,10 @@ class TaskSaver:
         existing = await self._read_meta() if resumed else None
         meta: TaskRunMeta
         if existing is not None and isinstance(existing.get("version"), str):
-            meta = {
-                "version": existing["version"],
-                "deterministic": existing.get("deterministic", self._deterministic),
-            }
+            meta = cast(TaskRunMeta, {"version": existing["version"]})
+            # Carried only when recorded: a pre-feature run never said.
+            if isinstance(existing.get("deterministic"), bool):
+                meta["deterministic"] = existing["deterministic"]
             if isinstance(existing.get("task"), dict):
                 meta["task"] = existing["task"]
         else:

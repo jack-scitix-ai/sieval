@@ -4,10 +4,13 @@ Tests for TaskSaver: sharding, manifest updates, flush, and report saving.
 AI-Generated Code - Claude Opus 4.6 (Anthropic)
 """
 
+from pathlib import Path
+
 import anyio
 import orjson
 import pytest
 
+from sieval.core.tasks import saver as saver_module
 from sieval.core.tasks.consts import TaskAction, TaskStage
 from sieval.core.tasks.context import TaskContext, TaskRunIdentity
 from sieval.core.tasks.saver import TaskSaver
@@ -24,6 +27,10 @@ _IDENTITY: TaskRunIdentity = {
     "status": "stable",
     "reference_kind": "value",
 }
+
+
+def _temp_files(root):
+    return sorted(p.name for p in root.glob("*.tmp"))
 
 
 # ===================================================================
@@ -292,6 +299,67 @@ class TestFlush:
         assert (tmp_root / "0" / "final" / "0.jsonl").exists()
         assert (tmp_root / "1" / "final" / "0.jsonl").exists()
 
+    @pytest.mark.anyio
+    async def test_a_failed_flush_keeps_its_batch_for_the_next(
+        self, saver, tmp_root, monkeypatch
+    ):
+        """A flush that dies mid-write (an error, or the storage worker being
+        cancelled) leaves its contexts queued, so a later flush still writes them."""
+        real_write_shard = TaskSaver._write_shard
+        calls = {"n": 0}
+
+        async def _write_shard(self, *args):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("EIO")
+            return await real_write_shard(self, *args)
+
+        monkeypatch.setattr(TaskSaver, "_write_shard", _write_shard)
+        for sid in (0, 1):
+            ctx = _make_ctx(sid, TaskStage.FINAL)
+            saver._update_manifest_entry(ctx)
+            saver._stage_queue.append(ctx)
+
+        with pytest.raises(ExceptionGroup):
+            await saver.flush()
+        assert [c.sample_id for c in saver._stage_queue] == [0, 1]
+
+        await saver.flush()
+        assert saver._stage_queue == []
+        lines = (tmp_root / "0" / "final" / "0.jsonl").read_bytes().splitlines()
+        assert {orjson.loads(line)["sample_id"] for line in lines} == {0, 1}
+
+    @pytest.mark.anyio
+    async def test_drain_writes_what_the_stream_still_holds(self, saver, tmp_root):
+        send, recv = anyio.create_memory_object_stream[TaskContext](8)
+        leftover = recv.clone()
+        for sid in (0, 1, 2):
+            send.send_nowait(_make_ctx(sid, TaskStage.FINAL))
+        # The consumer stopped early, with three contexts still buffered.
+        recv.close()
+
+        await saver.drain(leftover)
+
+        manifest = orjson.loads((tmp_root / "manifest.json").read_bytes())
+        assert [e["sample_id"] for e in manifest] == [0, 1, 2]
+        lines = (tmp_root / "0" / "final" / "0.jsonl").read_bytes().splitlines()
+        assert len(lines) == 3
+        with pytest.raises(anyio.ClosedResourceError):
+            leftover.receive_nowait()
+        send.close()
+
+    @pytest.mark.anyio
+    async def test_drain_stops_at_the_end_of_a_closed_stream(self, saver, tmp_root):
+        send, recv = anyio.create_memory_object_stream[TaskContext](8)
+        send.send_nowait(_make_ctx(0, TaskStage.FINAL))
+        send.close()
+
+        await saver.drain(recv)
+
+        assert (
+            len((tmp_root / "0" / "final" / "0.jsonl").read_bytes().splitlines()) == 1
+        )
+
 
 # ===================================================================
 # save_report
@@ -314,7 +382,7 @@ class TestSaveReport:
         assert loaded["v"] == 2
 
         # Temp file should not remain after successful save.
-        assert not (tmp_root / "report.tmp").exists()
+        assert _temp_files(tmp_root) == []
 
     @pytest.mark.anyio
     async def test_save_report_does_not_write_meta(self, saver, tmp_root):
@@ -334,14 +402,14 @@ class TestSaveReport:
         file does not linger."""
         await anyio.Path(tmp_root).mkdir(parents=True, exist_ok=True)
 
-        async def _fail_replace(*_args):
+        def _fail_replace(*_args):
             raise OSError("disk full")
 
-        monkeypatch.setattr(anyio.Path, "replace", _fail_replace)
+        monkeypatch.setattr(saver_module.os, "replace", _fail_replace)
         with pytest.raises(OSError, match="disk full"):
             await saver.save_report({"accuracy": 0.5})
         assert not (tmp_root / "report.json").exists()
-        assert not (tmp_root / "report.tmp").exists()
+        assert _temp_files(tmp_root) == []
 
 
 # ===================================================================
@@ -380,7 +448,7 @@ class TestRunMeta:
         assert "reran" not in run  # both written only when the run ends
         assert "ended" not in run
         assert "config" not in run  # absent when there is no diff
-        assert not (root / "meta.tmp").exists()
+        assert _temp_files(root) == []
 
     @pytest.mark.anyio
     async def test_deterministic_false_is_written(self, saver, tmp_root):
@@ -448,6 +516,53 @@ class TestRunMeta:
         assert meta["version"] == "0.6.0"
         assert meta["identity"]["data"] is None
         assert [r["start"] for r in meta["runs"]] == ["resume"]
+
+    @pytest.mark.anyio
+    async def test_resume_does_not_backfill_deterministic(self, tmp_path):
+        """A `meta.json` that never recorded `deterministic` keeps not saying it;
+        the resuming process's value would describe it, not the samples."""
+        root = tmp_path / "legacy"
+        root.mkdir()
+        (root / "meta.json").write_bytes(orjson.dumps({"version": "0.6.0"}))
+        saver = TaskSaver(root_dir=root, deterministic=True)
+
+        await saver.begin_run(resumed=True)
+
+        assert "deterministic" not in _read_meta(root)
+
+    @pytest.mark.anyio
+    async def test_concurrent_writes_use_their_own_temp_files(
+        self, tmp_root, monkeypatch
+    ):
+        """Two writers never share one temp file, and each fsyncs before the
+        replace makes its data visible."""
+        await anyio.Path(tmp_root).mkdir(parents=True)
+        temps: list[str] = []
+        synced: list[int] = []
+        real_mkstemp = saver_module.tempfile.mkstemp
+        real_fsync = saver_module.os.fsync
+
+        def _mkstemp(*args, **kwargs):
+            fd, name = real_mkstemp(*args, **kwargs)
+            temps.append(name)
+            return fd, name
+
+        def _fsync(fd):
+            synced.append(fd)
+            real_fsync(fd)
+
+        monkeypatch.setattr(saver_module.tempfile, "mkstemp", _mkstemp)
+        monkeypatch.setattr(saver_module.os, "fsync", _fsync)
+        async with anyio.create_task_group() as tg:
+            for i in range(4):
+                tg.start_soon(
+                    saver_module._atomic_write, tmp_root / "meta.json", b"%d" % i
+                )
+        assert len(set(temps)) == 4
+        assert all(Path(t).parent == tmp_root for t in temps)
+        assert len(synced) == 4
+        assert (tmp_root / "meta.json").read_bytes() in {b"0", b"1", b"2", b"3"}
+        assert _temp_files(tmp_root) == []
 
     @pytest.mark.anyio
     async def test_resume_without_readable_meta_writes_a_fresh_origin(self, tmp_path):
@@ -548,14 +663,14 @@ class TestRunMeta:
         """`meta.json` says whether a run started here: a write that did not land
         fails the task rather than leaving the directory to be read as fresh."""
 
-        async def _fail_replace(*_args):
+        def _fail_replace(*_args):
             raise OSError("read-only file system")
 
-        monkeypatch.setattr(anyio.Path, "replace", _fail_replace)
+        monkeypatch.setattr(saver_module.os, "replace", _fail_replace)
         with pytest.raises(OSError, match="read-only"):
             await saver.begin_run(resumed=False)
         assert not (tmp_root / "meta.json").exists()
-        assert not (tmp_root / "meta.tmp").exists()
+        assert _temp_files(tmp_root) == []
 
 
 # ===================================================================
