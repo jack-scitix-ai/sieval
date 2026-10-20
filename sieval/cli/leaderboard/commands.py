@@ -162,6 +162,13 @@ def run(
         str | None,
         typer.Option("--result-dir", help="Override result directory"),
     ] = None,
+    resume_from: Annotated[
+        Path | None,
+        typer.Option(
+            "--resume-from",
+            help="Start each task from <DIR>/<task> of another run (read-only ok)",
+        ),
+    ] = None,
     deterministic: Annotated[
         bool | None,
         typer.Option(
@@ -227,6 +234,7 @@ def run(
             config,
             model=model,
             resume=resume,
+            resume_from=resume_from,
             result_dir=result_dir,
             deterministic=deterministic,
             invocation=shlex.join(sys.argv),

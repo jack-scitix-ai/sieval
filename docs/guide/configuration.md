@@ -110,3 +110,27 @@ Built-in anomaly detection runs automatically after each task and saves to `anom
 ## Sharded Persistence
 
 Append-only sharded storage provides crash recovery via `auto_resume`, stream processing (low memory), and parallel shard writes. Custom dataclass types in `TaskContext` fields must use `@sieval_record` for proper deserialization.
+
+## Resume
+
+A resume compares each task's recorded stage identities (`meta.json`) with this
+run's:
+
+| Differs | Resume |
+| --- | --- |
+| Data or prompt | Those samples rerun from the start; the rest are kept |
+| Inference | Refused, naming the stage |
+| Grader (grading code, `grader_args()`, judges) | `postprocess`, `feedback` and `report` rerun on the recorded inference |
+
+So a grader-only change is a plain `--resume`.
+
+`--resume-from DIR` starts each task from `DIR/<task>` of another run, which
+may be read-only or another task's: its shards are copied into the empty
+`result_dir`, then resumed as above. `DIR` is never written. A task missing
+there runs fresh; with a one-task config `DIR` may be the task directory.
+`runner_config.resume_from` names one task directory and wins over the option.
+Rerunning the same command after an interruption resumes the copy.
+
+A directory recorded before stage identities is compared through the session's
+`effective_config.yaml`. Without one, `--resume-from` it is refused, and a
+same-directory `--resume` trusts it, as before.
