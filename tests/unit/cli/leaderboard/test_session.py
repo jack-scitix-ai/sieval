@@ -37,7 +37,6 @@ from sieval.cli.leaderboard.session import (
     _THROUGHPUT_RUNNER_KEYS,
     DETERMINISTIC_DEFAULT_SEED,
     EvalSession,
-    _append_resume_note,
     _apply_endpoint_injection,
     _apply_request_seed_decision_to_args,
     _apply_request_seed_decision_to_model,
@@ -6444,6 +6443,8 @@ class TestInferArgs:
         runner.models = models or {}
         runner.datasets = datasets or {}
         runner.runner = MultiTaskRunner()
+        runner._infer_plans = None
+        runner._resume_config_diff = []
         runner._task_requirement_contexts = {
             task_name: _task_requirement_context_for_setup_test(
                 task_cfg,
@@ -6511,6 +6512,63 @@ class TestInferArgs:
         assert derived_model is not mock_model  # should be a new derived model
         assert derived_model._kwargs["max_tokens"] == 512
         assert derived_model._kwargs["temperature"] == 0.7
+
+    def test_recipe_and_resume_diff_reach_the_runner(self):
+        """The served model's plan (without its checkpoint or host) and the
+        resume's config diff are handed to the runner for `meta.json`."""
+        mock_task_cls = MagicMock(return_value=MagicMock())
+        runner = self._make_runner(
+            {"eval_task": {"class": "fake.Task", "dataset": "ds", "model": "m"}},
+            models={"m": MockChatModel()},
+            datasets={"ds": MagicMock()},
+        )
+        runner.config["models"] = cast(
+            Any, {"base": {"path": "/ckpt"}, "m": {"base": "base"}}
+        )
+        runner._infer_plans = {
+            "base": {
+                "checkpoint": "/ckpt",
+                "backend": "vllm",
+                "assignments": [
+                    {"role": "full", "devices": {"count": 1, "host": "node-7"}}
+                ],
+                "attachments": [
+                    {
+                        "kind": "kv_cache",
+                        "provider": "redis",
+                        "address": "10.0.1.100:30001",
+                    }
+                ],
+            }
+        }
+        runner._resume_config_diff = ["concurrency_limit: 8 → 2"]
+        add_task = MagicMock()
+        runner.runner = MagicMock(add_task=add_task)
+
+        with patch(
+            "sieval.cli.leaderboard.session.resolve_task_class",
+            return_value=mock_task_cls,
+        ):
+            runner._setup_tasks()
+
+        kwargs = add_task.call_args.kwargs
+        # Where it ran (host, attachment address) is left out; how is kept.
+        assert kwargs["inference_recipe"] == {
+            "backend": "vllm",
+            "assignments": [{"role": "full", "devices": {"count": 1}}],
+            "attachments": [{"kind": "kv_cache", "provider": "redis"}],
+        }
+        assert kwargs["resume_config_diff"] == ["concurrency_limit: 8 → 2"]
+        # The session's plan is untouched by the projection.
+        assert runner._infer_plans["base"]["checkpoint"] == "/ckpt"
+
+    def test_unserved_model_has_no_recipe(self):
+        runner = self._make_runner({}, models={"m": MockChatModel()})
+        runner.config["models"] = cast(Any, {"m": {"api_base": "http://x/v1"}})
+        runner._infer_plans = {"other": {"backend": "vllm"}}
+        assert runner._inference_recipe_for("m") is None
+        runner._infer_plans = None
+        assert runner._inference_recipe_for("m") is None
 
     def test_infer_args_empty_noop(self):
         """Empty or missing infer_args should not create a model copy."""
@@ -7756,6 +7814,8 @@ class TestDeterministicMode:
         runner.models = {"m": mock_model}
         runner.datasets = {"ds": mock_ds}
         runner.runner = MultiTaskRunner()
+        runner._infer_plans = None
+        runner._resume_config_diff = []
         runner.deterministic = True
         runner._task_requirement_contexts = {
             "eval_task": RequirementContext(
@@ -8705,33 +8765,6 @@ class TestDiffKeyShape:
         )
         assert presence == ["- top: removed ['x']"]
         assert order == ["- other: 'b' moved from position 1 to 0 (2 keys)"]
-
-
-class TestAppendResumeNote:
-    def test_note_inserted_before_closing_border_and_split_stable(self):
-        header = _format_comment_header(
-            title="Persisted by", source_config="/x", invocation="sieval run x"
-        )
-        body = "models:\n  base:\n    name: m\n"
-        out = _append_resume_note(header, ["- concurrency_limit: 8 → 2"])
-
-        assert "Persisted by sieval" in out  # origin preserved
-        assert "Resumed by sieval" in out
-        assert "#   - concurrency_limit: 8 → 2" in out
-        # The note sits inside the border pair: the whole block is still parsed
-        # as header (body is not polluted) when prepended to a body.
-        h, b = _split_header(out + body)
-        assert b == body
-        assert "Resumed by sieval" in h
-
-    def test_second_append_accumulates(self):
-        header = _format_comment_header(
-            title="Persisted by", source_config="/x", invocation="sieval run x"
-        )
-        once = _append_resume_note(header, ["- a: 1 → 2"])
-        twice = _append_resume_note(once, ["- a: 2 → 3"])
-        assert twice.count("Resumed by sieval") == 2
-        assert "- a: 1 → 2" in twice and "- a: 2 → 3" in twice
 
 
 class TestBriefDiff:
