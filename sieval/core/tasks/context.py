@@ -1,4 +1,4 @@
-"""Task pipeline state machine: context, stage outputs, and manifest types."""
+"""Task pipeline state machine: context, stage outputs and ``meta.json`` types."""
 
 from dataclasses import dataclass, field, replace
 from typing import Any, NotRequired, Self, TypedDict
@@ -47,8 +47,9 @@ class TaskRunMeta(TypedDict):
 
     ``version``, ``deterministic`` and ``task`` describe the run that created
     the directory and are kept across resumes; the resume gates read them.
-    ``model``, ``identity`` and ``runs`` are rewritten by every run — see
-    :mod:`sieval.core.tasks.run_meta` for their shape.
+    ``model``, ``config``, ``identity`` and ``runs`` are rewritten by every
+    run — see :mod:`sieval.core.tasks.run_meta` for their shape. ``config`` is
+    the run's ``effective_config.yaml``, relative to this directory.
 
     Readers tolerate older files: ``deterministic`` absent is a pre-feature
     run, ``task`` absent is a pre-feature run or an undecorated ``Task``, and
@@ -60,6 +61,7 @@ class TaskRunMeta(TypedDict):
     deterministic: NotRequired[bool]
     task: NotRequired[TaskRunIdentity]
     model: NotRequired[str]
+    config: NotRequired[str]
     identity: NotRequired[RunIdentity]
     runs: NotRequired[list[RunRecord]]
 
@@ -85,19 +87,6 @@ class TaskStageOutput[T]:
 
     value: T
     meta: TaskStageMeta | None = None
-
-
-class TaskManifest(TypedDict):
-    """Schema for a single entry in ``manifest.json`` — a per-sample status snapshot."""
-
-    sample_id: str | int
-    iteration: int
-    stage: str
-    final: bool
-    failed: bool
-    error_action: NotRequired[str]
-    error_reason: NotRequired[str | None]
-    retry_count: NotRequired[int]
 
 
 @dataclass(frozen=True, slots=True)

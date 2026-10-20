@@ -20,6 +20,9 @@ from sieval.cli.leaderboard.annotation import CellAnnotationDict, annotate_cell
 from sieval.cli.leaderboard.card import AlignmentCard, load_card
 
 _TIMESTAMP_RE = re.compile(r"\d{14}")
+# `runs[].id` from `meta.json` (see `sieval.core.tasks.run_meta.new_run_id`).
+_RUN_ID_RE = re.compile(r"\d{8}T\d{6}\.\d{6}Z-[0-9a-f]+")
+_EFFECTIVE_CONFIG = "effective_config.yaml"
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +34,7 @@ class RunInfo:
     run_dir: Path
     report: dict
     model_name: str = ""
+    config: Path | None = None
 
 
 class LeaderboardResult(TypedDict):
@@ -47,13 +51,41 @@ class LeaderboardMatrix(TypedDict):
     results: list[LeaderboardResult]
 
 
+def _run_order(run: RunInfo) -> tuple[bool, str]:
+    """Sort key for "latest run": a recorded run ID beats a directory-name
+    fallback, which does not compare with one as a string and is always older.
+    """
+    return bool(_RUN_ID_RE.fullmatch(run.run_id)), run.run_id
+
+
+def _read_meta(run_dir: Path) -> dict:
+    try:
+        meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _latest_run_id(meta: dict) -> str | None:
+    """The ``id`` of the last run in ``meta.json``'s ``runs[]`` that has one."""
+    runs = meta.get("runs")
+    if not isinstance(runs, list):
+        return None
+    for run in reversed(runs):
+        if isinstance(run, dict) and isinstance(run.get("id"), str):
+            return run["id"]
+    return None
+
+
 def scan_runs(dirs: list[Path]) -> list[RunInfo]:
     """Recursively find ``report.json`` files and return :class:`RunInfo` list.
 
-    Two directory patterns are recognised:
+    The run ID, model and config come from the task directory's
+    ``meta.json``. Older directories without them fall back to two patterns:
 
     * **Pattern A** -- ``{root}/{task_name}/{14-digit-timestamp}/report.json``
-    * **Pattern B** -- ``{root}/{...}/{task_name}/report.json`` (no timestamp)
+    * **Pattern B** -- ``{root}/{...}/{task_name}/report.json`` (no timestamp),
+      whose run ID is then the task name
     """
     runs: list[RunInfo] = []
     for root in dirs:
@@ -74,22 +106,30 @@ def scan_runs(dirs: list[Path]) -> list[RunInfo]:
                 task_name = parent.name
                 run_id = parent.name
 
+            meta = _read_meta(parent)
+            model = meta.get("model")
+            config = meta.get("config")
+            if not (isinstance(config, str) and Path(config).name == _EFFECTIVE_CONFIG):
+                config = None
             runs.append(
                 RunInfo(
                     task_name=task_name,
-                    run_id=run_id,
+                    run_id=_latest_run_id(meta) or run_id,
                     run_dir=parent,
                     report=report,
+                    model_name=model if isinstance(model, str) else "",
+                    config=(parent / config).resolve() if config else None,
                 )
             )
     return runs
 
 
 def resolve_model_name(run_dir: Path) -> str:
-    """Extract model name from inference output, falling back to dir name.
+    """The model of a run whose ``meta.json`` does not name it.
 
-    Looks for ``{run_dir}/{iteration}/final/0.jsonl``, reads the first line,
-    and extracts ``infer_result.model.model``.
+    For a directory from before ``meta.json`` recorded ``model``: reads the
+    first line of ``{run_dir}/{iteration}/final/0.jsonl`` for
+    ``infer_result.model.model``, falling back to the directory name.
     """
     fallback = run_dir.name
     candidates = sorted(run_dir.glob("*/final/0.jsonl"))
@@ -108,16 +148,17 @@ def resolve_model_name(run_dir: Path) -> str:
         return fallback
 
 
-def _find_effective_config(run_dir: Path) -> Path | None:
-    """Walk up from ``run_dir`` looking for ``effective_config.yaml``."""
-    candidate = run_dir
-    while True:
-        cfg = candidate / "effective_config.yaml"
+def _find_effective_config(run: RunInfo) -> Path | None:
+    """The run's ``effective_config.yaml``: ``meta.json``'s ``config``, else
+    one level up (Pattern B) or two (Pattern A), never further.
+    """
+    if run.config is not None:
+        return run.config if run.config.is_file() else None
+    for candidate in (run.run_dir.parent, run.run_dir.parent.parent):
+        cfg = candidate / _EFFECTIVE_CONFIG
         if cfg.is_file():
             return cfg
-        if candidate.parent == candidate:
-            return None
-        candidate = candidate.parent
+    return None
 
 
 def _load_card_from_config(cfg: Path) -> AlignmentCard | None:
@@ -153,8 +194,8 @@ def _load_card_from_config(cfg: Path) -> AlignmentCard | None:
 class _CardResolver:
     """Cache alignment-card lookups across a single :func:`build_matrix` call.
 
-    Two levels of cache: the walk-up from a run directory to its nearest
-    ``effective_config.yaml`` (bounded, cheap), and the parse+load of that
+    Two levels of cache: the lookup of a run's ``effective_config.yaml``
+    (cheap), and the parse+load of that
     config plus the card it cites (expensive). A 10×50 board shares one
     config and one card, so this collapses 500 parses to 1.
     """
@@ -163,10 +204,10 @@ class _CardResolver:
         self._cfg_cache: dict[Path, Path | None] = {}
         self._card_cache: dict[Path, AlignmentCard | None] = {}
 
-    def card_for(self, run_dir: Path) -> AlignmentCard | None:
-        if run_dir not in self._cfg_cache:
-            self._cfg_cache[run_dir] = _find_effective_config(run_dir)
-        cfg = self._cfg_cache[run_dir]
+    def card_for(self, run: RunInfo) -> AlignmentCard | None:
+        if run.run_dir not in self._cfg_cache:
+            self._cfg_cache[run.run_dir] = _find_effective_config(run)
+        cfg = self._cfg_cache[run.run_dir]
         if cfg is None:
             return None
         if cfg not in self._card_cache:
@@ -213,7 +254,7 @@ def build_matrix(runs: list[RunInfo], *, all_runs: bool = False) -> LeaderboardM
     """Aggregate runs into a :class:`LeaderboardMatrix`.
 
     When *all_runs* is ``False`` (default), only the latest run per
-    ``(model, task)`` pair is kept (lexicographic comparison on *run_id*).
+    ``(model, task)`` pair is kept (see :func:`_run_order`).
     """
     if not runs:
         return LeaderboardMatrix(models=[], tasks=[], results=[])
@@ -226,7 +267,7 @@ def build_matrix(runs: list[RunInfo], *, all_runs: bool = False) -> LeaderboardM
             task=r.task_name,
             run_id=r.run_id,
             report=r.report,
-            annotation=_compute_annotation(r, resolver.card_for(r.run_dir)),
+            annotation=_compute_annotation(r, resolver.card_for(r)),
         )
 
     if all_runs:
@@ -236,7 +277,7 @@ def build_matrix(runs: list[RunInfo], *, all_runs: bool = False) -> LeaderboardM
         best: dict[tuple[str, str], RunInfo] = {}
         for r in runs:
             key = (r.model_name, r.task_name)
-            if key not in best or r.run_id > best[key].run_id:
+            if key not in best or _run_order(r) > _run_order(best[key]):
                 best[key] = r
         results = [_result(r) for r in best.values()]
 

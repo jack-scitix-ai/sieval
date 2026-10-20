@@ -11,3 +11,7 @@ config = TaskRunnerConfig(
     dump_progress=True,    # save progress.json
 )
 ```
+
+With `record_meta` on (the default), `profile.json` covers every sample's
+recorded stage timings and token usage, resumed samples included, regardless of
+`profile_stages` / `profile_usage`. `profile_io` timings cover this run only.

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **BREAKING — `manifest.json` is removed.** A sample's state is its latest shard record, found through `.idx`; read per-sample status from the `.idx` columns or the record's `error_*` fields (#148).
+- **BREAKING — every exit path finalizes the same way.** `report.json` gains a `sieval` block (`total`, `final`, `failed`, `anomalies`) that decides a fast resume; `anomalies.json` covers every iteration and loses `summary` and its timestamped backups; `runs[].rules_hash` names the rules applied (#148).
+- `meta.json` records `config` (the session's `effective_config.yaml`) and `runs[].id`, a run ID sortable by start time; the leaderboard scanner reads them instead of walking up the filesystem (#148).
 - **BREAKING — a resume compares stage identities, not config text.** Changed data or prompt reruns those samples, a changed grader regrades on the recorded inference, a changed inference is refused. `effective_config.yaml` and `infer_plans.yaml` no longer refuse a resume; `gate_resume_identity` is removed (#148).
 
 ### Added

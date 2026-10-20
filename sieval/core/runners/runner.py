@@ -1,5 +1,6 @@
 """Single-task execution engine with dual-stream compute/storage architecture."""
 
+import os
 import re
 import time
 from collections import defaultdict
@@ -7,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypedDict, cast
 
 import anyio
 import anyio.to_thread
@@ -30,7 +31,6 @@ from sieval.core.tasks.consts import NON_RETRIABLE_REASON, NonRetriableSampleErr
 from sieval.core.tasks.context import (
     TaskAction,
     TaskContext,
-    TaskManifest,
     TaskStage,
     TaskStageMeta,
     TaskStageOutput,
@@ -90,6 +90,58 @@ from .stage_resume import (
     remove_copied,
 )
 
+#: Key of the run's own counts in ``report.json``.
+SIEVAL_COUNTS_KEY = "sieval"
+
+#: Sentinel for :meth:`TaskRunner._finalize`: no cached report to reuse.
+_NOT_REPORTED: Any = object()
+
+
+class SievalCounts(TypedDict):
+    """The ``sieval`` block of ``report.json``.
+
+    ``anomalies`` counts final samples any rule flagged. A fast resume needs
+    ``total == final`` and ``failed == 0``.
+    """
+
+    total: int
+    final: int
+    failed: int
+    anomalies: int
+
+
+def _counts(
+    total: int,
+    finals: list[TaskContext],
+    fails: list[TaskContext],
+    anomalies: dict[str | int, dict[int, dict[str, list[int]]]],
+) -> SievalCounts:
+    final_ids = {c.sample_id for c in finals}
+    return {
+        "total": total,
+        "final": len(finals),
+        "failed": len(fails),
+        "anomalies": sum(
+            1 for sid, its in anomalies.items() if sid in final_ids and its
+        ),
+    }
+
+
+def _reported_complete(report: object) -> bool:
+    """Whether a cached report's ``sieval`` counts say every sample is final.
+
+    A report without them cannot say, and is finalized again from the shards.
+    """
+    if not isinstance(report, dict):
+        return False
+    counts = cast(dict[str, object], report).get(SIEVAL_COUNTS_KEY)
+    if not isinstance(counts, dict):
+        return False
+    fields = cast(dict[str, object], counts)
+    total, final, failed = (fields.get(k) for k in ("total", "final", "failed"))
+    return isinstance(total, int) and total > 0 and final == total and failed == 0
+
+
 # Type Aliases
 type TaskStageMetaHook = Callable[[Any, TaskStage, TaskContext], TaskStageMeta | None]
 type TaskStageMetaHooks = dict[TaskStage, TaskStageMetaHook]
@@ -135,6 +187,8 @@ class TaskRunnerConfig:
         result_dir: Output directory for shards, manifest, and report.
             If ``None``, auto-generated under ``outputs/<task_name>/<timestamp>``.
         auto_resume: When ``True``, detect and resume from existing result_dir.
+        effective_config: The session's ``effective_config.yaml``, recorded in
+            ``meta.json`` as ``config``. Not part of any identity.
         resume_from: A recorded task directory, possibly another task's and
             read-only, whose shards are copied into an empty ``result_dir`` and
             resumed (see :mod:`sieval.core.runners.stage_resume`). Implies
@@ -145,6 +199,7 @@ class TaskRunnerConfig:
     result_dir: str | None = None
     auto_resume: bool = False
     resume_from: str | None = None
+    effective_config: str | None = None
 
     profile_io: bool = False  # timings
     profile_stages: bool = False  # timings
@@ -206,15 +261,17 @@ def _read_run_meta(root_dir: Path) -> dict | None:
 def run_started(root_dir: Path) -> bool:
     """Whether a run has started in *root_dir*, so a new one would resume it.
 
-    Read from ``meta.json``'s ``runs[]``, which a run appends before it does any
-    work: a run killed before its first ``manifest.json`` flush still counts. A
-    directory written before ``runs[]`` existed falls back to ``manifest.json``,
-    the signal those versions used.
+    Read from ``meta.json``'s ``runs[]``, which a run appends before any work.
+    Versions before ``runs[]`` wrote ``meta.json`` once at run start, so a
+    ``meta.json`` without ``runs`` counts; an empty ``runs[]`` does not.
     """
     meta = _read_run_meta(root_dir)
-    if meta is not None and isinstance(meta.get("runs"), list) and meta["runs"]:
-        return True
-    return (root_dir / "manifest.json").exists()
+    if meta is None:
+        return False
+    runs = meta.get("runs")
+    if isinstance(runs, list):
+        return bool(runs)
+    return True
 
 
 def read_run_version(root_dir: Path) -> str | None:
@@ -538,6 +595,7 @@ class TaskRunner:
                 model=self._model_name(),
                 keep_recorded_model=keeps_recorded_model,
                 config_diff=self._resume_config_diff if resumed else (),
+                config_path=self._config_path(),
                 data=None,
                 prompt=None,
                 inference=inference,
@@ -559,7 +617,6 @@ class TaskRunner:
             self._total_samples = max(len(self._contexts), dataset_size)
 
             # 4. Prepare Runtime State
-            initial_manifest: dict[str | int, TaskManifest] = {}
             # For exit check
             finals_count = 0
             fails_count = 0
@@ -593,22 +650,6 @@ class TaskRunner:
                     )
                     self._contexts[sid] = ctx
 
-                # 4.2. Sync Manifest
-                entry: TaskManifest = {
-                    "sample_id": ctx.sample_id,
-                    "stage": ctx.stage.value,
-                    "iteration": ctx.iteration,
-                    "final": ctx.stage == TaskStage.FINAL,
-                    "failed": ctx.stage == TaskStage.FAILED,
-                }
-                if ctx.error_action:
-                    entry["error_action"] = ctx.error_action.value
-                if ctx.error_reason:
-                    entry["error_reason"] = ctx.error_reason
-                if ctx.retry_count:
-                    entry["retry_count"] = ctx.retry_count
-                initial_manifest[sid] = entry
-
                 # 4.3. Collect Stats for Exit Check & Progress
                 if ctx.is_terminal():
                     completed_ids.append(sid)
@@ -631,8 +672,6 @@ class TaskRunner:
                         fails_count += 1
                         failed_ids.append(sid)
 
-            # Sync Saver Manifest
-            self._saver.sync_manifest(initial_manifest)
             if changed:
                 # Rewritten whole as this run's records, which supersede the
                 # recorded ones on load.
@@ -654,17 +693,7 @@ class TaskRunner:
                     prepare_retries=False,
                     record_each_stage=self._record_each_stage,
                 )
-                # Re-fetch finals and fails fully hydrated
-                finals, fails = self._final_and_failed()
-                report = await self._task.report(finals, fails)
-                # Always save report on completion
-                reported = await self._save_report_with_diagnostics(
-                    report, finals, fails
-                )
-                await self._end_run(reported=reported)
-                # A rerun after a failed `end_run` lands here, owing anomalies.json.
-                await self._save_anomalies(finals, fails)
-                return report
+                return await self._finalize()
 
             # 6. Setup Progress Tracker
             self._progress = TaskProgress(
@@ -719,37 +748,7 @@ class TaskRunner:
                         logger.error("Flush after the run stopped failed: {}", exc)
 
             # 8. Finalize
-            self._profiler.aggregate_stage_timings(self._contexts)
-            self._profiler.aggregate_token_usage(self._contexts)
-            self._profiler.log_summary()
-            await self._profiler.save(self._root_dir)
-
-            finals, fails = self._final_and_failed()
-            report = await self._task.report(finals, fails)
-            # Always save report on completion
-            refusal: UnreadableIntervalError | None = None
-            reported = False
-            try:
-                reported = await self._save_report_with_diagnostics(
-                    report, finals, fails
-                )
-            except UnreadableIntervalError as exc:
-                # HELD, not swallowed. `report.json` is already on disk and the run
-                # itself finished, so the remaining artifacts are written before
-                # this surfaces -- refusing an unreadable declaration must not also
-                # cost the run its `anomalies.json`, which is the evidence a reader
-                # of the failure needs. Re-raised unchanged below; only this one
-                # type is deferred, so every other failure still aborts here.
-                refusal = exc
-            if refusal is None:
-                await self._end_run(reported=reported)
-            await self._save_anomalies(finals, fails)
-
-            if self._progress:
-                self._progress.close()
-            if refusal is not None:
-                raise refusal
-            return report
+            return await self._finalize()
 
         except (KeyboardInterrupt, anyio.get_cancelled_exc_class()):
             if not self._interrupted:
@@ -758,18 +757,9 @@ class TaskRunner:
                 try:
                     with anyio.CancelScope(shield=True):
                         await self._saver.flush()
-                        await self._saver.interrupt_run()
-                        # Generate anomaly report on interrupt
-                        if self._config.detect_anomalies:
-                            finals_i, fails_i = self._final_and_failed()
-                            await self._anomaly_detector.generate_and_save_from_results(
-                                self._anomaly_results,
-                                self._task.name,
-                                total_samples=self._total_samples,
-                                final_count=len(finals_i),
-                                failed_count=len(fails_i),
-                                backup_if_changed=False,
-                            )
+                        # Anomalies of the samples this run saw finish.
+                        rules_hash = await self._write_anomalies(self._anomaly_results)
+                        await self._saver.interrupt_run(rules_hash=rules_hash)
                 except Exception as e:
                     logger.error("Flush failed: {}", e)
             if self._progress:
@@ -836,55 +826,32 @@ class TaskRunner:
                 "from this run's; resuming stage by stage"
             )
             cached_report = None
-        if cached_report is not None:
-            # Check if we need to retry failures
-            has_failures, all_final = await self._loader.get_manifest_status()
-            if not has_failures and all_final:
-                # Generate anomaly report if needed on resume
-                if (
-                    self._config.detect_anomalies
-                    and self._config.detect_anomalies_on_resume
-                ):
-                    # Load existing report to check if regeneration needed
-                    await self._anomaly_detector.load()
-                    if self._anomaly_detector.needs_regeneration():
-                        logger.info(
-                            "Anomaly detection rules changed, "
-                            "regenerating anomaly report"
-                        )
-                        # Load contexts to generate anomaly report
-                        self._contexts = await self._loader.load_initial_state()
-                        # Hydrate only FINAL and FAILED samples
-                        await self._loader.hydrate(
-                            self._contexts,
-                            self._hydrated_ids,
-                            include_stages={TaskStage.FINAL, TaskStage.FAILED},
-                            prepare_retries=False,
-                            record_each_stage=self._record_each_stage,
-                        )
-                        # Only detects anomalies in the latest iteration
-                        # (loader keeps the highest-iteration offset).
-                        await self._anomaly_detector.generate_and_save(
-                            self._contexts,
-                            self._task.name,
-                            task_tags=self._task.tags,
-                            backup_if_changed=True,
-                        )
-                    else:
-                        logger.info(
-                            "Anomaly detection rules unchanged, "
-                            "using cached anomaly report"
-                        )
-                # Nothing reran, so the identity stays the one that
-                # produced this report; only the run is recorded.
-                await self._saver.begin_run(
-                    resumed=True,
-                    model=self._model_name(),
-                    config_diff=self._resume_config_diff,
-                )
-                await self._saver.end_run(())
-                return cached_report
-        return None
+        if cached_report is None:
+            return None
+        if not _reported_complete(cached_report):
+            # Failures to retry, samples left, or a report from before the
+            # `sieval` counts: the full path decides.
+            return None
+        # Nothing reruns, so the identity is kept; the views are rebuilt from
+        # the shards like every other exit.
+        await self._saver.begin_run(
+            resumed=True,
+            model=self._model_name(),
+            config_diff=self._resume_config_diff,
+            config_path=self._config_path(),
+        )
+        self._contexts = await self._loader.load_initial_state()
+        await self._loader.hydrate(
+            self._contexts,
+            self._hydrated_ids,
+            include_stages={TaskStage.FINAL, TaskStage.FAILED},
+            prepare_retries=False,
+            record_each_stage=self._record_each_stage,
+        )
+        # The resume gate pins the dataset, and the report says every sample
+        # is final, so the recorded samples are the whole run.
+        self._total_samples = len(self._contexts)
+        return await self._finalize(cached_report=cached_report)
 
     async def _run_streams(
         self,
@@ -1268,6 +1235,7 @@ class TaskRunner:
         report: JSONValue,
         finals: list[TaskContext],
         fails: list[TaskContext],
+        counts: "SievalCounts | None" = None,
     ) -> bool:
         """Inject the run-level diagnostics into a dict report, then save.
 
@@ -1307,10 +1275,11 @@ class TaskRunner:
         has a type of its own: raising here would abort the rest of :meth:`arun`'s
         finalization, so a declaration defect would cost the finished run its
         ``anomalies.json`` -- the artifact the paragraph above exists to protect.
-        The completion path catches :class:`UnreadableIntervalError`, writes what
-        is left, and re-raises it unchanged. The early-return path has nothing
-        after it and lets it propagate straight out.
+        :meth:`_finalize`, which every exit path goes through, catches
+        :class:`UnreadableIntervalError`, writes what is left, and re-raises it
+        unchanged.
 
+        *counts* go in as the ``sieval`` block (see :class:`SievalCounts`).
         Non-dict reports are saved unchanged; ``None`` skips the save. Returns
         whether ``report.json`` was written.
 
@@ -1325,6 +1294,8 @@ class TaskRunner:
             return False
         if isinstance(report, dict):
             as_dict = cast(dict[str, JSONValue], report)
+            if counts is not None:
+                as_dict[SIEVAL_COUNTS_KEY] = cast(JSONValue, dict(counts))
             as_dict["sieval_versions"] = report_versions(
                 (c.stage_meta for c in finals),
                 (c.stage_meta for c in fails),
@@ -1353,20 +1324,131 @@ class TaskRunner:
                 )
         return True
 
-    async def _save_anomalies(
-        self, finals: list[TaskContext], fails: list[TaskContext]
+    async def _finalize(self, cached_report: Any = _NOT_REPORTED) -> Any:
+        """Finish a run the same way on every exit path.
+
+        Expects every terminal sample hydrated in ``_contexts``. Writes the
+        profile, ``report.json`` (a fast resume passes *cached_report* and
+        reuses it), ``anomalies.json``, the ended ``runs[]`` entry and
+        ``progress.json``.
+        """
+        finals, fails = self._final_and_failed()
+        anomalies = self._anomalies_of(finals)
+
+        await self._profile(finals + fails)
+
+        refusal: UnreadableIntervalError | None = None
+        reused = cached_report is not _NOT_REPORTED
+        reported = False
+        if reused:
+            report = cached_report
+        else:
+            report = await self._task.report(finals, fails)
+            counts = _counts(self._total_samples, finals, fails, anomalies)
+            try:
+                reported = await self._save_report_with_diagnostics(
+                    report, finals, fails, counts
+                )
+            except UnreadableIntervalError as exc:
+                # Held, not swallowed: `report.json` is on disk, so write the
+                # remaining artifacts first, then re-raise below.
+                refusal = exc
+
+        rules_hash = None
+        if not reused or self._config.detect_anomalies_on_resume:
+            rules_hash = await self._write_anomalies(anomalies)
+            if reused and rules_hash is not None:
+                await self._refresh_anomaly_count(report, finals, fails, anomalies)
+        if refusal is None:
+            if reused:
+                await self._saver.end_run((), rules_hash=rules_hash)
+            else:
+                await self._end_run(reported=reported, rules_hash=rules_hash)
+        self._finish_progress(finals, fails, anomalies)
+        if refusal is not None:
+            raise refusal
+        return report
+
+    async def _refresh_anomaly_count(
+        self,
+        report: dict,
+        finals: list[TaskContext],
+        fails: list[TaskContext],
+        anomalies: dict[str | int, dict[int, dict[str, list[int]]]],
     ) -> None:
-        """Write ``anomalies.json`` from the anomalies this run has collected."""
+        """Match a reused report's ``sieval.anomalies`` to the re-detection."""
+        counts = report[SIEVAL_COUNTS_KEY]
+        count = _counts(self._total_samples, finals, fails, anomalies)["anomalies"]
+        if counts.get("anomalies") != count:
+            counts["anomalies"] = count
+            await self._saver.save_report(report)
+
+    def _anomalies_of(
+        self, finals: list[TaskContext]
+    ) -> dict[str | int, dict[int, dict[str, list[int]]]]:
+        """This run's per-iteration anomalies, plus detection on the final
+        samples an earlier run recorded."""
+        results: dict[str | int, dict[int, dict[str, list[int]]]] = {
+            sid: dict(iterations) for sid, iterations in self._anomaly_results.items()
+        }
         if not self._config.detect_anomalies:
-            return
-        await self._anomaly_detector.generate_and_save_from_results(
-            self._anomaly_results,
-            self._task.name,
-            total_samples=self._total_samples,
-            final_count=len(finals),
-            failed_count=len(fails),
-            backup_if_changed=False,
-        )
+            return results
+        for ctx in finals:
+            if ctx.iteration in results.get(ctx.sample_id, {}):
+                continue
+            found = self._anomaly_detector.detect(ctx, task_tags=self._task.tags)
+            if found:
+                results.setdefault(ctx.sample_id, {})[ctx.iteration] = {
+                    rule: sorted(indices) for rule, indices in found.items()
+                }
+        return results
+
+    async def _write_anomalies(
+        self, results: dict[str | int, dict[int, dict[str, list[int]]]]
+    ) -> str | None:
+        """Write ``anomalies.json``; the rules hash it used, else ``None``."""
+        if not self._config.detect_anomalies:
+            return None
+        return await self._anomaly_detector.write(results, self._task.name)
+
+    async def _profile(self, contexts: list[TaskContext]) -> None:
+        """Rebuild ``profile.json`` from every terminal sample's ``stage_meta``."""
+        by_id = {ctx.sample_id: ctx for ctx in contexts}
+        if self._config.record_meta:
+            self._profiler.include_stage_meta()
+        self._profiler.aggregate_stage_timings(by_id)
+        self._profiler.aggregate_token_usage(by_id)
+        self._profiler.log_summary()
+        await self._profiler.save(self._root_dir)
+
+    def _finish_progress(
+        self,
+        finals: list[TaskContext],
+        fails: list[TaskContext],
+        anomalies: dict[str | int, dict[int, dict[str, list[int]]]],
+    ) -> None:
+        """Write ``progress.json`` with ``finished: true``."""
+        progress = self._progress
+        if progress is None:
+            progress = TaskProgress(
+                total=self._total_samples,
+                desc=f"Running {self._task.name}",
+                show_progress=False,
+                root_dir=self._root_dir,
+                dump_progress=self._config.dump_progress,
+            )
+            details: dict[str, int] = defaultdict(int)
+            for iterations in anomalies.values():
+                for rule in set().union(*iterations.values()):
+                    details[rule] += 1
+            progress.init_state(
+                [c.sample_id for c in finals + fails],
+                failed_ids=[c.sample_id for c in fails],
+                anomaly_ids=[sid for sid, its in anomalies.items() if its],
+                anomaly_details=details,
+            )
+        progress.finish()
+        progress.close()
 
     # ------------------------------------------------------------------
     # meta.json: stage identities and run history
@@ -1476,7 +1558,6 @@ class TaskRunner:
         if self._copied:
             remove_copied(self._copied)
             (self._root_dir / "meta.json").unlink(missing_ok=True)
-            (self._root_dir / "manifest.json").unlink(missing_ok=True)
             self._copied = []
 
     def _recorded_stages_match(self) -> bool:
@@ -1679,6 +1760,15 @@ class TaskRunner:
             error_msg=None,
             retry_count=0,
             stage_meta={k: v for k, v in ctx.stage_meta.items() if k in keep},
+        )
+
+    def _config_path(self) -> str | None:
+        """``effective_config`` relative to this directory."""
+        configured = self._config.effective_config
+        if not configured:
+            return None
+        return os.path.relpath(
+            Path(configured).expanduser().resolve(), self._root_dir.resolve()
         )
 
     def _model_name(self) -> str:
@@ -1913,7 +2003,7 @@ class TaskRunner:
             return ctx.error_action not in (TaskAction.PREPROCESS, TaskAction.INFER)
         return ctx.stage not in (TaskStage.INITIAL, TaskStage.PREPROCESSED)
 
-    async def _end_run(self, *, reported: bool) -> None:
+    async def _end_run(self, *, reported: bool, rules_hash: str | None = None) -> None:
         """Finish this run's ``runs[]`` entry once its report is settled.
 
         *reported* says ``report.json`` was written; ``report()`` returning
@@ -1943,7 +2033,7 @@ class TaskRunner:
         # `report()` has no identity: only the stages that grade count.
         if ran & {TaskAction.POSTPROCESS, TaskAction.FEEDBACK}:
             reran.add("grader")
-        await self._saver.end_run(reran, reported=reported)
+        await self._saver.end_run(reran, reported=reported, rules_hash=rules_hash)
 
     def _resolve_result_dir(
         self, result_dir: str | None, task: Task, auto_resume: bool

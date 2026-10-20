@@ -35,11 +35,15 @@ same as a zero-width one. It is never zeroed to stand in for a missing
 one. `ci95_units` is there whenever the report carries **any** interval, and
 absent when it carries none.
 
-`ci95_units` is the one **nested object** in `report.json`. Every other value is a
-scalar or a flat list — a number, a string, an interval as `[lo, hi]`, the
-variable-length `sieval_versions`, and `null` where a task omits a value in band
-(`hle_0shot_gen`'s `calibration_error`). Consumers that read `score` and pass the
-rest through are unaffected.
+`ci95_units` and `sieval` are the two **nested objects** in `report.json`. Every
+other value is a scalar or a flat list — a number, a string, an interval as
+`[lo, hi]`, the variable-length `sieval_versions`, and `null` where a task omits
+a value in band (`hle_0shot_gen`'s `calibration_error`). Consumers that read
+`score` and pass the rest through are unaffected.
+
+`sieval` holds the runner's counts: `total`, `final`, `failed`, and
+`anomalies` (final samples an anomaly rule flagged, matching `anomalies.json`).
+A resume reuses `report.json` only when `final == total` and `failed == 0`.
 
 `denominator_policy` is `requested` (`finals + fails`, so a pipeline failure
 counts as **wrong**) or `judged` (`finals` only, failures excluded). The split is
