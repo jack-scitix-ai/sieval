@@ -516,6 +516,12 @@ _SINGULAR_CHANNEL = {"response_role": "channel", "choice_indexed": False}
 _PROVENANCE = {"response_role": "provenance", "choice_indexed": False}
 _CHOICE_PROVENANCE = {"response_role": "provenance", "choice_indexed": True}
 
+#: ``Response.finish_reason_sources`` values. Persisted in records, so the
+#: spellings are frozen; :func:`sieval.core.utils.meta.is_truncated_finish_reason`
+#: keys on them.
+FINISH_SOURCE_CANDIDATE = "candidate.finishReason"
+FINISH_SOURCE_PROMPT_BLOCK = "promptFeedback.blockReason"
+
 
 @sieval_record
 @dataclass(frozen=True)

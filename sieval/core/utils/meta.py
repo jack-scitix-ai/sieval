@@ -6,22 +6,17 @@ from collections.abc import Iterable, Mapping
 from packaging.version import InvalidVersion, Version
 
 from sieval import __version__
-from sieval.core.models import ModelCallMeta, ModelOutput
+from sieval.core.models import (
+    FINISH_SOURCE_CANDIDATE,
+    FINISH_SOURCE_PROMPT_BLOCK,
+    ModelCallMeta,
+    ModelOutput,
+)
 from sieval.core.tasks.consts import TaskStage
 from sieval.core.tasks.context import TaskStageMeta
 
-#: Finish reasons for candidate generation interrupted by a limit, filter, or refusal.
-#:
-#: Every spelling, not one canonical name: the IR does not normalize these, so a
-#: set holding only ``length`` (OpenAI-compatible Chat/Completions and SGLang
-#: native) would read zero against ``max_output_tokens`` (OpenAI Responses),
-#: ``max_tokens`` or ``model_context_window_exceeded`` (Anthropic), or
-#: ``MAX_TOKENS`` or ``CONTINUATION`` (Google generateContent).
-#: ``content_filter``, Anthropic's ``refusal``, and Google's candidate policy
-#: stops also count: the output was interrupted, although raising ``max_tokens``
-#: would not fix filtering or refusal.
-#: Google's promptFeedback reasons can use the same spelling; their source must
-#: be checked before counting. Shared by live anomaly and persisted report paths.
+#: Google candidate policy stops. ``promptFeedback.blockReason`` can use the
+#: same spellings, so these count only with a candidate source.
 _GOOGLE_POLICY_FINISH_REASONS = frozenset(
     {
         "SAFETY",
@@ -36,6 +31,9 @@ _GOOGLE_POLICY_FINISH_REASONS = frozenset(
         "ESCALATION",
     }
 )
+#: Finish reasons for output interrupted by a limit, filter, or refusal. Every
+#: provider spelling is listed because the IR does not normalize them. Shared by
+#: the anomaly rule and the report key so the two cannot drift.
 _TRUNCATION_FINISH_REASONS = (
     frozenset(
         {
@@ -54,16 +52,16 @@ _TRUNCATION_FINISH_REASONS = (
 
 
 def is_truncated_finish_reason(reason: str, source: str | None = None) -> bool:
-    """Never count prompt blocks; count Google policy stops only for candidates.
+    """Whether ``reason`` (from ``source``, if recorded) interrupted the output.
 
-    An old record with no source cannot disambiguate ``SAFETY`` and is left
-    uncounted rather than being misclassified on replay.
+    Google policy stops need a candidate source: a record that predates
+    ``finish_reason_sources`` cannot tell them from a prompt block, so they are
+    left uncounted.
     """
-    if source == "promptFeedback.blockReason":
+    if source == FINISH_SOURCE_PROMPT_BLOCK:
         return False
     return reason in _TRUNCATION_FINISH_REASONS and (
-        reason not in _GOOGLE_POLICY_FINISH_REASONS
-        or source == "candidate.finishReason"
+        reason not in _GOOGLE_POLICY_FINISH_REASONS or source == FINISH_SOURCE_CANDIDATE
     )
 
 
@@ -242,11 +240,10 @@ def _scored_rollout_indices(
 def count_truncated_rollouts(
     stage_metas: Iterable[Mapping[str, list]],
 ) -> int | None:
-    """Rollouts whose candidate output was interrupted, over scored records.
+    """Rollouts whose output was interrupted, over a report's scored records.
 
-    A token limit, output filter, or refusal can end generation prematurely;
-    only the first is addressed by increasing ``max_tokens``. Raw finish reasons
-    retain the cause, and Google prompt blocks are not candidate interruptions.
+    See :func:`is_truncated_finish_reason` for what counts; only token-limit
+    stops are fixed by raising ``max_tokens``.
 
     Counted per rollout, not per sample -- one truncated draw in four is a
     different fact from four (RFC #74 C) -- and deduplicated by rollout index, so

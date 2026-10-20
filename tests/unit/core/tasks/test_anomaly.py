@@ -602,7 +602,7 @@ class TestTaskAnomalyDetectorAsync:
             {0: ctx}, "t", task_tags={"gen"}, backup_if_changed=True
         )
 
-        assert current["meta"]["rules_hash"] == "0c7b42d9576740b0"
+        assert current["meta"]["rules_hash"] == "2c440347324b1edb"
         backup = orjson.loads((tmp_path / "anomalies.20260807010203.json").read_bytes())
         assert backup["meta"]["rules_hash"] == "1d61bae98de6f417"
         assert detector.needs_regeneration() is False
@@ -1007,7 +1007,7 @@ class TestRulesHashStability:
         Anthropic refusals. Each change must reach stored anomaly reports;
         without a new hash, `needs_regeneration()` returns False.
         """
-        assert get_rules_hash() == "0c7b42d9576740b0"
+        assert get_rules_hash() == "2c440347324b1edb"
 
     def test_the_rule_set_is_the_expected_size(self):
         # Guards the other direction: a rule silently dropped from the registry

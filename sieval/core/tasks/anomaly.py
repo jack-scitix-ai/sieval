@@ -474,10 +474,9 @@ def detect_empty_infer_ppl(ctx: TaskContext) -> set[int]:
     description="Output was interrupted before completion",
     category="output_quality",
     rationale=(
-        "Incomplete outputs may be caused by a token limit, output filtering "
-        "(including unsupported-language stops), or refusal. "
-        "Only token-limit stops can be addressed by increasing max_tokens. "
-        "Scoped to gen: single-token logprob "
+        "A token limit, output filter, or refusal cut the output short; only "
+        "a token limit is fixed by raising max_tokens. Scoped to gen: "
+        "single-token logprob "
         "tasks (ppl/clp) infer with max_tokens=1 and always finish with "
         "'length', so the signal is only meaningful for generation."
     ),
@@ -488,10 +487,8 @@ def detect_empty_infer_ppl(ctx: TaskContext) -> set[int]:
 def detect_truncated_output(ctx: TaskContext) -> set[int]:
     if ctx.infer_result is None:
         return set()
-    # Unioned across calls: a conversation whose second turn hit the cap has that
-    # rollout truncated, whichever turn did it. The reason set is shared with the
-    # `n_truncated` report key -- which reduces the same event off the persisted
-    # `finish_reasons` rather than the live output -- so the two cannot drift.
+    # Unioned across calls: whichever turn was cut short, the rollout was. The
+    # predicate is shared with the `n_truncated` report key so the two cannot drift.
     truncated: set[int] = set()
     for output in _model_outputs(_unwrap_result(ctx.infer_result)):
         sources = output.finish_reason_sources or ()

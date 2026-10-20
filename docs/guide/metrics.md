@@ -517,20 +517,14 @@ than the draw, so neither is confined to `n > 1`. Unlike every other key here
 the *runner* injects them, so a task cannot report zero truncation by having
 forgotten to look.
 
-Google's `candidate.finishReason` policy stops (including `LANGUAGE` for an
-unsupported response language) count as output filtering;
-`promptFeedback.blockReason` stops do not, because no candidate was generated.
-Both retain their provider-verbatim reason, with the source recorded separately.
-Older Google records without that source cannot distinguish the two and are not
-retroactively counted as filtered output.
-
-Anthropic's `stop_reason=refusal` counts as an interrupted output, including
-refusals that yielded no text. OpenAI Chat/Completions `finish_reason=content_filter`
-also counts. A Chat `message.refusal` without a filtering finish reason is not
-represented in the stored finish reasons and cannot be counted here. A refusal
-content part in OpenAI Responses currently raises an output-contract error
-rather than producing a scoreable rollout; it does not contribute to
-`n_truncated`.
+What counts: token/context-limit stops (`length`, `max_tokens`,
+`max_output_tokens`, `model_context_window_exceeded`, Google `MAX_TOKENS` /
+`CONTINUATION`), OpenAI `content_filter`, Anthropic `refusal`, and Google
+candidate policy stops (`SAFETY`, `RECITATION`, `LANGUAGE`, …). A Google prompt
+block (`promptFeedback.blockReason`) does not count — no candidate was
+generated — and older Google records that lack `finish_reason_sources` cannot
+tell the two apart, so their policy stops are left uncounted. A Chat
+`message.refusal` without a `content_filter` finish reason is not counted.
 
 They arrive as a **pair or not at all**. The count alone says nothing about how
 much of a score it explains — `26` is a different fact at 600 rollouts than at 30
@@ -549,12 +543,10 @@ unmeasured one. `sieval_versions` reports that state in band as `"unknown"`; a
 count has no such value.
 
 Read `n_truncated` as a count of interrupted outputs, **not** a budget-only
-diagnosis. Inspect each call's raw `finish_reasons` to separate budget exhaustion
-from policy filtering or refusal. Raising `max_tokens` can help only with
-token-limit stops; it does not fix filtering or refusal. The count is
-independent of `n_unextracted`: an interrupted answer can still parse (for
-example, the stop lands after the boxed answer). When both occur, check the stop
-reason before changing the budget.
+diagnosis: raising `max_tokens` fixes only the token-limit stops, and the raw
+`finish_reasons` say which kind each was. It is independent of `n_unextracted` —
+an interrupted answer can still parse when the stop lands after the boxed
+answer — so when both occur, check the stop reason before changing the budget.
 
 ### Pairs that must be read together
 

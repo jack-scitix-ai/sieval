@@ -59,6 +59,8 @@ from sieval.core.models.dialect import (
     validate_top_logprobs,
 )
 from sieval.core.models.ir import (
+    FINISH_SOURCE_CANDIDATE,
+    FINISH_SOURCE_PROMPT_BLOCK,
     ChatInput,
     ChatMessage,
     Citation,
@@ -136,11 +138,9 @@ _GEMINI_3_SAMPLING_PATHS = frozenset(
 )
 _GEMINI_3_SAMPLING_WIRE_KEYS = frozenset({"temperature", "topP", "topK"})
 _STANDARD_USER_PART_FIELDS = frozenset({"text", "inlineData", "fileData"})
-#: ``CONTINUATION`` is Google's per-request token cap reached with generation
-#: unfinished: ``candidate.continuationToken`` could resume it, but this dialect
-#: neither forwards nor replays that token. The rollout is scored as truncated
-#: (same as ``MAX_TOKENS``; see ``is_truncated_finish_reason``) and the raw finish
-#: reason stays on the record.
+#: Finish reasons that may leave requested channels empty. ``CONTINUATION``
+#: carries a ``continuationToken`` this dialect does not replay; like
+#: ``MAX_TOKENS`` it counts as truncated.
 _CHANNEL_OPTIONAL_FINISH_REASONS = frozenset(
     {
         "MAX_TOKENS",
@@ -2042,17 +2042,12 @@ def _structured_output(req: Request, text: str) -> StructuredOutput | None:
 
 
 def _usage(raw: object) -> UsageStats | None:
-    """Lift Google's counts onto the shared breakdown-consistent accounting.
+    """Lift Google's counts onto the shared accounting.
 
-    Google reports the addends of ``totalTokenCount`` ("prompt + tool-use
-    prompt + thoughts + response candidates"), not the shared IR's parent
-    counts.  ``candidatesTokenCount`` therefore excludes thoughts, and taking
-    it as ``output_tokens`` would make ``reasoning_tokens`` -- documented as a
-    breakdown of ``output_tokens`` -- exceed its own parent, so the profiler
-    would publish a reasoning share above 100% and every thinking call would
-    disagree with Google's reported total.  Folding the two addends into their
-    parents fixes both; ``promptTokenCount`` already includes cached content,
-    so ``cachedContentTokenCount`` stays a breakdown of the result unchanged.
+    Google reports the addends of ``totalTokenCount``; ``candidatesTokenCount``
+    excludes thoughts. Folding thoughts into ``output_tokens`` (and tool-use
+    prompt into ``input_tokens``) keeps ``reasoning_tokens`` a breakdown of its
+    parent. ``promptTokenCount`` already includes ``cachedContentTokenCount``.
     """
 
     if raw is None:
@@ -2880,7 +2875,7 @@ class GoogleGenAIDialect:
             return Response(
                 texts=("",) * req.sampling.n,
                 finish_reasons=(block_reason,) * req.sampling.n,
-                finish_reason_sources=("promptFeedback.blockReason",) * req.sampling.n,
+                finish_reason_sources=(FINISH_SOURCE_PROMPT_BLOCK,) * req.sampling.n,
                 usage=_usage(_get(raw, "usageMetadata")),
                 request_params=context.request_params,
                 response_model=_optional_string(
@@ -3275,7 +3270,7 @@ class GoogleGenAIDialect:
                 else None
             ),
             finish_reasons=tuple(finish_reasons),
-            finish_reason_sources=("candidate.finishReason",) * len(finish_reasons),
+            finish_reason_sources=(FINISH_SOURCE_CANDIDATE,) * len(finish_reasons),
             tool_calls=tuple(calls) or None,
             server_tool_uses=tuple(server_uses) or None,
             structured_output=(

@@ -85,12 +85,10 @@ class PreparedRequestVerifier(Protocol):
 
 @dataclass(frozen=True)
 class PreparedRequestEvidence:
-    """Explicitly select verification against the complete prepared request.
+    """Opt a verifier into checking the whole prepared request, not just the body.
 
-    A wrapper keeps structural ``WireVerifier`` objects on their historical
-    body-only path even when they happen to expose another similarly named
-    method.  It also validates the callable at evidence-admission time rather
-    than failing later with an unhelpful ``TypeError``.
+    An explicit wrapper, so a ``WireVerifier`` never switches path by happening
+    to have a ``verify_prepared`` method.
     """
 
     verifier: PreparedRequestVerifier
@@ -514,11 +512,10 @@ def validate_runtime_binding_plan(plan: RuntimePlanView, req: Request) -> None:
             )
 
     minimum = plan.capability_minimums.get("top_logprobs", {}).get("minimum")
-    minimum_value = cast(int, minimum) if minimum is not None else None
     if (
-        minimum_value is not None
+        minimum is not None
         and req.scoring.top_logprobs > 0
-        and req.scoring.top_logprobs < minimum_value
+        and req.scoring.top_logprobs < int(minimum)
     ):
         raise DialectError(
             f"top_logprobs={req.scoring.top_logprobs} weakens required "

@@ -46,6 +46,8 @@ from .dialect_registry import (
 from .exceptions import CapabilityError
 from .gen_model import GenModel
 from .ir import (
+    FINISH_SOURCE_CANDIDATE,
+    FINISH_SOURCE_PROMPT_BLOCK,
     CapabilityEvidence,
     ChatInput,
     ChatMessage,
@@ -130,6 +132,8 @@ __all__ = [
     "DialectOptions",
     "DialectSpec",
     "Engine",
+    "FINISH_SOURCE_CANDIDATE",
+    "FINISH_SOURCE_PROMPT_BLOCK",
     "FunctionToolCall",
     "GenModel",
     "GroundingChunk",
