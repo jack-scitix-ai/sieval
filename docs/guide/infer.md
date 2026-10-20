@@ -153,13 +153,14 @@ Rejected before any network I/O:
   (`additionalProperties`, `$ref`, type arrays, numeric enums) — use `/v1beta`;
   on both versions, a function needs a non-empty description and an explicit
   `type: object` parameter root;
-- Gemini model-family limits, matched on the model name: on Gemini 3,
-  `sampling.n > 1`, explicit `temperature`/`top_p`/`top_k`, and
-  `reasoning.effort` values outside the model's
-  [thinking-level table](https://ai.google.dev/gemini-api/docs/generate-content/thinking);
-  on Gemini 2.5, `reasoning.effort` and out-of-range `reasoning.budget_tokens`;
-  on Gemini 1.x/2.x, mixing function tools with hosted tools. A gateway alias
-  that does not start with `gemini-` skips these checks.
+- explicit `temperature`/`top_p`/`top_k` on `gemini-3…` models: Google
+  [advises omitting them](https://ai.google.dev/gemini-api/docs/latest-model)
+  but accepts them, so the record could claim a control with no effect.
+
+Per-model limits Google enforces itself (thinking levels, thinking budgets,
+candidate counts, tool combinations) are left to its 400. The sampling check
+above and the Gemini 3 call-id/`thoughtSignature` contracts match the model
+name, so a gateway alias not starting with `gemini-3` skips them.
 
 Provider-only root controls such as `safetySettings`, `serviceTier`, or `store`
 go through `dialect_options` (`cachedContent` and `labels` are `v1beta`-only).
