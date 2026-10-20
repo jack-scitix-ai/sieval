@@ -53,6 +53,32 @@ The instruct flags are inert on a base checkpoint — the engine accepts and
 ignores them — so this affects what `infer_plans.yaml` records as the params
 used, not whether the service starts.
 
+## Handles and engine logs
+
+Each launched service has a handle file under `~/.sieval/handles`:
+
+| Launched by | Handle | Name in `infer list` / `show` / `stop` |
+| --- | --- | --- |
+| `sieval infer start` | `<model>.json` | `<model>` |
+| `sieval run` | `run-<pid>/<model>.json` | `run-<pid>/<model>` |
+
+So `sieval run` never collides with an `infer start` of the same model. A run
+removes its handles when it ends; if it was killed, the next `infer list`
+cleans them up, except a handle whose engine is still alive, which stays
+listed so `infer stop` can reach it.
+
+Engine logs:
+
+| Launched by | Log |
+| --- | --- |
+| `sieval run` with a `result_dir` | `<result_dir>/logs/<model>/<role>.log` |
+| otherwise | `~/.sieval/logs/<model>/<role>-<deployment_id>.log` |
+
+Each launch prunes `~/.sieval/logs/<model>/` to the last N logs per role,
+counting the new one; other models' logs and `result_dir` logs are untouched.
+Set N with `--keep-logs` (on `infer start` and `run`), else `SIEVAL_KEEP_LOGS`,
+else 3. `0` deletes the log when the service stops; a negative N keeps all.
+
 ## YAML Infer Configuration
 
 Models with a `path` field (and no `api_base`) or an `infer` section in the YAML config are automatically launched by `sieval run` and stopped after evaluation completes.

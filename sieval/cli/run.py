@@ -17,7 +17,15 @@ import typer
 import yaml
 from loguru import logger
 
-from sieval.cli.infer import cleanup_model, launch_model, resolve_infer_config
+from sieval.cli.infer import (
+    HandleHeldError,
+    cleanup_model,
+    launch_model,
+    remove_run_handle_dir,
+    resolve_infer_config,
+    resolve_keep_logs,
+    run_handle_dir,
+)
 from sieval.cli.leaderboard.session import resolve_deterministic, unwrap_proxies
 from sieval.cli.output import (
     CommandResult,
@@ -178,12 +186,17 @@ async def _run_all(
     result_dir: str | None = None,
     deterministic: bool | None = None,
     ready_timeout: float = DEFAULT_READY_TIMEOUT,
+    keep_logs: int | None = None,
 ) -> dict[str, object]:
     """Orchestrate: start services -> run eval -> stop services.
 
     Two triggers cause a model to be auto-served:
       1. Explicit ``infer`` section in the model config.
       2. Top-level ``path`` field without ``api_base`` (path-only shortcut).
+
+    Handles go under ``run-<pid>/``, removed when the run ends. Engine logs go
+    to ``<result_dir>/logs/<model>/<role>.log`` when a result_dir is set,
+    otherwise to ``~/.sieval/logs/<model>/`` pruned to *keep_logs* per role.
 
     Returns:
         Report dict from arun_session (task_name → report string).
@@ -201,6 +214,10 @@ async def _run_all(
     effective_deterministic = resolve_deterministic(deterministic, config)
 
     launched: dict[str, list[InferHandle]] = {}
+    handle_dir = run_handle_dir()
+    effective_result_dir = result_dir or config.get("result_dir")
+    # Retention applies only to ~/.sieval/logs, not to result_dir logs.
+    keep = None if effective_result_dir else resolve_keep_logs(keep_logs)
     plan_dicts: dict[str, dict[str, Any]] = {}
     prepared_launches: dict[str, tuple[DeploymentPlan, list[BackendCommand]]] = {}
     realized_deployments: dict[str, Deployment] = {}
@@ -284,22 +301,34 @@ async def _run_all(
                             elapsed,
                         )
 
-            # Claim → deploy → save handle (shared with infer start)
+            # Claim → deploy → save handle (shared with infer start). The
+            # handle lives under this process's own run-<pid>/ directory, so
+            # an `infer start` of the same model name does not collide.
             try:
                 new_handles, env = await launch_model(
                     model_name,
                     commands,
                     backend=plan.backend,
                     deployer=deployer,
+                    handle_path=handle_dir / f"{model_name}.json",
+                    log_dir=(
+                        Path(effective_result_dir) / "logs" / model_name
+                        if effective_result_dir
+                        else None
+                    ),
+                    keep_logs=keep,
                     on_progress=_progress,
                     timeout=ready_timeout,
+                    # A leftover run-<pid>/ from an earlier process with this PID.
+                    replace_stale=True,
                 )
-            except FileExistsError:
+            except HandleHeldError as held:
                 msg = (
-                    f"Model {model_name!r} is already claimed by another"
-                    " process — check `sieval infer list`"
+                    f"Model {model_name!r}: engine PID {held.pid} from an earlier "
+                    f"process still holds {held.path}. Run `sieval infer stop "
+                    f"{handle_dir.name}/{model_name}`, then retry."
                 )
-                raise FileExistsError(msg) from None
+                raise HandleHeldError(held.path, held.data, held.pid, msg) from None
 
             if sys.stderr.isatty():
                 logger.opt(raw=True).log("USER", "\n")
@@ -333,9 +362,15 @@ async def _run_all(
         return reports
 
     finally:
-        # Stop all launched services and remove handle files
+        # Stop all launched services, then remove this run's handle directory
         for name, model_handles in launched.items():
-            await cleanup_model(name, model_handles, deployer=deployer)
+            await cleanup_model(
+                name,
+                model_handles,
+                deployer=deployer,
+                handle_path=handle_dir / f"{name}.json",
+            )
+        remove_run_handle_dir(handle_dir)
 
 
 def register_run_command(app: typer.Typer) -> None:
@@ -394,6 +429,18 @@ def register_run_command(app: typer.Typer) -> None:
                 ),
             ),
         ] = DEFAULT_READY_TIMEOUT,
+        keep_logs: Annotated[
+            int | None,
+            typer.Option(
+                "--keep-logs",
+                help=(
+                    "Engine logs to keep per role in ~/.sieval/logs/<model>, "
+                    "counting this launch; ignored with a result_dir. 0 deletes "
+                    "at the end; negative keeps all. "
+                    "Default: $SIEVAL_KEEP_LOGS, else 3."
+                ),
+            ),
+        ] = None,
         verbose: Annotated[
             bool,
             typer.Option("--verbose", "-v", help="Verbose output"),
@@ -460,6 +507,7 @@ def register_run_command(app: typer.Typer) -> None:
                 result_dir=result_dir,
                 deterministic=deterministic,
                 ready_timeout=ready_timeout,
+                keep_logs=keep_logs,
             )
 
         try:
