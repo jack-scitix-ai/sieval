@@ -139,6 +139,22 @@ class TestDialectDescriptors:
             "vllm_native": RequestSeedSupport.RESERVED,
         }
 
+    def test_only_google_leaves_measured_limits_to_the_provider(self) -> None:
+        assert {
+            dialect_id: spec.provider_enforced_capabilities
+            for dialect_id, spec in DIALECT_SPECS.items()
+            if spec.provider_enforced_capabilities
+        } == {
+            "google_genai": frozenset({"reasoning", "sampled_logprobs", "top_logprobs"})
+        }
+        google = dialect_registry_to_json()["google_genai"]
+        assert isinstance(google, dict)
+        assert google["provider_enforced_capabilities"] == [
+            "reasoning",
+            "sampled_logprobs",
+            "top_logprobs",
+        ]
+
     def test_implemented_dialects_are_active_and_bindable(self) -> None:
         active = {
             dialect_id
@@ -166,6 +182,14 @@ class TestDialectDescriptors:
             ({"connection_family": ""}, "connection_family"),
             ({"implementation_status": "active"}, "implementation_status"),
             ({"request_seed_support": "supported"}, "request_seed_support"),
+            (
+                {"provider_enforced_capabilities": {"reasoning"}},
+                "provider_enforced_capabilities must be a frozenset",
+            ),
+            (
+                {"provider_enforced_capabilities": frozenset({"fim"})},
+                "must be supported by the dialect: fim",
+            ),
             (
                 {"request_seed_support": RequestSeedSupport.RESERVED},
                 "cannot reserve request-seed support",

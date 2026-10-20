@@ -144,6 +144,9 @@ _PR1_REQUEST_VERIFIERS = {
     "top_logprobs": "validate_response_channel",
 }
 
+#: Verifier for ``DialectSpec.provider_enforced_capabilities``.
+_PROVIDER_ENFORCED_VERIFIER = "provider_enforced"
+
 _DETERMINISTIC_SEED_CONTRACT_KEY = "_sieval_deterministic_seed_contract"
 
 
@@ -805,16 +808,9 @@ class _PR1CompatibilityServingReconciler:
                         for baseline in baselines
                     )
                 )
-                verifier = _PR1_REQUEST_VERIFIERS.get(requirement.capability)
-                if not request_checks and verifier is not None:
-                    request_checks = (
-                        DeferredCheck(
-                            requirement.capability,
-                            CheckStage.REQUEST,
-                            verifier,
-                            "external runtime support remains guarded by the "
-                            "existing response contract",
-                        ),
+                if not request_checks:
+                    request_checks = _response_contract_checks(
+                        requirement.capability, "external runtime"
                     )
                 evidence: dict[str, JSONValue] = {
                     "source": "external_runtime_plans",
@@ -828,6 +824,14 @@ class _PR1CompatibilityServingReconciler:
                     request_checks=request_checks,
                 )
                 continue
+            if requirement.verifier == _PROVIDER_ENFORCED_VERIFIER:
+                outcomes[requirement.capability] = Configured(
+                    evidence={"source": _PROVIDER_ENFORCED_VERIFIER},
+                    request_checks=_response_contract_checks(
+                        requirement.capability, "provider-enforced"
+                    ),
+                )
+                continue
             verifier = _PR1_REQUEST_VERIFIERS.get(requirement.capability)
             if verifier is None or requirement.verifier not in (None, verifier):
                 continue
@@ -838,6 +842,24 @@ class _PR1CompatibilityServingReconciler:
                 or "legacy compatibility requires response-time verification",
             )
         return outcomes
+
+
+def _response_contract_checks(
+    capability: CapabilityKey, source: str
+) -> tuple[DeferredCheck, ...]:
+    """Keep a capability with a response validator behind it on every request."""
+
+    verifier = _PR1_REQUEST_VERIFIERS.get(capability)
+    if verifier is None:
+        return ()
+    return (
+        DeferredCheck(
+            capability,
+            CheckStage.REQUEST,
+            verifier,
+            f"{source} support remains guarded by the existing response contract",
+        ),
+    )
 
 
 def _dedupe_deferred_checks(
@@ -2639,6 +2661,27 @@ class EvalSession:
                 for key in CAPABILITY_KEYS
             }
             return ModelCapabilityProfile(entries, authoritative=True)
+
+        if binding.dialect_id is not None:
+            spec = get_dialect_spec(binding.dialect_id)
+            if spec.provider_enforced_capabilities:
+                # Keyed by dialect, never by model name.
+                return ModelCapabilityProfile(
+                    {
+                        key: ModelCapabilityEntry(
+                            ModelCapabilityStatus.SUPPORTED,
+                            source="dialect-provider-enforced",
+                            reason=(
+                                f"{binding.dialect_id} rejects this with an "
+                                "error on a model that lacks it"
+                            ),
+                            verifier=_PROVIDER_ENFORCED_VERIFIER,
+                        )
+                        for key in CAPABILITY_KEYS
+                        if key in spec.provider_enforced_capabilities
+                    },
+                    authoritative=False,
+                )
 
         entries = {
             cast(CapabilityKey, capability): ModelCapabilityEntry(

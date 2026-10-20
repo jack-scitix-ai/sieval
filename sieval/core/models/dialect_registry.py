@@ -119,6 +119,10 @@ class DialectSpec:
     request_seed_support: RequestSeedSupport
     input_kinds: tuple[str, ...]
     input_modalities: tuple[str, ...]
+    #: Capabilities the provider was measured to reject with an error, not
+    #: ignore, on a model that lacks them. A binding with no model profile
+    #: takes these as supported and leaves per-model limits to that error.
+    provider_enforced_capabilities: frozenset[CapabilityKey] = frozenset()
 
     def __post_init__(self) -> None:
         if not self.dialect_id:
@@ -131,12 +135,24 @@ class DialectSpec:
             )
         if not isinstance(self.request_seed_support, RequestSeedSupport):
             raise TypeError("request_seed_support must be a RequestSeedSupport")
+        if not isinstance(self.provider_enforced_capabilities, frozenset):
+            raise TypeError("provider_enforced_capabilities must be a frozenset")
         outcomes = normalize_dialect_capability_outcomes(
             cast(
                 Mapping[str, DialectCapabilityStatus | str],
                 self.capability_outcomes,
             )
         )
+        unmapped = sorted(
+            key
+            for key in self.provider_enforced_capabilities
+            if outcomes.get(key) is not DialectCapabilityStatus.SUPPORTED
+        )
+        if unmapped:
+            raise ValueError(
+                "provider_enforced_capabilities must be supported by the dialect: "
+                + ", ".join(unmapped)
+            )
         if (
             self.implementation_status is DialectImplementationStatus.ACTIVE
             and DialectCapabilityStatus.RESERVED in outcomes.values()
@@ -171,6 +187,9 @@ class DialectSpec:
             "connection_family": self.connection_family,
             "implementation_status": self.implementation_status.value,
             "request_seed_support": self.request_seed_support.value,
+            "provider_enforced_capabilities": cast(
+                JSONValue, sorted(self.provider_enforced_capabilities)
+            ),
             "capability_outcomes": {
                 key: self.capability_outcomes[key].value for key in CAPABILITY_KEYS
             },
@@ -295,6 +314,7 @@ def _spec(
     request_seed_support: RequestSeedSupport,
     input_kinds: tuple[str, ...],
     input_modalities: tuple[str, ...],
+    provider_enforced_capabilities: frozenset[CapabilityKey] = frozenset(),
 ) -> DialectSpec:
     status = (
         DialectImplementationStatus.ACTIVE
@@ -314,6 +334,7 @@ def _spec(
         request_seed_support=request_seed_support,
         input_kinds=input_kinds,
         input_modalities=input_modalities,
+        provider_enforced_capabilities=provider_enforced_capabilities,
     )
 
 
@@ -437,6 +458,11 @@ DIALECT_SPECS: Mapping[str, DialectSpec] = MappingProxyType(
             request_seed_support=RequestSeedSupport.SUPPORTED,
             input_kinds=("chat",),
             input_modalities=("text", "image", "tool_call", "tool_result"),
+            # Measured: an unsupported thinking level or logprobs request gets
+            # a 400. Tools and structured output have no measured refusal.
+            provider_enforced_capabilities=frozenset(
+                {"reasoning", "sampled_logprobs", "top_logprobs"}
+            ),
         ),
         "sglang_native": _spec(
             "sglang_native",
