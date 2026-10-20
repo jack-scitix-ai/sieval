@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, fields
 from enum import StrEnum
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from sieval.core.types import JSONValue
 
@@ -34,6 +34,9 @@ from .ir import (
     TopKEntry,
     response_field_contract,
 )
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 
 class DialectError(ValueError):
@@ -246,7 +249,7 @@ def active_request_leaves(req: Request) -> dict[str, object]:
     """Return exact active semantic leaf paths for one concrete request."""
 
     active = _input_leaves(req)
-    grouped = {
+    grouped: dict[str, DataclassInstance] = {
         "sampling": req.sampling,
         "scoring": req.scoring,
         "reasoning": req.reasoning,
@@ -257,7 +260,7 @@ def active_request_leaves(req: Request) -> dict[str, object]:
     }
     for group_name, group in grouped.items():
         default = type(group)()
-        for item in fields(cast(Any, group)):
+        for item in fields(group):
             value = getattr(group, item.name)
             if value != getattr(default, item.name):
                 active[f"{group_name}.{item.name}"] = value
@@ -511,7 +514,7 @@ def validate_runtime_binding_plan(plan: RuntimePlanView, req: Request) -> None:
             )
 
     minimum = plan.capability_minimums.get("top_logprobs", {}).get("minimum")
-    minimum_value = int(cast(int, minimum)) if minimum is not None else None
+    minimum_value = cast(int, minimum) if minimum is not None else None
     if (
         minimum_value is not None
         and req.scoring.top_logprobs > 0

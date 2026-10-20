@@ -2665,6 +2665,7 @@ class TestResponseLifting:
 
         assert result.texts == ("",)
         assert result.finish_reasons == ("SAFETY",)
+        assert result.finish_reason_sources == ("promptFeedback.blockReason",)
         assert result.reasoning is None
         assert result.structured_output is None
 
@@ -2680,6 +2681,7 @@ class TestResponseLifting:
 
         assert result.texts == ("",)
         assert result.finish_reasons == ("PROHIBITED_CONTENT",)
+        assert result.finish_reason_sources == ("candidate.finishReason",)
         assert result.reasoning == (None,)
 
     @pytest.mark.anyio
@@ -2832,6 +2834,27 @@ class TestResponseLifting:
 
         assert result.texts == ("A", "B")
         assert result.finish_reasons == ("STOP", "MAX_TOKENS")
+        assert result.finish_reason_sources == ("candidate.finishReason",) * 2
+
+    @pytest.mark.anyio
+    async def test_streamed_candidate_filter_preserves_distinct_source(self) -> None:
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                content=_sse(
+                    {
+                        "candidates": [
+                            {"index": 0, "finishReason": "SAFETY"},
+                        ]
+                    }
+                ),
+                headers={"content-type": "text/event-stream"},
+            ),
+            _request(scheduling=SchedulingParams(stream=True)),
+        )
+        assert result.texts == ("",)
+        assert result.finish_reasons == ("SAFETY",)
+        assert result.finish_reason_sources == ("candidate.finishReason",)
 
     @pytest.mark.anyio
     async def test_multiple_candidates_reject_singular_response_metadata(self) -> None:
@@ -3556,8 +3579,10 @@ class TestResponseLifting:
         assert result.server_tool_uses[0].tool_type == "GOOGLE_SEARCH_WEB"
         assert result.server_tool_uses[0].result == {"ok": True}
         assert result.usage is not None
-        assert result.usage.total_tokens == 6
-        assert result.usage.reported_total_tokens == 7
+        assert result.usage.input_tokens == 4
+        assert result.usage.output_tokens == 3  # candidates 2 + thoughts 1
+        assert result.usage.total_tokens == 7
+        assert result.usage.reported_total_tokens is None  # matches computed total
         assert result.usage.reasoning_tokens == 1
         assert result.usage.cached_tokens == 2
 
@@ -3607,6 +3632,38 @@ class TestResponseLifting:
                 "id": tool_id,
             },
         ]
+
+    @pytest.mark.anyio
+    async def test_usage_folds_thoughts_and_tool_use_prompt_into_parent_counts(
+        self,
+    ) -> None:
+        """toolUsePromptTokenCount + thoughtsTokenCount are addends, not breakdowns.
+
+        Google reports ``totalTokenCount = promptTokenCount + toolUsePromptTokenCount
+        + thoughtsTokenCount + candidatesTokenCount``, but the IR expects
+        ``output_tokens >= reasoning_tokens`` (reasoning is a breakdown of output).
+        Folding the addends into their parents preserves profiler share semantics.
+        """
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                json=_response(
+                    usage={
+                        "promptTokenCount": 10,
+                        "toolUsePromptTokenCount": 3,
+                        "thoughtsTokenCount": 5,
+                        "candidatesTokenCount": 8,
+                        "totalTokenCount": 26,
+                    }
+                ),
+            )
+        )
+        assert result.usage is not None
+        assert result.usage.input_tokens == 13  # prompt 10 + tool_use_prompt 3
+        assert result.usage.output_tokens == 13  # candidates 8 + thoughts 5
+        assert result.usage.reasoning_tokens == 5
+        assert result.usage.total_tokens == 26
+        assert result.usage.reported_total_tokens is None  # matches computed
 
     @pytest.mark.anyio
     async def test_usage_computes_total_without_claiming_provider_report(self) -> None:
@@ -4138,6 +4195,7 @@ class TestStreamingAndAuditEvidence:
         assert result.finish_reasons == ("MAX_TOKENS",)
         assert result.usage is not None
         assert result.usage.total_tokens == 4
+        assert result.usage.output_tokens == 2
         assert result.request_params is not None
         assert result.request_params["query"] == {"alt": "sse"}
 
@@ -4327,6 +4385,7 @@ class TestStreamingAndAuditEvidence:
 
         assert result.texts == ("",)
         assert result.finish_reasons == ("SAFETY",)
+        assert result.finish_reason_sources == ("promptFeedback.blockReason",)
 
     @pytest.mark.anyio
     async def test_streaming_rejects_conflicting_prompt_feedback(self) -> None:
@@ -6080,4 +6139,912 @@ class TestPreparedRequestAndVerifierContracts:
         assert response.request_params is not None
         assert response.request_params["body"] == {
             "generationConfig": {"temperature": 0.9}
+        }
+
+
+def _forced(obj: Any, **fields: object) -> Any:
+    """Bypass IR construction checks to reach a dialect's own defensive guards."""
+
+    for name, value in fields.items():
+        object.__setattr__(obj, name, value)
+    return obj
+
+
+def _one_message(*parts: object, role: str = "user") -> ChatInput:
+    return _chat(ChatMessage(role, cast(Any, tuple(parts))))
+
+
+class TestHistoryShapeGuards:
+    """Fail-loud guards for input the IR constructors do not themselves reject."""
+
+    @pytest.mark.parametrize(
+        ("make", "expected"),
+        [
+            (lambda: _forced(_chat(), messages=()), "at least one message"),
+            (
+                lambda: _one_message(
+                    _forced(ImagePart(url="u", media_type="image/png"), data="d")
+                ),
+                "exactly one of url or data",
+            ),
+            (
+                lambda: _one_message(_forced(ImagePart(url="u"), url=5)),
+                ".url must be a string",
+            ),
+            (
+                lambda: _one_message(
+                    _forced(ImagePart(data="d", media_type="image/png"), data=5)
+                ),
+                ".data must be a string",
+            ),
+            (
+                lambda: _one_message(_forced(ImagePart(url="u"), media_type=5)),
+                ".media_type must be a string",
+            ),
+            (
+                lambda: _one_message(_forced(ImagePart(url="u"), detail=5)),
+                ".detail must be a string",
+            ),
+            (
+                lambda: _one_message(ToolCallPart("c", "", {}), role="assistant"),
+                ".name must be a non-empty string",
+            ),
+            (
+                lambda: _one_message(ToolResultPart("", {}), role="tool"),
+                ".call_id must be a non-empty string",
+            ),
+            (
+                lambda: _one_message(
+                    _forced(ToolResultPart("c", {}), is_error="yes"), role="tool"
+                ),
+                ".is_error must be a boolean",
+            ),
+            (lambda: _one_message(object()), "has unsupported type"),
+        ],
+    )
+    def test_chat_shape_error_names_each_malformed_field(
+        self, make: Callable[[], ChatInput], expected: str
+    ) -> None:
+        error = google_genai._chat_shape_error(make())
+
+        assert error is not None
+        assert expected in error
+
+    @pytest.mark.parametrize("lower", ["main", "verification"])
+    @pytest.mark.parametrize(
+        ("image", "expected"),
+        [
+            (ImagePart(url="u", detail="high"), "per-image detail"),
+            (
+                ImagePart(url="u", media_type="image/bmp"),
+                "unsupported Google image media type",
+            ),
+            (
+                ImagePart(data="", media_type="image/png"),
+                "inline images require data",
+            ),
+            (ImagePart(data="AAAA"), "inline images require data"),
+        ],
+    )
+    def test_image_lowering_and_its_audit_mirror_reject_the_same_inputs(
+        self, lower: str, image: ImagePart, expected: str
+    ) -> None:
+        convert = (
+            google_genai._input_to_wire
+            if lower == "main"
+            else google_genai._verification_input_to_wire
+        )
+
+        with pytest.raises(DialectError, match=expected):
+            convert(_one_message(TextPart("look"), image), None)
+
+    def test_empty_image_url_is_rejected_by_lowering(self) -> None:
+        with pytest.raises(DialectError, match="URLs must not be empty"):
+            google_genai._input_to_wire(
+                _one_message(ImagePart(url="", media_type="image/png")), None
+            )
+
+    @pytest.mark.parametrize(
+        ("message", "names", "wire_ids", "answered", "expected"),
+        [
+            (
+                ChatMessage("tool", (TextPart("x"),)),
+                {},
+                {},
+                set(),
+                "may contain only tool results",
+            ),
+            (
+                ChatMessage("tool", (ImagePart(url="u"),)),
+                {},
+                {},
+                set(),
+                "may contain only tool results",
+            ),
+            (
+                ChatMessage("user", (ToolCallPart("c", "f", {}),)),
+                {},
+                {},
+                set(),
+                "require assistant role",
+            ),
+            (
+                ChatMessage("assistant", (ToolCallPart("", "f", {}),)),
+                {},
+                {},
+                set(),
+                "require id and name",
+            ),
+            (
+                ChatMessage("assistant", (ToolCallPart("c", "", {}),)),
+                {},
+                {},
+                set(),
+                "require id and name",
+            ),
+            (
+                ChatMessage("assistant", (ToolCallPart("c", "f", {}),)),
+                {"c": "f"},
+                {"c": "c"},
+                set(),
+                "duplicate Google function call id",
+            ),
+            (
+                ChatMessage("user", (ToolResultPart("c", {}),)),
+                {"c": "f"},
+                {"c": "c"},
+                set(),
+                "require tool role",
+            ),
+            (
+                ChatMessage("tool", (ToolResultPart("c", {}),)),
+                {},
+                {},
+                set(),
+                "has no prior call",
+            ),
+            (
+                ChatMessage("tool", (ToolResultPart("c", {}),)),
+                {"c": "f"},
+                {"c": "c"},
+                {"c"},
+                "duplicate Google function result",
+            ),
+            (
+                ChatMessage("user", (cast(Any, object()),)),
+                {},
+                {},
+                set(),
+                "unsupported Google content part",
+            ),
+            (
+                ChatMessage("user", ()),
+                {},
+                {},
+                set(),
+                "must not contain an empty message",
+            ),
+        ],
+    )
+    def test_content_parts_reject_each_malformed_message(
+        self,
+        message: ChatMessage,
+        names: dict[str, str],
+        wire_ids: dict[str, str | None],
+        answered: set[str],
+        expected: str,
+    ) -> None:
+        with pytest.raises(DialectError, match=expected):
+            google_genai._content_parts(message, names, answered, wire_ids, {}, 1)
+
+    def test_idless_function_response_requires_a_conversation_index(self) -> None:
+        with pytest.raises(AssertionError, match="conversation index"):
+            google_genai._content_parts(
+                ChatMessage("tool", (ToolResultPart("c", {}),)),
+                {"c": "f"},
+                set(),
+                {"c": None},
+                {},
+                None,
+            )
+
+
+def _opaque_envelope(
+    synthetic: object = None,
+    *,
+    call: object | None = None,
+    part_extra: Mapping[str, object] | None = None,
+) -> str:
+    part: dict[str, object] = {
+        "functionCall": {"name": "f", "args": {}} if call is None else call,
+        "thoughtSignature": "sig",
+    }
+    part.update(part_extra or {})
+    envelope: dict[str, object] = {
+        "version": 1,
+        "contents": [
+            {"role": "user", "parts": [{"text": "q"}]},
+            {"role": "model", "parts": [part]},
+        ],
+    }
+    if synthetic is not None:
+        envelope["syntheticCallIds"] = synthetic
+    return json.dumps(envelope)
+
+
+def _synthetic(**changes: object) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "contentIndex": 1,
+        "partIndex": 0,
+        "field": "functionCall",
+        "id": "local",
+    }
+    entry.update(changes)
+    return entry
+
+
+class TestOpaqueReplayGuards:
+    def test_well_formed_synthetic_correlation_decodes(self) -> None:
+        _, contents, synthetic = google_genai._decode_opaque(
+            _opaque_envelope([_synthetic()])
+        )
+
+        assert len(contents) == 2
+        assert synthetic == {(1, 0, "functionCall"): "local"}
+
+    @pytest.mark.parametrize(
+        ("synthetic", "expected"),
+        [
+            ({}, "must be a list"),
+            ([{"contentIndex": 1}], "has invalid shape"),
+            ([_synthetic(contentIndex=-1)], "non-negative integers"),
+            ([_synthetic(partIndex=True)], "non-negative integers"),
+            ([_synthetic(field="bogus")], "has invalid field"),
+            ([_synthetic(id="")], "must be non-empty"),
+            ([_synthetic(contentIndex=9)], "points outside contents"),
+            ([_synthetic(field="functionResponse")], "points to the wrong part"),
+            ([_synthetic(), _synthetic()], "contains a duplicate"),
+        ],
+    )
+    def test_malformed_synthetic_correlation_is_rejected(
+        self, synthetic: object, expected: str
+    ) -> None:
+        with pytest.raises(DialectError, match=expected):
+            google_genai._decode_opaque(_opaque_envelope(synthetic))
+
+    def test_synthetic_id_cannot_shadow_a_provider_issued_id(self) -> None:
+        payload = _opaque_envelope(
+            [_synthetic()], call={"id": "provider", "name": "f", "args": {}}
+        )
+
+        with pytest.raises(DialectError, match="requires a call without id"):
+            google_genai._decode_opaque(payload)
+
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            [{"role": "model", "parts": "not-a-list"}],
+            [{"role": "model", "parts": [{"functionCall": "not-an-object"}]}],
+        ],
+    )
+    def test_synthetic_validation_does_not_trust_unchecked_contents(
+        self, contents: list[dict[str, object]]
+    ) -> None:
+        with pytest.raises(DialectError):
+            google_genai._validate_synthetic_call_ids(
+                [_synthetic(contentIndex=0)], cast(Any, contents)
+            )
+
+    def test_malformed_part_metadata_is_rejected_on_replay(self) -> None:
+        with pytest.raises(DialectError, match="partMetadata must be an object"):
+            google_genai._decode_opaque(
+                _opaque_envelope(
+                    [_synthetic()], part_extra={"partMetadata": "not-an-object"}
+                )
+            )
+
+    @pytest.mark.parametrize(
+        ("contents", "expected"),
+        [
+            ([{"role": "user", "parts": "x"}], "parts must be a list"),
+            ([{"role": "user", "parts": ["x"]}], "must be an object"),
+            (
+                [{"role": "model", "parts": [{"functionCall": "x"}]}],
+                "history must be an object",
+            ),
+            (
+                [
+                    {
+                        "role": "model",
+                        "parts": [
+                            {"functionCall": {"id": "a", "name": "f"}},
+                            {"functionCall": {"id": "a", "name": "f"}},
+                        ],
+                    }
+                ],
+                "duplicates functionCall id",
+            ),
+        ],
+    )
+    def test_final_history_recovery_rejects_malformed_contents(
+        self, contents: list[dict[str, object]], expected: str
+    ) -> None:
+        with pytest.raises(DialectError, match=expected):
+            google_genai._historical_output_call_ids(cast(Any, contents), {})
+
+    @pytest.mark.parametrize(
+        ("output", "calls", "expected"),
+        [
+            ([], {}, "must remain an object"),
+            ({"role": "model"}, {}, "must retain parts"),
+            (
+                {"role": "model", "parts": [{"text": "x"}]},
+                {5: ("functionCall", "c")},
+                "part index changed",
+            ),
+            (
+                {"role": "model", "parts": ["x"]},
+                {0: ("functionCall", "c")},
+                "part changed shape",
+            ),
+            (
+                {"role": "model", "parts": [{"functionCall": "x"}]},
+                {0: ("functionCall", "c")},
+                "call payload changed shape",
+            ),
+            (
+                {
+                    "role": "model",
+                    "parts": [{"functionCall": {"id": "real", "name": "f"}}],
+                },
+                {0: ("functionCall", "c")},
+                "unexpectedly gained an id",
+            ),
+        ],
+    )
+    def test_opaque_history_asserts_its_internal_invariants(
+        self, output: object, calls: dict[int, tuple[str, str]], expected: str
+    ) -> None:
+        with pytest.raises(AssertionError, match=expected):
+            google_genai._opaque_history(None, (), {}, cast(Any, output), calls)
+
+
+class TestFinalBodyStructuralGuards:
+    """The final-body validators run on serialized JSON, so tolerate any shape."""
+
+    _GEMINI_3 = "gemini-3-pro-preview"
+    _JUNK: list[object] = [
+        "not-a-content",
+        {"role": "model", "parts": "not-a-list"},
+        {"role": "model", "parts": ["not-a-part"]},
+    ]
+
+    def test_call_ids_ignore_non_sequence_contents(self) -> None:
+        google_genai._validate_final_function_call_ids(
+            {"contents": "x"}, self._GEMINI_3
+        )
+
+    def test_call_id_check_still_reaches_a_later_malformed_call(self) -> None:
+        contents = [*self._JUNK, {"role": "model", "parts": [{"functionCall": "x"}]}]
+
+        with pytest.raises(DialectError, match="functionCall must be an object"):
+            google_genai._validate_final_function_call_ids(
+                cast(Any, {"contents": contents}), self._GEMINI_3
+            )
+
+    def test_signatures_ignore_non_sequence_contents(self) -> None:
+        google_genai._validate_final_function_call_signatures(
+            {"contents": None}, self._GEMINI_3
+        )
+
+    def test_signature_check_skips_junk_but_still_finds_an_unsigned_call(
+        self,
+    ) -> None:
+        google_genai._validate_final_function_call_signatures(
+            cast(Any, {"contents": self._JUNK}), self._GEMINI_3
+        )
+        contents = [
+            *self._JUNK,
+            {"role": "model", "parts": [{"functionCall": {"id": "1", "name": "f"}}]},
+        ]
+
+        with pytest.raises(DialectError, match="thoughtSignature"):
+            google_genai._validate_final_function_call_signatures(
+                cast(Any, {"contents": contents}), self._GEMINI_3
+            )
+
+
+_SEARCH = ToolParams(hosted=(HostedToolSpec("google_search"),))
+_SEARCH_CALL: dict[str, Any] = {
+    "toolCall": {"id": "s1", "toolType": "GOOGLE_SEARCH_WEB", "args": {}},
+    "thoughtSignature": "sig",
+}
+_SEARCH_RESULT: dict[str, Any] = {
+    "toolResponse": {
+        "id": "s1",
+        "toolType": "GOOGLE_SEARCH_WEB",
+        "response": {"ok": True},
+    },
+    "thoughtSignature": "sig",
+}
+
+
+def _with_model(model: str, parts: list[dict[str, Any]], **extra: Any) -> Any:
+    return _run(
+        lambda _: httpx.Response(200, json=_response(parts, **extra)),
+        _request(tools=_SEARCH),
+        model=model,
+    )
+
+
+class TestServerToolResponseGuards:
+    """Hosted-tool reply shapes that must fail loudly rather than be guessed at."""
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("parts", "expected"),
+        [
+            (
+                [
+                    {
+                        "toolCall": {
+                            "id": "s1",
+                            "toolType": "CODE_EXECUTION",
+                            "args": {},
+                        },
+                        "thoughtSignature": "sig",
+                    }
+                ],
+                "outside the request's allowed hosted-tool set",
+            ),
+            (
+                [_SEARCH_CALL, _SEARCH_RESULT, _SEARCH_RESULT],
+                "duplicate Google server tool response id",
+            ),
+            (
+                [
+                    _SEARCH_CALL,
+                    {
+                        "toolResponse": {
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "response": {},
+                        },
+                        "thoughtSignature": "sig",
+                    },
+                    {
+                        "toolResponse": {
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "response": {},
+                        },
+                        "thoughtSignature": "sig",
+                    },
+                ],
+                "without id is ambiguous",
+            ),
+            (
+                [
+                    {
+                        "toolResponse": {
+                            "id": "orphan",
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "response": {},
+                        },
+                        "thoughtSignature": "sig",
+                    }
+                ],
+                "without its call",
+            ),
+            (
+                [
+                    _SEARCH_CALL,
+                    {
+                        "toolResponse": {
+                            "id": "s1",
+                            "toolType": "URL_CONTEXT",
+                            "response": {},
+                        },
+                        "thoughtSignature": "sig",
+                    },
+                ],
+                "server tool type changed",
+            ),
+        ],
+    )
+    async def test_inconsistent_server_tool_parts_are_rejected(
+        self, parts: list[dict[str, Any]], expected: str
+    ) -> None:
+        with pytest.raises(OutputContractError, match=expected):
+            await _with_model("gemini-3-pro-preview", parts)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("part", "expected"),
+        [
+            (_SEARCH_CALL, "unrequested server tool call"),
+            (_SEARCH_RESULT, "unrequested server tool response"),
+        ],
+    )
+    async def test_server_tool_parts_without_a_hosted_request_are_rejected(
+        self, part: dict[str, Any], expected: str
+    ) -> None:
+        with pytest.raises(OutputContractError, match=expected):
+            await _run(
+                lambda _: httpx.Response(200, json=_response([part])),
+                _request(),
+                model="gemini-3-pro-preview",
+            )
+
+    @pytest.mark.anyio
+    async def test_candidates_cannot_each_carry_singular_grounding(self) -> None:
+        grounding = {"groundingChunks": [{"web": {"uri": "https://w", "title": "t"}}]}
+        candidates = [
+            {
+                "index": index,
+                "content": {"role": "model", "parts": [{"text": "x"}]},
+                "finishReason": "STOP",
+                "groundingMetadata": grounding,
+            }
+            for index in range(2)
+        ]
+        # The n>1 gate fires first; the later ``len(groundings) > 1`` guard is
+        # unreachable (n==1 admits one candidate, so at most one grounding).
+        with pytest.raises(OutputContractError, match="cannot represent choices"):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    json={
+                        "candidates": candidates,
+                        "usageMetadata": {
+                            "promptTokenCount": 1,
+                            "candidatesTokenCount": 1,
+                        },
+                    },
+                ),
+                _request(sampling=SamplingParams(n=2)),
+            )
+
+
+class TestCandidateContentGuards:
+    @pytest.mark.anyio
+    async def test_candidate_without_content_is_an_empty_scoreable_reply(self) -> None:
+        result = await _run(
+            lambda _: httpx.Response(
+                200,
+                json={
+                    "candidates": [{"index": 0, "finishReason": "SAFETY"}],
+                    "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 0},
+                },
+            )
+        )
+
+        assert result.texts == ("",)
+        assert result.finish_reasons == ("SAFETY",)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            (
+                {"role": "model", "parts": [{"text": "x"}], "extra": 1},
+                "unsupported field",
+            ),
+            (
+                {"role": "model", "parts": [{"text": "x", "partMetadata": "bad"}]},
+                "partMetadata must be an object",
+            ),
+            (
+                {"role": "model", "parts": [{"text": "t", "thought": True, "x": 1}]},
+                "unsupported field",
+            ),
+            (
+                {"role": "model", "parts": [{"text": 5, "thought": True}]},
+                "exactly one text field",
+            ),
+        ],
+    )
+    async def test_malformed_candidate_content_is_rejected(
+        self, content: dict[str, Any], expected: str
+    ) -> None:
+        with pytest.raises(OutputContractError, match=expected):
+            await _run(
+                lambda _: httpx.Response(
+                    200,
+                    json={
+                        "candidates": [
+                            {"index": 0, "content": content, "finishReason": "STOP"}
+                        ],
+                        "usageMetadata": {
+                            "promptTokenCount": 1,
+                            "candidatesTokenCount": 1,
+                        },
+                    },
+                )
+            )
+
+
+class TestRequestSideGuards:
+    @pytest.mark.parametrize("summary", ["none", "auto"])
+    def test_reasoning_summary_none_is_a_documented_noop(self, summary: str) -> None:
+        req = _request(reasoning=ReasoningParams(summary=summary))
+        audit = RequestAudit(active_request_leaves(req))
+        connection = _connection(lambda _: httpx.Response(200, json=_response()))
+        try:
+            dialect = GoogleGenAIDialect(connection, "gemini-2.5-flash")
+            dialect.validate_request(req, audit, cast(Any, SimpleNamespace()))
+            prepared = dialect.prepare(req, audit)
+        finally:
+            import asyncio
+
+            asyncio.run(connection.aclose())
+
+        thinking = prepared.body.get("generationConfig", {}).get("thinkingConfig", {})
+        assert ("includeThoughts" in thinking) is (summary == "auto")
+
+    def test_multimodal_config_guards_against_future_modality_widening(self) -> None:
+        """The shared option type admits only ``image`` today.
+
+        ``_validate_multimodal_config`` is the dialect's own backstop for the day
+        ``_MULTIMODAL_INPUT_MODALITIES`` grows beyond what Gemini input maps, so
+        it is exercised by forcing a value past the option's constructor.
+        """
+
+        from sieval.core.models.capabilities import MultimodalInputOptions
+
+        google_genai._validate_multimodal_config(
+            MultimodalInputOptions(modalities=("image",))
+        )
+        widened = _forced(MultimodalInputOptions(), modalities=("image", "audio"))
+        with pytest.raises(ValueError, match="does not support modalities"):
+            google_genai._validate_multimodal_config(widened)
+
+    def test_empty_dialect_options_are_a_documented_noop(self) -> None:
+        req = _request(dialect_options=DialectOptions("google_genai", {}))
+        audit = RequestAudit(active_request_leaves(req))
+        connection = _connection(lambda _: httpx.Response(200, json=_response()))
+        try:
+            dialect = GoogleGenAIDialect(connection, "gemini-2.5-flash")
+            dialect.validate_request(req, audit, cast(Any, SimpleNamespace()))
+            dialect.prepare(req, audit)
+        finally:
+            import asyncio
+
+            asyncio.run(connection.aclose())
+
+        assert type(audit.decisions["dialect_options"]).__name__ == "NoOp"
+
+
+class TestConstructionAndInputGuards:
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("", "must not be empty"),
+            ("models/", "Gemini model id"),
+            ("a/b", "Gemini model id"),
+        ],
+    )
+    def test_requested_model_id_must_name_one_gemini_model(
+        self, model: str, expected: str
+    ) -> None:
+        connection = _connection(lambda _: httpx.Response(200, json=_response()))
+        with pytest.raises(ValueError, match=expected):
+            GoogleGenAIDialect(connection, model)
+
+    def test_dialect_requires_the_provider_neutral_http_connection(self) -> None:
+        with pytest.raises(TypeError, match="AsyncHTTPJSONConnection"):
+            GoogleGenAIDialect(object(), "gemini-2.5-flash")
+
+    @pytest.mark.parametrize("convert", ["main", "verification"])
+    @pytest.mark.parametrize(
+        ("build", "expected"),
+        [
+            (lambda: _forced(_chat(), messages=()), "at least one message"),
+            (
+                lambda: _chat(
+                    ChatMessage("user", (TextPart("x"),), name="ada"),
+                ),
+                "no ChatMessage.name",
+            ),
+            (
+                lambda: _chat(
+                    ChatMessage("user", (TextPart("q"),)),
+                    ChatMessage("system", (TextPart("late"),)),
+                ),
+                "must precede conversation turns",
+            ),
+            (
+                lambda: _chat(
+                    ChatMessage("system", (ImagePart(url="u"),)),
+                    ChatMessage("user", (TextPart("q"),)),
+                ),
+                "text-only",
+            ),
+        ],
+    )
+    def test_main_path_and_audit_mirror_reject_the_same_histories(
+        self, convert: str, build: Callable[[], ChatInput], expected: str
+    ) -> None:
+        function = (
+            google_genai._input_to_wire
+            if convert == "main"
+            else google_genai._verification_input_to_wire
+        )
+
+        with pytest.raises(DialectError, match=expected):
+            function(build(), None)
+
+    @pytest.mark.parametrize("convert", ["main", "verification"])
+    def test_non_object_tool_result_is_wrapped_and_error_is_tagged(
+        self, convert: str
+    ) -> None:
+        function = (
+            google_genai._input_to_wire
+            if convert == "main"
+            else google_genai._verification_input_to_wire
+        )
+
+        def lower(result: object, *, is_error: bool = False) -> list[Any]:
+            history = _chat(
+                ChatMessage("user", (TextPart("q"),)),
+                ChatMessage("assistant", (ToolCallPart("c", "f", {}),)),
+                ChatMessage(
+                    "tool", (ToolResultPart("c", cast(Any, result), is_error=is_error),)
+                ),
+            )
+            contents = function(history, None)[1]
+            return cast(list[Any], contents[-1]["parts"][0]["functionResponse"])
+
+        assert lower([1, 2])["response"] == {"result": [1, 2]}  # type: ignore[index]
+        assert lower({"a": 1})["response"] == {"a": 1}  # type: ignore[index]
+        assert lower("boom", is_error=True)["response"] == {"error": "boom"}  # type: ignore[index]
+
+    def test_tool_choice_requires_declared_function_tools(self) -> None:
+        req = _request(tools=ToolParams(choice="required"))
+        audit = RequestAudit(active_request_leaves(req))
+        connection = _connection(lambda _: httpx.Response(200, json=_response()))
+        dialect = GoogleGenAIDialect(connection, "gemini-2.5-flash")
+
+        dialect.validate_request(req, audit, cast(Any, SimpleNamespace()))
+
+        decision = audit.decisions["tools.choice"]
+        assert isinstance(decision, Rejected)
+        assert "requires function tools" in decision.reason
+
+    def test_unsupported_structured_output_format_is_rejected(self) -> None:
+        req = _request(
+            structured_output=_forced(StructuredOutputParams(), format="xml")
+        )
+        audit = RequestAudit(active_request_leaves(req))
+        connection = _connection(lambda _: httpx.Response(200, json=_response()))
+        dialect = GoogleGenAIDialect(connection, "gemini-2.5-flash")
+
+        dialect.validate_request(req, audit, cast(Any, SimpleNamespace()))
+
+        decision = audit.decisions["structured_output.format"]
+        assert isinstance(decision, Rejected)
+        assert "unsupported Google structured output format" in decision.reason
+
+
+class TestAllowedServerToolTypes:
+    @staticmethod
+    def _allowed(*hosted: HostedToolSpec) -> frozenset[str]:
+        return google_genai._allowed_server_tool_types(
+            _request(tools=ToolParams(hosted=hosted))
+        )
+
+    def test_each_hosted_kind_maps_to_its_server_tool_types(self) -> None:
+        assert self._allowed(HostedToolSpec("url_context")) == {"URL_CONTEXT"}
+        assert self._allowed(HostedToolSpec("google_search")) == {"GOOGLE_SEARCH_WEB"}
+        assert self._allowed(
+            HostedToolSpec(
+                "google_search",
+                {"searchTypes": {"webSearch": {}, "imageSearch": {}}},
+            )
+        ) == {"GOOGLE_SEARCH_WEB", "GOOGLE_SEARCH_IMAGE"}
+        assert self._allowed(
+            HostedToolSpec("google_search", {"searchTypes": {"imageSearch": {}}})
+        ) == {"GOOGLE_SEARCH_IMAGE"}
+
+    def test_unrecognized_kind_or_search_types_shape_admits_nothing(self) -> None:
+        assert self._allowed(_forced(HostedToolSpec("google_search"), kind="x")) == (
+            frozenset()
+        )
+        assert (
+            self._allowed(HostedToolSpec("google_search", {"searchTypes": "bad"}))
+            == frozenset()
+        )
+
+
+class TestHostedToolsVerifierShape:
+    @staticmethod
+    def _body(tools: object, *, invoke: bool = True) -> dict[str, Any]:
+        body: dict[str, Any] = {"tools": tools}
+        if invoke:
+            body["toolConfig"] = {"includeServerSideToolInvocations": True}
+        return body
+
+    def _verifier(self, *, has_functions: bool = False) -> Any:
+        return google_genai._HostedToolsVerifier(
+            (HostedToolSpec("google_search"),), has_functions=has_functions
+        )
+
+    def test_exact_hosted_tool_list_verifies(self) -> None:
+        assert self._verifier().verify(self._body([{"googleSearch": {}}])) is None
+
+    @pytest.mark.parametrize(
+        "tools",
+        [
+            [{"googleSearch": {}}, {"urlContext": {}}],  # extra, unrequested tool
+            [{"googleSearch": {}}, {"googleSearch": {}}],  # duplicated tool
+            [],
+            "not-a-sequence",
+        ],
+    )
+    def test_any_deviation_from_the_requested_hosted_tools_is_detected(
+        self, tools: object
+    ) -> None:
+        assert self._verifier().verify(self._body(tools)) == "hosted tools changed"
+
+    def test_function_declarations_must_lead_when_functions_are_requested(
+        self,
+    ) -> None:
+        verifier = self._verifier(has_functions=True)
+        ok = [{"functionDeclarations": [{"name": "f"}]}, {"googleSearch": {}}]
+
+        assert verifier.verify(self._body(ok)) is None
+        for tools in (
+            [{"googleSearch": {}}],
+            [{"googleSearch": {}}, {"functionDeclarations": []}],
+            [{"functionDeclarations": [], "googleSearch": {}}],
+        ):
+            assert verifier.verify(self._body(tools)) == "hosted tools changed"
+
+    def test_non_json_tool_content_never_verifies(self) -> None:
+        assert (
+            self._verifier().verify(self._body([{"googleSearch": {1, 2}}]))
+            == "hosted tools changed"
+        )
+
+    def test_invocation_evidence_must_remain_enabled(self) -> None:
+        assert (
+            self._verifier().verify(self._body([{"googleSearch": {}}], invoke=False))
+            == "hosted-tool invocation evidence was disabled"
+        )
+
+    def test_invalid_requested_config_is_reported(self) -> None:
+        verifier = google_genai._HostedToolsVerifier(
+            (_forced(HostedToolSpec("google_search"), config="bad"),)
+        )
+
+        assert verifier.verify(self._body([])) == "hosted tool config is invalid"
+
+
+class TestStreamDeltaMerging:
+    merge = staticmethod(google_genai._merge_stream_text_delta)
+
+    def test_adjacent_text_deltas_join_into_one_part(self) -> None:
+        assert self.merge({"text": "ab"}, {"text": "cd"}) == {"text": "abcd"}
+
+    @pytest.mark.parametrize(
+        ("previous", "current"),
+        [
+            ("not-a-mapping", {"text": "x"}),
+            ({"text": "x"}, "not-a-mapping"),
+            ({"text": 1}, {"text": "x"}),
+            ({"text": "x"}, {"text": 2}),
+            ({"text": "x"}, {"text": "y", "thought": True}),
+            ({"text": "x", "thoughtSignature": "sig"}, {"text": "y"}),
+            ({"text": "x"}, {"text": "y", "thoughtSignature": ""}),
+            ({"text": "x"}, {"text": "y", "thoughtSignature": 7}),
+            ({"text": "x", "functionCall": {}}, {"text": "y"}),
+        ],
+    )
+    def test_parts_that_are_not_one_semantic_part_stay_separate(
+        self, previous: object, current: object
+    ) -> None:
+        assert self.merge(previous, current) is None
+
+    def test_signature_on_a_later_delta_closes_the_joined_part(self) -> None:
+        assert self.merge({"text": "a"}, {"text": "b", "thoughtSignature": "sig"}) == {
+            "text": "ab",
+            "thoughtSignature": "sig",
         }

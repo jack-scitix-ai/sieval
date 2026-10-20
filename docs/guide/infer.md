@@ -270,6 +270,26 @@ When `finishReason` is `MAX_TOKENS`, partial text is preserved, requested
 channels may be absent, and incomplete JSON is not misreported as a malformed
 structured response; downstream truncation accounting receives the provider's
 finish reason unchanged.
+`CONTINUATION` is handled the same way: Google uses it when the per-request token
+limit is reached with generation unfinished, and returns a `continuationToken`
+that a later request could use to resume. This dialect does not forward or replay
+that token, so the reply is scored as truncated and the raw `finishReason` stays
+on the record. To avoid truncation, raise `max_tokens` rather than expecting
+automatic continuation.
+
+Google reports blocked prompts under `promptFeedback.blockReason` and interrupted
+candidates under `candidate.finishReason`; either can say `SAFETY`. Both retain
+the raw reason and can yield an empty scoreable answer. The dialect also records
+the source in `finish_reason_sources` for each choice: only candidate policy stops
+count toward `n_truncated`, not prompt blocks. Historical records without this
+source cannot distinguish them and remain uncounted for Google policy reasons.
+
+Google's `usageMetadata` lists the addends of `totalTokenCount` (prompt, tool-use
+prompt, thoughts, and response candidates), not the shared record's parent counts.
+The dialect therefore reports `input_tokens` as `promptTokenCount` plus
+`toolUsePromptTokenCount`, and `output_tokens` as `candidatesTokenCount` plus
+`thoughtsTokenCount`, so that `reasoning_tokens` stays a breakdown of
+`output_tokens` and the computed total matches Google's.
 
 Provider-only root controls can be supplied through matching
 `dialect_options`, for example `safetySettings`, `serviceTier`, or `store`.

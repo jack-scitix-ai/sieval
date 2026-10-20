@@ -2903,6 +2903,57 @@ class TestReportTruncation:
         assert report["n_scored_rollouts"] == 3
 
     @pytest.mark.anyio
+    async def test_google_prompt_block_is_not_candidate_truncation_after_resume(
+        self, tmp_path
+    ):
+        class FilteredChatModel(MockChatModel):
+            async def _stub_arun(self, req):
+                response = await super()._stub_arun(req)
+                prompt = prompt_of(req)
+                if prompt == "What is 1+1?":
+                    source = "promptFeedback.blockReason"
+                elif prompt == "What is 2+3?":
+                    source = "candidate.finishReason"
+                else:
+                    return response
+                return replace(
+                    response,
+                    texts=("",),
+                    finish_reasons=("SAFETY",),
+                    finish_reason_sources=(source,),
+                )
+
+        task = GenTask(
+            dataset=MockDataset(),
+            model=FilteredChatModel(answers=DEFAULT_ANSWERS),
+            name="filtered_google",
+        )
+        runner = TaskRunner(task, make_config(tmp_path, detect_anomalies=True))
+        report = await runner.arun()
+        assert report["n_truncated"] == 1
+        assert report["n_scored_rollouts"] == 3
+        anomalies = orjson.loads((runner.root_dir / "anomalies.json").read_bytes())
+        assert anomalies["summary"]["anomaly_sample_details"]["truncated_output"] == 1
+
+        (runner.root_dir / "report.json").unlink()
+        resumed_task = GenTask(
+            dataset=MockDataset(),
+            model=FilteredChatModel(answers=DEFAULT_ANSWERS),
+            name="filtered_google",
+        )
+        resumed = TaskRunner(
+            resumed_task,
+            replace(
+                make_config(tmp_path, detect_anomalies=True),
+                result_dir=str(runner.root_dir),
+                auto_resume=True,
+            ),
+        )
+        reloaded = await resumed.arun()
+        assert reloaded["n_truncated"] == 1
+        assert reloaded["n_scored_rollouts"] == 3
+
+    @pytest.mark.anyio
     async def test_clean_gen_run_reports_zero_not_nothing(self, tmp_path):
         # Present-and-zero is the point: it says the run was measured and no
         # rollout was cut short, which an absent key cannot say.

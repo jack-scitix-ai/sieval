@@ -395,6 +395,24 @@ class TestRequestAudit:
                 cast(Any, type("SneakyPrepared", (), {"verify_prepared": True})())
             )
 
+    def test_verifier_that_loses_verify_after_admission_fails_loudly(self) -> None:
+        """Admission checks ``verify`` once; ``finish`` must not trust it blindly.
+
+        A verifier mutated between ``consumed()`` and ``finish()`` would otherwise
+        surface as an opaque ``TypeError`` from calling ``None``.
+        """
+
+        class Verifier:
+            def verify(self, body: Any) -> str | None:
+                return None
+
+        audit = RequestAudit({"scheduling.stream": True})
+        audit.consumed("scheduling.stream", Verifier())
+        Verifier.verify = cast(Any, None)
+
+        with pytest.raises(AssertionError, match=r"lost its verify\(\) method"):
+            audit.finish(PreparedRequest("op", {"stream": True}))
+
     def test_passthrough_destination_and_value_are_verified(self):
         audit = RequestAudit({"dialect_options.min_p": 0.1})
         audit.passthrough("dialect_options.min_p", "extra_body")

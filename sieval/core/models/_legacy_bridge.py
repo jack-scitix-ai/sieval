@@ -77,6 +77,7 @@ class ModelCallMeta(TypedDict):
     usage: NotRequired[ModelUsage]
     request_params: NotRequired[dict[str, JSONValue]]
     finish_reasons: NotRequired[list[str]]
+    finish_reason_sources: NotRequired[list[str]]
     response_model: NotRequired[str]
     system_fingerprint: NotRequired[str | None]
 
@@ -101,6 +102,7 @@ class ModelOutput:
     request_params: dict[str, JSONValue] | None = None
     response_model: str | None = None
     system_fingerprint: str | None = None
+    finish_reason_sources: list[str] | None = None
 
 
 def _optional_float(value: object, name: str) -> float | None:
@@ -473,6 +475,11 @@ def response_to_model_output(model_meta: ModelMeta, response: Response) -> Model
         finish_reasons=(
             list(response.finish_reasons)
             if response.finish_reasons is not None
+            else None
+        ),
+        finish_reason_sources=(
+            list(response.finish_reason_sources)
+            if response.finish_reason_sources is not None
             else None
         ),
         reasoning_texts=reasoning_texts,

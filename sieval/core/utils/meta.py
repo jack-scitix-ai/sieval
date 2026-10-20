@@ -10,28 +10,58 @@ from sieval.core.models import ModelCallMeta, ModelOutput
 from sieval.core.tasks.consts import TaskStage
 from sieval.core.tasks.context import TaskStageMeta
 
-#: Finish reasons that mean the generation stopped before the model chose to.
+#: Finish reasons for candidate generation interrupted by a limit or filter.
 #:
 #: Every spelling, not one canonical name: the IR does not normalize these, so a
 #: set holding only ``length`` (OpenAI-compatible Chat/Completions and SGLang
 #: native) would read zero against ``max_output_tokens`` (OpenAI Responses),
 #: ``max_tokens`` or ``model_context_window_exceeded`` (Anthropic), or
 #: ``MAX_TOKENS`` or ``CONTINUATION`` (Google generateContent).
-#: ``content_filter`` is in because the output is cut short the same way;
-#: separating causes is what the raw ``finish_reasons`` are for. Shared with
-#: :func:`sieval.core.tasks.anomaly.detect_truncated_output` so the rule and the
-#: report key cannot drift apart.
-TRUNCATION_FINISH_REASONS = frozenset(
+#: ``content_filter`` and Google's candidate policy stops also count: the output
+#: was interrupted, although raising ``max_tokens`` would not fix filtering.
+#: Google's promptFeedback reasons can use the same spelling; their source must
+#: be checked before counting. Shared by live anomaly and persisted report paths.
+_GOOGLE_POLICY_FINISH_REASONS = frozenset(
     {
-        "length",
-        "max_output_tokens",
-        "max_tokens",
-        "model_context_window_exceeded",
-        "MAX_TOKENS",
-        "CONTINUATION",
-        "content_filter",
+        "SAFETY",
+        "RECITATION",
+        "BLOCKLIST",
+        "PROHIBITED_CONTENT",
+        "SPII",
+        "IMAGE_SAFETY",
+        "IMAGE_PROHIBITED_CONTENT",
+        "IMAGE_RECITATION",
+        "ESCALATION",
     }
 )
+TRUNCATION_FINISH_REASONS = (
+    frozenset(
+        {
+            "length",
+            "max_output_tokens",
+            "max_tokens",
+            "model_context_window_exceeded",
+            "MAX_TOKENS",
+            "CONTINUATION",
+            "content_filter",
+        }
+    )
+    | _GOOGLE_POLICY_FINISH_REASONS
+)
+
+
+def is_truncated_finish_reason(reason: str, source: str | None = None) -> bool:
+    """Never count prompt blocks; count Google policy stops only for candidates.
+
+    An old record with no source cannot disambiguate ``SAFETY`` and is left
+    uncounted rather than being misclassified on replay.
+    """
+    if source == "promptFeedback.blockReason":
+        return False
+    return reason in TRUNCATION_FINISH_REASONS and (
+        reason not in _GOOGLE_POLICY_FINISH_REASONS
+        or source == "candidate.finishReason"
+    )
 
 
 def build_model_call_meta(output: ModelOutput) -> ModelCallMeta:
@@ -43,6 +73,8 @@ def build_model_call_meta(output: ModelOutput) -> ModelCallMeta:
         model_call["request_params"] = dict(output.request_params)
     if output.finish_reasons:
         model_call["finish_reasons"] = output.finish_reasons
+    if output.finish_reason_sources is not None:
+        model_call["finish_reason_sources"] = list(output.finish_reason_sources)
     if output.response_model is not None:
         model_call["response_model"] = output.response_model
     if output.system_fingerprint is not None:
@@ -74,6 +106,9 @@ def build_model_call_meta_from_mapping(data: Mapping) -> ModelCallMeta | None:
     finish_reasons = data.get("finish_reasons")
     if finish_reasons:
         call["finish_reasons"] = list(finish_reasons)
+    finish_reason_sources = data.get("finish_reason_sources")
+    if finish_reason_sources is not None:
+        call["finish_reason_sources"] = list(finish_reason_sources)
     for key in ("response_model", "system_fingerprint"):
         value = data.get(key)
         if value is not None:
@@ -192,9 +227,11 @@ def _scored_rollout_indices(
     scored: set[int] = set()
     truncated: set[int] = set()
     for call in entries[-1].get("model_calls") or ():
+        sources = call.get("finish_reason_sources") or ()
         for index, reason in enumerate(call.get("finish_reasons") or ()):
             scored.add(index)
-            if reason in TRUNCATION_FINISH_REASONS:
+            source = sources[index] if index < len(sources) else None
+            if is_truncated_finish_reason(reason, source):
                 truncated.add(index)
     return scored, truncated
 
@@ -202,11 +239,11 @@ def _scored_rollout_indices(
 def count_truncated_rollouts(
     stage_metas: Iterable[Mapping[str, list]],
 ) -> int | None:
-    """Rollouts whose generation was cut short, over a report's scored records.
+    """Rollouts whose candidate output was interrupted, over scored records.
 
-    A truncated rollout scores as wrong without the model being wrong -- it ran
-    out of budget mid-answer, and the fix is ``max_tokens``. Reported so a score
-    a truncation rate explains is distinguishable from one capability explains.
+    A token limit and an output filter can both end generation prematurely;
+    only the former is addressed by increasing ``max_tokens``. Raw finish reasons
+    retain the cause, and Google prompt blocks are not candidate interruptions.
 
     Counted per rollout, not per sample -- one truncated draw in four is a
     different fact from four (RFC #74 C) -- and deduplicated by rollout index, so

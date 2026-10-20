@@ -182,6 +182,32 @@ class TestDetectEmptyInferPpl:
 
 
 class TestDetectTruncatedOutput:
+    def test_prompt_block_is_never_output_truncation(self, sample_model_meta):
+        output = ModelOutput(
+            model=sample_model_meta,
+            texts=[""],
+            finish_reasons=["content_filter"],
+            finish_reason_sources=["promptFeedback.blockReason"],
+        )
+        assert detect_truncated_output(_make_final_ctx(infer_result=output)) == set()
+
+    def test_google_candidate_filter_not_prompt_block(self, sample_model_meta):
+        for source, expected in (
+            ("candidate.finishReason", {0}),
+            ("promptFeedback.blockReason", set()),
+            (None, set()),
+        ):
+            output = ModelOutput(
+                model=sample_model_meta,
+                texts=[""],
+                finish_reasons=["SAFETY"],
+                finish_reason_sources=[source] if source is not None else None,
+            )
+            assert (
+                detect_truncated_output(_make_final_ctx(infer_result=output))
+                == expected
+            )
+
     def test_single_sample(self, sample_model_meta):
         """Single-sample (n=1) finish reason variants."""
         cases = [
@@ -950,13 +976,12 @@ class TestRulesHashStability:
         value here in the same commit, so the rotation is in the diff rather than
         discovered in production.
 
-        Rotated once here, deliberately: `empty_infer_ppl` was inert for every ppl
-        task, and repairing it has to reach the runs already on disk. Its
-        description now says "any candidate's" — the accurate reading, and what
-        moves this hash. Without that, `needs_regeneration()` returns False and
-        every stored report keeps the dead rule's verdict.
+        Rotated to cover two deliberate changes: `empty_infer_ppl` now reads
+        every candidate, and `truncated_output` now counts filtered candidates
+        without misclassifying blocked prompts. Both changes must reach reports
+        already on disk; without a new hash, `needs_regeneration()` returns False.
         """
-        assert get_rules_hash() == "56480a99ae65a3c0"
+        assert get_rules_hash() == "1d61bae98de6f417"
 
     def test_the_rule_set_is_the_expected_size(self):
         # Guards the other direction: a rule silently dropped from the registry

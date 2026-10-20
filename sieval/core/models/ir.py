@@ -514,6 +514,7 @@ _CORE = {"response_role": "core", "choice_indexed": True}
 _CHOICE_CHANNEL = {"response_role": "channel", "choice_indexed": True}
 _SINGULAR_CHANNEL = {"response_role": "channel", "choice_indexed": False}
 _PROVENANCE = {"response_role": "provenance", "choice_indexed": False}
+_CHOICE_PROVENANCE = {"response_role": "provenance", "choice_indexed": True}
 
 
 @sieval_record
@@ -560,6 +561,9 @@ class Response:
     response_model: str | None = field(default=None, metadata=_PROVENANCE)
     system_fingerprint: str | None = field(default=None, metadata=_PROVENANCE)
     provenance: ModelProvenance | None = field(default=None, metadata=_PROVENANCE)
+    finish_reason_sources: tuple[str, ...] | None = field(
+        default=None, metadata=_CHOICE_PROVENANCE
+    )
 
     def __post_init__(self) -> None:
         if self.request_params is not None:
@@ -570,6 +574,13 @@ class Response:
             self.texts
         ):
             raise ValueError("Response.finish_reasons must align with Response.texts")
+        if self.finish_reason_sources is not None and (
+            self.finish_reasons is None
+            or len(self.finish_reason_sources) != len(self.finish_reasons)
+        ):
+            raise ValueError(
+                "Response.finish_reason_sources must align with Response.finish_reasons"
+            )
 
 
 def response_field_contract() -> dict[str, tuple[str, bool]]:
