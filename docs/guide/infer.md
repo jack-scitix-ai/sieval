@@ -117,6 +117,67 @@ Replace the placeholder above through your configuration/secret-management
 workflow; omit `api_key` only when the target endpoint does not require
 authentication.
 
+### Google GenAI
+
+To call the native Gemini `generateContent` REST API, select the dialect
+explicitly and provide the Google AI endpoint and API key:
+
+```yaml
+models:
+  gemini:
+    name: gemini-3.8-flash
+    type: chat
+    dialect: google_genai
+    api_base: https://generativelanguage.googleapis.com
+    api_key: "<your Gemini API key>"
+```
+
+The model name may be `gemini-...` or `models/gemini-...`. An endpoint root
+uses `v1beta`; an explicit `/v1` or `/v1beta` suffix selects that version, and
+gateway path prefixes are preserved. The key is sent only in the
+`x-goog-api-key` header. Vertex AI resource paths and OAuth are not supported.
+
+Supported: text and image input, function tools, the `google_search` and
+`url_context` hosted tools, JSON output, thinking controls, logprobs,
+streaming, request seeds, and opaque continuation. Ordinary YAML bindings do
+not yet supply Google model-profile outcomes, so model-dependent capabilities
+(images, reasoning, tools, structured output, logprobs, opaque continuation)
+currently fail reconciliation with `model_outcome_missing`; plain text
+generation, streaming, seeds, and `dialect_options` work today.
+
+Rejected before any network I/O:
+
+- per-image `detail`, assistant prefill, input scoring,
+  `previous_response_id`, and `developer` messages (Google has no such role);
+- on `v1`, function schemas using constructs outside Google's OpenAPI subset
+  (`additionalProperties`, `$ref`, type arrays, numeric enums) — use `/v1beta`;
+  on both versions, a function needs a non-empty description and an explicit
+  `type: object` parameter root;
+- Gemini model-family limits, matched on the model name: on Gemini 3,
+  `sampling.n > 1`, explicit `temperature`/`top_p`/`top_k`, and
+  `reasoning.effort` values outside the model's
+  [thinking-level table](https://ai.google.dev/gemini-api/docs/generate-content/thinking);
+  on Gemini 2.5, `reasoning.effort` and out-of-range `reasoning.budget_tokens`;
+  on Gemini 1.x/2.x, mixing function tools with hosted tools. A gateway alias
+  that does not start with `gemini-` skips these checks.
+
+Provider-only root controls such as `safetySettings`, `serviceTier`, or `store`
+go through `dialect_options` (`cachedContent` and `labels` are `v1beta`-only).
+They cannot override `contents`, `generationConfig`, `tools`, `model`, or
+`stream`, and there is no HTTP-header passthrough.
+
+Accounting:
+
+- `MAX_TOKENS` and `CONTINUATION` keep the partial text and count toward
+  `n_truncated`. The dialect does not replay `continuationToken`; raise
+  `max_tokens` instead.
+- Candidate policy stops (`SAFETY`, `RECITATION`, …) count toward
+  `n_truncated`; a prompt blocked under `promptFeedback.blockReason` does not.
+  Both keep the raw reason, and `finish_reason_sources` records which it was.
+- `input_tokens` is `promptTokenCount + toolUsePromptTokenCount` and
+  `output_tokens` is `candidatesTokenCount + thoughtsTokenCount`, so
+  `reasoning_tokens` stays a breakdown of `output_tokens`.
+
 ## Environment Variables
 
 Custom environment variables can be passed through the YAML config's `infer.env` section. Values are injected into the inference engine process.

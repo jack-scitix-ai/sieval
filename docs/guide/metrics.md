@@ -509,12 +509,22 @@ at **every** budget, `n = 1` included, and by the single-draw tasks below that
 have no `n` at all. It measures the parser, not the draw, and `n = 1` is where a
 silently-stopped extractor survives longest: no second rollout to disagree with.
 
-`n_truncated` — **rollouts** whose generation stopped because it ran out of
-tokens rather than because the model was done — and `n_scored_rollouts`, the
-rollouts scored in total, are reported by **every `gen` task**, on the same terms
-as `n_unextracted`: they describe the generation rather than the draw, so neither
-is confined to `n > 1`. Unlike every other key here the *runner* injects them, so
-a task cannot report zero truncation by having forgotten to look.
+`n_truncated` — **rollouts** whose output was interrupted before completion,
+either by a token/context limit, output filtering, or refusal — and
+`n_scored_rollouts`, the rollouts scored in total, are reported by **every `gen`
+task**, on the same terms as `n_unextracted`: they describe the generation rather
+than the draw, so neither is confined to `n > 1`. Unlike every other key here
+the *runner* injects them, so a task cannot report zero truncation by having
+forgotten to look.
+
+What counts: token/context-limit stops (`length`, `max_tokens`,
+`max_output_tokens`, `model_context_window_exceeded`, Google `MAX_TOKENS` /
+`CONTINUATION`), OpenAI `content_filter`, Anthropic `refusal`, and Google
+candidate policy stops (`SAFETY`, `RECITATION`, `LANGUAGE`, …). A Google prompt
+block (`promptFeedback.blockReason`) does not count — no candidate was
+generated — and older Google records that lack `finish_reason_sources` cannot
+tell the two apart, so their policy stops are left uncounted. A Chat
+`message.refusal` without a `content_filter` finish reason is not counted.
 
 They arrive as a **pair or not at all**. The count alone says nothing about how
 much of a score it explains — `26` is a different fact at 600 rollouts than at 30
@@ -532,14 +542,11 @@ finals without per-stage metadata and a `0` would claim a clean run rather than 
 unmeasured one. `sieval_versions` reports that state in band as `"unknown"`; a
 count has no such value.
 
-Read `n_truncated` as a **bound on how much of a score is budget, not
-capability** — a truncated rollout is scored wrong whether or not the model was
-on its way to the right answer, and the fix is `max_tokens`. It is independent of
-`n_unextracted`: an answer can be cut short and still parse (the truncation lands
-after the boxed answer), or parse cleanly and be wrong for reasons of its own.
-The two are worth reading together only in the direction where they coincide — a
-rollout that is both truncated *and* unextracted is the case where raising the
-budget is most likely to move the score.
+Read `n_truncated` as a count of interrupted outputs, **not** a budget-only
+diagnosis: raising `max_tokens` fixes only the token-limit stops, and the raw
+`finish_reasons` say which kind each was. It is independent of `n_unextracted` —
+an interrupted answer can still parse when the stop lands after the boxed
+answer — so when both occur, check the stop reason before changing the budget.
 
 ### Pairs that must be read together
 

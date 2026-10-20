@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, fields
 from enum import StrEnum
-from typing import Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from sieval.core.types import JSONValue
 
@@ -34,6 +34,9 @@ from .ir import (
     TopKEntry,
     response_field_contract,
 )
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 
 class DialectError(ValueError):
@@ -74,7 +77,31 @@ class WireVerifier(Protocol):
     def verify(self, body: Mapping[str, JSONValue]) -> str | None: ...
 
 
-type WireEvidence = WireObservation | WireVerifier
+class PreparedRequestVerifier(Protocol):
+    """Independently verify request evidence outside the JSON body."""
+
+    def verify_prepared(self, prepared: "PreparedRequest") -> str | None: ...
+
+
+@dataclass(frozen=True)
+class PreparedRequestEvidence:
+    """Opt a verifier into checking the whole prepared request, not just the body.
+
+    An explicit wrapper, so a ``WireVerifier`` never switches path by happening
+    to have a ``verify_prepared`` method.
+    """
+
+    verifier: PreparedRequestVerifier
+
+    def __post_init__(self) -> None:
+        if not callable(getattr(self.verifier, "verify_prepared", None)):
+            raise TypeError(
+                "PreparedRequestEvidence.verifier must provide callable "
+                "verify_prepared()"
+            )
+
+
+type WireEvidence = WireObservation | WireVerifier | PreparedRequestEvidence
 
 
 @dataclass(frozen=True)
@@ -220,7 +247,7 @@ def active_request_leaves(req: Request) -> dict[str, object]:
     """Return exact active semantic leaf paths for one concrete request."""
 
     active = _input_leaves(req)
-    grouped = {
+    grouped: dict[str, DataclassInstance] = {
         "sampling": req.sampling,
         "scoring": req.scoring,
         "reasoning": req.reasoning,
@@ -309,11 +336,14 @@ class RequestAudit:
             raise RequestAuditError(
                 f"consumed request leaf {path!r} requires wire evidence"
             )
-        if not all(
-            isinstance(evidence, (WireObservation, WireVerifier))
-            for evidence in wire_evidence
-        ):
-            raise TypeError("wire evidence must be WireObservation or WireVerifier")
+        for evidence in wire_evidence:
+            if isinstance(evidence, WireObservation | PreparedRequestEvidence):
+                continue
+            if not callable(getattr(evidence, "verify", None)):
+                raise TypeError(
+                    "wire evidence must be WireObservation, a verifier with "
+                    "callable verify(), or PreparedRequestEvidence"
+                )
         self._record(path, Consumed(path, tuple(wire_evidence)))
 
     def rejected(self, path: str, reason: str) -> None:
@@ -344,7 +374,7 @@ class RequestAudit:
                 "unaccounted request leaves: " + ", ".join(sorted(missing))
             )
 
-        verified: set[int] = set()
+        verified: set[tuple[str, int]] = set()
         for path, decision in self._decisions.items():
             if isinstance(decision, Consumed):
                 evidence_items = decision.wire_evidence
@@ -378,20 +408,39 @@ class RequestAudit:
                         )
                     continue
 
-                verifier_id = id(evidence)
+                verifier = (
+                    evidence.verifier
+                    if isinstance(evidence, PreparedRequestEvidence)
+                    else evidence
+                )
+                verifier_id = (
+                    "prepared"
+                    if isinstance(evidence, PreparedRequestEvidence)
+                    else "body",
+                    id(verifier),
+                )
                 if verifier_id in verified:
                     continue
                 verified.add(verifier_id)
-                mismatch = evidence.verify(prepared.body)
+                if isinstance(evidence, PreparedRequestEvidence):
+                    mismatch = evidence.verifier.verify_prepared(prepared)
+                else:
+                    verify = getattr(evidence, "verify", None)
+                    if not callable(verify):
+                        raise AssertionError(
+                            "admitted wire verifier lost its verify() method"
+                        )
+                    mismatch = verify(prepared.body)
                 if mismatch is not None and (
                     not isinstance(mismatch, str) or not mismatch.strip()
                 ):
                     raise TypeError(
-                        "WireVerifier.verify() must return None or a non-empty string"
+                        "request evidence verifier must return None or a non-empty "
+                        "string"
                     )
                 if mismatch is not None:
                     raise RequestAuditError(
-                        f"prepared wire mismatch for {path!r}: {mismatch}"
+                        f"prepared request evidence mismatch for {path!r}: {mismatch}"
                     )
 
 
@@ -606,9 +655,21 @@ class OutputRule:
 @dataclass(frozen=True)
 class OutputContract:
     rules: Mapping[str, OutputRule]
+    empty_outcome_finish_reasons: frozenset[str] = frozenset({"refusal"})
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "rules", dict(self.rules))
+        empty_outcome_finish_reasons = frozenset(self.empty_outcome_finish_reasons)
+        if not empty_outcome_finish_reasons or any(
+            not isinstance(reason, str) or not reason
+            for reason in empty_outcome_finish_reasons
+        ):
+            raise ValueError("empty-outcome finish reasons must be non-empty strings")
+        object.__setattr__(
+            self,
+            "empty_outcome_finish_reasons",
+            empty_outcome_finish_reasons,
+        )
         channels = {
             name
             for name, (role, _) in response_field_contract().items()
@@ -628,16 +689,18 @@ class OutputContract:
         # response channels this particular call must return.
         required = set(required_response_channels(req))
         finish_reasons = response.finish_reasons
-        refused = (
+        empty_outcome = (
             finish_reasons is not None
             and bool(finish_reasons)
-            and all(reason == "refusal" for reason in finish_reasons)
+            and all(
+                reason in self.empty_outcome_finish_reasons for reason in finish_reasons
+            )
         )
         for name, rule in self.rules.items():
             value = getattr(response, name)
             if rule.guarantee is Guarantee.NEVER and value is not None:
                 raise OutputContractError(f"dialect promised {name!r} would be absent")
-            if name in required and not refused:
+            if name in required and not empty_outcome:
                 if rule.guarantee is not Guarantee.PRESENT_OR_ERROR:
                     raise OutputContractError(
                         f"{name!r} is required but has {rule.guarantee.value} guarantee"
@@ -649,7 +712,7 @@ class OutputContract:
             if value is not None:
                 rule.validator(value)
 
-        if req.session.opaque_continuation is not None and not refused:
+        if req.session.opaque_continuation is not None and not empty_outcome:
             reasoning = response.reasoning
             if reasoning is None or any(
                 item is None

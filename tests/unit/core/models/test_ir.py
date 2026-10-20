@@ -338,6 +338,7 @@ class TestResponseContract:
         assert contract["reasoning"] == ("channel", True)
         assert contract["input_scoring"] == ("channel", False)
         assert contract["provenance"] == ("provenance", False)
+        assert contract["finish_reason_sources"] == ("provenance", True)
 
     def test_reasoning_must_align_with_choices(self):
         with pytest.raises(ValueError, match="reasoning must align"):
@@ -346,6 +347,16 @@ class TestResponseContract:
     def test_finish_reasons_must_align_with_choices(self):
         with pytest.raises(ValueError, match="finish_reasons must align"):
             Response(texts=("a", "b"), finish_reasons=("stop",))
+
+    def test_finish_reason_sources_must_align_with_reasons(self):
+        with pytest.raises(ValueError, match="finish_reason_sources must align"):
+            Response(texts=("a",), finish_reason_sources=("candidate.finishReason",))
+        with pytest.raises(ValueError, match="finish_reason_sources must align"):
+            Response(
+                texts=("a", "b"),
+                finish_reasons=("SAFETY", "STOP"),
+                finish_reason_sources=("candidate.finishReason",),
+            )
 
     def test_optional_usage_absence_differs_from_zero_usage(self):
         assert Response(texts=("x",)).usage is None
@@ -391,6 +402,21 @@ class TestSerializationRoundTrip:
         back = dict_to_obj(obj_to_dict(response, add_type=True), global_type_registry)
         assert isinstance(back, Response)
         return back
+
+    def test_finish_reason_source_survives_reload_and_old_records_default(self):
+        response = Response(
+            texts=("",),
+            finish_reasons=("SAFETY",),
+            finish_reason_sources=("promptFeedback.blockReason",),
+        )
+        persisted = obj_to_dict(response, add_type=True)
+        assert self._round_trip(response).finish_reason_sources == (
+            "promptFeedback.blockReason",
+        )
+        persisted.pop("finish_reason_sources")
+        restored = dict_to_obj(persisted, global_type_registry)
+        assert isinstance(restored, Response)
+        assert restored.finish_reason_sources is None
 
     def test_choice_indexed_reasoning_and_usage_rehydrate(self):
         back = self._round_trip(

@@ -20,6 +20,17 @@ from sieval.core.utils.meta import (
 
 
 class TestBuildModelCallMeta:
+    def test_finish_reason_sources_survive_metadata_round_trip(self, sample_model_meta):
+        output = ModelOutput(
+            model=sample_model_meta,
+            texts=[""],
+            finish_reasons=["SAFETY"],
+            finish_reason_sources=["candidate.finishReason"],
+        )
+        meta = build_model_call_meta(output)
+        assert meta["finish_reason_sources"] == ["candidate.finishReason"]
+        assert build_model_call_meta_from_mapping({**meta, "texts": [""]}) == meta
+
     def test_full_output(self, sample_model_output):
         meta = build_model_call_meta(sample_model_output)
         assert meta["model"] == sample_model_output.model
@@ -265,7 +276,7 @@ def _inferred(*calls: dict) -> dict:
 
 
 class TestCountTruncatedRollouts:
-    """The report-level count of rollouts that ran out of budget.
+    """The report-level count of rollouts whose output was interrupted.
 
     Semantics are pinned against `detect_truncated_output`, which reduces the
     same event off the live output rather than the persisted meta: the two must
@@ -307,19 +318,101 @@ class TestCountTruncatedRollouts:
     def test_every_provider_spelling_counts(self):
         # The IR keeps finish_reasons provider-verbatim: OpenAI-compatible
         # Chat/Completions and SGLang native say `length`, Responses says
-        # `max_output_tokens`, and Anthropic says either `max_tokens` or
-        # `model_context_window_exceeded`. A set holding only one spelling would
-        # silently read zero on another provider.
+        # `max_output_tokens`, Anthropic says `max_tokens` or
+        # `model_context_window_exceeded`, and Google says `MAX_TOKENS` or
+        # `CONTINUATION`. A set holding only one spelling would silently read
+        # zero on another provider.
         for reason in (
             "length",
             "max_output_tokens",
             "max_tokens",
             "model_context_window_exceeded",
+            "MAX_TOKENS",
+            "CONTINUATION",
             "content_filter",
+            "refusal",
         ):
             assert (
                 count_truncated_rollouts([_inferred({"finish_reasons": [reason]})]) == 1
             )
+
+    def test_anthropic_refusal_and_natural_stop(self):
+        calls = _inferred({"finish_reasons": ["refusal", "end_turn"]})
+        assert count_truncated_rollouts([calls]) == 1
+        assert count_scored_rollouts([calls]) == 2
+
+    def test_google_policy_counts_only_candidate_stops(self):
+        reasons = (
+            "SAFETY",
+            "RECITATION",
+            "LANGUAGE",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "IMAGE_SAFETY",
+            "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_RECITATION",
+            "ESCALATION",
+        )
+        for reason in reasons:
+            candidate = _inferred(
+                {
+                    "finish_reasons": [reason],
+                    "finish_reason_sources": ["candidate.finishReason"],
+                }
+            )
+            prompt = _inferred(
+                {
+                    "finish_reasons": [reason],
+                    "finish_reason_sources": ["promptFeedback.blockReason"],
+                }
+            )
+            assert count_truncated_rollouts([candidate]) == 1
+            assert count_truncated_rollouts([prompt]) == 0
+            assert (
+                count_truncated_rollouts([_inferred({"finish_reasons": [reason]})]) == 0
+            )
+
+    def test_prompt_feedback_with_repeated_choices_is_not_truncation(self):
+        blocked = _inferred(
+            {
+                "finish_reasons": ["SAFETY", "SAFETY"],
+                "finish_reason_sources": ["promptFeedback.blockReason"] * 2,
+            }
+        )
+        assert count_truncated_rollouts([blocked]) == 0
+        assert count_scored_rollouts([blocked]) == 2
+
+    def test_prompt_feedback_source_takes_priority_over_stop_spelling(self):
+        for reason in ("MAX_TOKENS", "content_filter"):
+            blocked = _inferred(
+                {
+                    "finish_reasons": [reason],
+                    "finish_reason_sources": ["promptFeedback.blockReason"],
+                }
+            )
+            assert count_truncated_rollouts([blocked]) == 0
+
+    def test_google_multi_candidate_counts_only_filtered_candidates(self):
+        assert (
+            count_truncated_rollouts(
+                [
+                    _inferred(
+                        {
+                            "finish_reasons": ["STOP", "SAFETY", "STOP"],
+                            "finish_reason_sources": ["candidate.finishReason"] * 3,
+                        }
+                    )
+                ]
+            )
+            == 1
+        )
+
+    def test_budget_limit_counts_without_source(self):
+        assert (
+            count_truncated_rollouts([_inferred({"finish_reasons": ["MAX_TOKENS"]})])
+            == 1
+        )
 
     def test_same_rollout_truncated_on_two_turns_counts_once(self):
         # A multi-turn stage makes several calls per rollout. Rollout 0 hit the

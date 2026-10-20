@@ -17,7 +17,7 @@ from loguru import logger
 from sieval.core.models import ModelOutput
 from sieval.core.tasks.context import TaskContext, TaskStage, TaskStageOutput
 from sieval.core.tasks.records import is_prediction_record
-from sieval.core.utils.meta import TRUNCATION_FINISH_REASONS
+from sieval.core.utils.meta import is_truncated_finish_reason
 
 
 # Schema
@@ -471,31 +471,32 @@ def detect_empty_infer_ppl(ctx: TaskContext) -> set[int]:
 
 
 @sieval_detection_rule(
-    description="Output was truncated due to length limit",
+    description="Output was interrupted before completion",
     category="output_quality",
     rationale=(
-        "Truncated outputs may indicate insufficient max_tokens setting "
-        "or unexpectedly long responses. Scoped to gen: single-token logprob "
+        "A token limit, output filter, or refusal cut the output short; only "
+        "a token limit is fixed by raising max_tokens. Scoped to gen: "
+        "single-token logprob "
         "tasks (ppl/clp) infer with max_tokens=1 and always finish with "
         "'length', so the signal is only meaningful for generation."
     ),
     severity="info",
     applies_to=["gen"],
-    tags=["truncation", "length_limit", "incomplete_output"],
+    tags=["truncation", "length_limit", "output_filter", "incomplete_output"],
 )
 def detect_truncated_output(ctx: TaskContext) -> set[int]:
     if ctx.infer_result is None:
         return set()
-    # Unioned across calls: a conversation whose second turn hit the cap has that
-    # rollout truncated, whichever turn did it. The reason set is shared with the
-    # `n_truncated` report key -- which reduces the same event off the persisted
-    # `finish_reasons` rather than the live output -- so the two cannot drift.
-    return {
-        i
-        for output in _model_outputs(_unwrap_result(ctx.infer_result))
-        for i, reason in enumerate(output.finish_reasons or ())
-        if reason in TRUNCATION_FINISH_REASONS
-    }
+    # Unioned across calls: whichever turn was cut short, the rollout was. The
+    # predicate is shared with the `n_truncated` report key so the two cannot drift.
+    truncated: set[int] = set()
+    for output in _model_outputs(_unwrap_result(ctx.infer_result)):
+        sources = output.finish_reason_sources or ()
+        for index, reason in enumerate(output.finish_reasons or ()):
+            source = sources[index] if index < len(sources) else None
+            if is_truncated_finish_reason(reason, source):
+                truncated.add(index)
+    return truncated
 
 
 @sieval_detection_rule(

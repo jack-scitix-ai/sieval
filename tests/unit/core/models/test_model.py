@@ -55,6 +55,11 @@ from sieval.core.models.model import (
     _validate_provenance_plan,
 )
 from sieval.core.models.reconcile import CheckStage, DeferredCheck, RuntimeBindingPlan
+from sieval.core.utils.serialization import (
+    dict_to_obj,
+    global_type_registry,
+    obj_to_dict,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +811,40 @@ class TestModelUnique:
 # Response metadata
 # ===================================================================
 class TestModelOutputResponseMetadata:
+    def test_finish_reason_sources_survive_record_reload(self):
+        output = ModelOutput(
+            model={"model": "gemini", "api_base": None, "default_params": {}},
+            texts=[""],
+            finish_reasons=["SAFETY"],
+            finish_reason_sources=["candidate.finishReason"],
+        )
+        persisted = obj_to_dict(output, add_type=True)
+        restored = dict_to_obj(persisted, global_type_registry)
+        assert isinstance(restored, ModelOutput)
+        assert restored.finish_reason_sources == ["candidate.finishReason"]
+
+        persisted.pop("finish_reason_sources")
+        historical = dict_to_obj(persisted, global_type_registry)
+        assert isinstance(historical, ModelOutput)
+        assert historical.finish_reason_sources is None
+
+    def test_finish_reason_sources_survive_legacy_bridge(self):
+        response = Response(
+            texts=("", ""),
+            finish_reasons=("SAFETY", "STOP"),
+            finish_reason_sources=(
+                "promptFeedback.blockReason",
+                "candidate.finishReason",
+            ),
+        )
+        output = response_to_model_output(
+            {"model": "gemini", "api_base": None, "default_params": {}}, response
+        )
+        assert output.finish_reason_sources == [
+            "promptFeedback.blockReason",
+            "candidate.finishReason",
+        ]
+
     def test_model_output_response_metadata_defaults(self):
         """New response metadata fields default to None."""
         output = ModelOutput(

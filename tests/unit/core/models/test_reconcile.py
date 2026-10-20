@@ -1277,6 +1277,57 @@ class TestServingJoin:
 
 
 class TestRuntimePlanAndBinding:
+    @pytest.mark.parametrize("use_endpoints", [False, True])
+    def test_google_api_versions_have_distinct_stable_runtime_fingerprints(
+        self, use_endpoints: bool
+    ) -> None:
+        binding = dataclasses.replace(
+            _binding(dialect_id="google_genai"), requested_model_id="gemini-2.5-flash"
+        )
+        plans: dict[str, RuntimeBindingPlan] = {}
+        for version in ("v1", "v1beta"):
+            endpoint = f"https://generativelanguage.googleapis.com/{version}"
+            snapshots: list[RuntimeBindingPlan] = []
+            for _ in range(2):
+                deployment = Deployment(
+                    deployment_id=None,
+                    plan=None,
+                    engine=Engine("unknown"),
+                    engine_source="unknown",
+                    api_base="" if use_endpoints else endpoint,
+                    endpoints={"default": endpoint} if use_endpoints else {},
+                    topology=None,
+                    metrics_url=None,
+                    facts=ServingFacts(),
+                )
+                result = reconcile(
+                    _batch(
+                        binding,
+                        deployment=DeploymentReconcileInput(
+                            root_deployment_key="root",
+                            engine_id="unknown",
+                            deployment=deployment,
+                        ),
+                    )
+                )
+                assert result.is_valid, result.diagnostics
+                plan = result.runtime_plans[binding.binding_id]
+                assert plan.connection_identity.endpoint == endpoint
+                snapshots.append(plan)
+            # Equivalent reconstruction is stable, including serialized evidence.
+            assert json.dumps(
+                snapshots[0].to_json_value(), sort_keys=True
+            ) == json.dumps(snapshots[1].to_json_value(), sort_keys=True)
+            plans[version] = snapshots[0]
+
+        v1, beta = plans["v1"], plans["v1beta"]
+        # The pre-deployment capability plan has no endpoint yet.
+        assert v1.binding_plan_fingerprint == beta.binding_plan_fingerprint
+        assert v1.deployment_fingerprint != beta.deployment_fingerprint
+        assert v1.resolved_route.fingerprint != beta.resolved_route.fingerprint
+        assert v1.fingerprint != beta.fingerprint
+        assert v1.verification_fingerprint != beta.verification_fingerprint
+
     def test_external_deployment_without_plan_or_id_reconciles_and_binds(self) -> None:
         deployment = Deployment(
             deployment_id=None,
