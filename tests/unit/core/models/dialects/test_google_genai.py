@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 import pytest
@@ -41,6 +41,7 @@ from sieval.core.models.dialects.google_genai import (
 from sieval.core.models.ir import (
     ChatInput,
     ChatMessage,
+    ChatRole,
     CompletionInput,
     DialectOptions,
     HostedToolSpec,
@@ -6153,7 +6154,7 @@ def _forced(obj: Any, **fields: object) -> Any:
     return obj
 
 
-def _one_message(*parts: object, role: str = "user") -> ChatInput:
+def _one_message(*parts: object, role: ChatRole = "user") -> ChatInput:
     return _chat(ChatMessage(role, cast(Any, tuple(parts))))
 
 
@@ -6767,7 +6768,9 @@ class TestCandidateContentGuards:
 
 class TestRequestSideGuards:
     @pytest.mark.parametrize("summary", ["none", "auto"])
-    def test_reasoning_summary_none_is_a_documented_noop(self, summary: str) -> None:
+    def test_reasoning_summary_none_is_a_documented_noop(
+        self, summary: Literal["none", "auto"]
+    ) -> None:
         req = _request(reasoning=ReasoningParams(summary=summary))
         audit = RequestAudit(active_request_leaves(req))
         connection = _connection(lambda _: httpx.Response(200, json=_response()))
@@ -6780,7 +6783,10 @@ class TestRequestSideGuards:
 
             asyncio.run(connection.aclose())
 
-        thinking = prepared.body.get("generationConfig", {}).get("thinkingConfig", {})
+        generation_config = prepared.thaw_body().get("generationConfig", {})
+        assert isinstance(generation_config, dict)
+        thinking = generation_config.get("thinkingConfig", {})
+        assert isinstance(thinking, dict)
         assert ("includeThoughts" in thinking) is (summary == "auto")
 
     def test_multimodal_config_guards_against_future_modality_widening(self) -> None:
@@ -6885,7 +6891,7 @@ class TestConstructionAndInputGuards:
             else google_genai._verification_input_to_wire
         )
 
-        def lower(result: object, *, is_error: bool = False) -> list[Any]:
+        def lower(result: object, *, is_error: bool = False) -> Mapping[str, object]:
             history = _chat(
                 ChatMessage("user", (TextPart("q"),)),
                 ChatMessage("assistant", (ToolCallPart("c", "f", {}),)),
@@ -6894,11 +6900,19 @@ class TestConstructionAndInputGuards:
                 ),
             )
             contents = function(history, None)[1]
-            return cast(list[Any], contents[-1]["parts"][0]["functionResponse"])
+            last_content = contents[-1]
+            assert isinstance(last_content, dict)
+            parts = last_content["parts"]
+            assert isinstance(parts, list)
+            first_part = parts[0]
+            assert isinstance(first_part, dict)
+            function_response = first_part["functionResponse"]
+            assert isinstance(function_response, dict)
+            return function_response
 
-        assert lower([1, 2])["response"] == {"result": [1, 2]}  # type: ignore[index]
-        assert lower({"a": 1})["response"] == {"a": 1}  # type: ignore[index]
-        assert lower("boom", is_error=True)["response"] == {"error": "boom"}  # type: ignore[index]
+        assert lower([1, 2])["response"] == {"result": [1, 2]}
+        assert lower({"a": 1})["response"] == {"a": 1}
+        assert lower("boom", is_error=True)["response"] == {"error": "boom"}
 
     def test_tool_choice_requires_declared_function_tools(self) -> None:
         req = _request(tools=ToolParams(choice="required"))
