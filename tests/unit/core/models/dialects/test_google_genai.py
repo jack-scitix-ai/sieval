@@ -2670,17 +2670,20 @@ class TestResponseLifting:
         assert result.structured_output is None
 
     @pytest.mark.anyio
-    async def test_candidate_safety_stop_is_a_scoreable_empty_outcome(self) -> None:
+    @pytest.mark.parametrize("finish_reason", ["PROHIBITED_CONTENT", "LANGUAGE"])
+    async def test_candidate_policy_stop_is_a_scoreable_empty_outcome(
+        self, finish_reason: str
+    ) -> None:
         result = await _run(
             lambda _: httpx.Response(
                 200,
-                json=_response(parts=[], finish_reason="PROHIBITED_CONTENT"),
+                json=_response(parts=[], finish_reason=finish_reason),
             ),
             _request(reasoning=ReasoningParams(summary="auto")),
         )
 
         assert result.texts == ("",)
-        assert result.finish_reasons == ("PROHIBITED_CONTENT",)
+        assert result.finish_reasons == (finish_reason,)
         assert result.finish_reason_sources == ("candidate.finishReason",)
         assert result.reasoning == (None,)
 

@@ -192,21 +192,22 @@ class TestDetectTruncatedOutput:
         assert detect_truncated_output(_make_final_ctx(infer_result=output)) == set()
 
     def test_google_candidate_filter_not_prompt_block(self, sample_model_meta):
-        for source, expected in (
-            ("candidate.finishReason", {0}),
-            ("promptFeedback.blockReason", set()),
-            (None, set()),
-        ):
-            output = ModelOutput(
-                model=sample_model_meta,
-                texts=[""],
-                finish_reasons=["SAFETY"],
-                finish_reason_sources=[source] if source is not None else None,
-            )
-            assert (
-                detect_truncated_output(_make_final_ctx(infer_result=output))
-                == expected
-            )
+        for reason in ("SAFETY", "LANGUAGE"):
+            for source, expected in (
+                ("candidate.finishReason", {0}),
+                ("promptFeedback.blockReason", set()),
+                (None, set()),
+            ):
+                output = ModelOutput(
+                    model=sample_model_meta,
+                    texts=[""],
+                    finish_reasons=[reason],
+                    finish_reason_sources=[source] if source is not None else None,
+                )
+                assert (
+                    detect_truncated_output(_make_final_ctx(infer_result=output))
+                    == expected
+                ), (reason, source)
 
     def test_single_sample(self, sample_model_meta):
         """Single-sample (n=1) finish reason variants."""
@@ -221,6 +222,8 @@ class TestDetectTruncatedOutput:
             ),
             (["MAX_TOKENS"], {0}, "MAX_TOKENS"),
             (["content_filter"], {0}, "content_filter"),
+            (["refusal"], {0}, "refusal"),
+            (["end_turn"], set(), "end_turn"),
             (["stop"], set(), "stop"),
             (None, set(), "missing_finish_reasons"),
         ]
@@ -580,6 +583,28 @@ class TestTaskAnomalyDetectorAsync:
         report = detector.generate_report({0: ctx}, "t", task_tags={"gen"})
         await detector.save(report, backup_if_changed=False)
         await detector.load()
+        assert detector.needs_regeneration() is False
+
+    @pytest.mark.anyio
+    async def test_previous_filter_rule_hash_is_backed_up_and_regenerated(
+        self, tmp_path
+    ):
+        detector = TaskAnomalyDetector(root_dir=tmp_path)
+        ctx = _make_final_ctx(postprocess_result="answer")
+        previous = detector.generate_report({0: ctx}, "t", task_tags={"gen"})
+        previous["meta"]["rules_hash"] = "1d61bae98de6f417"
+        previous["meta"]["generated_at"] = "2026-08-07T01:02:03+00:00"
+        await detector.save(previous, backup_if_changed=False)
+
+        await detector.load()
+        assert detector.needs_regeneration() is True
+        current = await detector.generate_and_save(
+            {0: ctx}, "t", task_tags={"gen"}, backup_if_changed=True
+        )
+
+        assert current["meta"]["rules_hash"] == "0c7b42d9576740b0"
+        backup = orjson.loads((tmp_path / "anomalies.20260807010203.json").read_bytes())
+        assert backup["meta"]["rules_hash"] == "1d61bae98de6f417"
         assert detector.needs_regeneration() is False
 
     @pytest.mark.anyio
@@ -976,12 +1001,13 @@ class TestRulesHashStability:
         value here in the same commit, so the rotation is in the diff rather than
         discovered in production.
 
-        Rotated to cover two deliberate changes: `empty_infer_ppl` now reads
-        every candidate, and `truncated_output` now counts filtered candidates
-        without misclassifying blocked prompts. Both changes must reach reports
-        already on disk; without a new hash, `needs_regeneration()` returns False.
+        Rotated first for `empty_infer_ppl` reading every candidate and
+        `truncated_output` counting filtered candidates without misclassifying
+        blocked prompts; rotated again to include unsupported languages and
+        Anthropic refusals. Each change must reach stored anomaly reports;
+        without a new hash, `needs_regeneration()` returns False.
         """
-        assert get_rules_hash() == "1d61bae98de6f417"
+        assert get_rules_hash() == "0c7b42d9576740b0"
 
     def test_the_rule_set_is_the_expected_size(self):
         # Guards the other direction: a rule silently dropped from the registry

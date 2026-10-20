@@ -474,7 +474,8 @@ def detect_empty_infer_ppl(ctx: TaskContext) -> set[int]:
     description="Output was interrupted before completion",
     category="output_quality",
     rationale=(
-        "Incomplete outputs may be caused by a token limit or output filtering. "
+        "Incomplete outputs may be caused by a token limit, output filtering "
+        "(including unsupported-language stops), or refusal. "
         "Only token-limit stops can be addressed by increasing max_tokens. "
         "Scoped to gen: single-token logprob "
         "tasks (ppl/clp) infer with max_tokens=1 and always finish with "

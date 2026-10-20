@@ -139,7 +139,7 @@ _STANDARD_USER_PART_FIELDS = frozenset({"text", "inlineData", "fileData"})
 #: ``CONTINUATION`` is Google's per-request token cap reached with generation
 #: unfinished: ``candidate.continuationToken`` could resume it, but this dialect
 #: neither forwards nor replays that token. The rollout is scored as truncated
-#: (same as ``MAX_TOKENS``; see ``TRUNCATION_FINISH_REASONS``) and the raw finish
+#: (same as ``MAX_TOKENS``; see ``is_truncated_finish_reason``) and the raw finish
 #: reason stays on the record.
 _CHANNEL_OPTIONAL_FINISH_REASONS = frozenset(
     {

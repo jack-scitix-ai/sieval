@@ -510,17 +510,27 @@ have no `n` at all. It measures the parser, not the draw, and `n = 1` is where a
 silently-stopped extractor survives longest: no second rollout to disagree with.
 
 `n_truncated` — **rollouts** whose output was interrupted before completion,
-either by a token/context limit or by output filtering — and `n_scored_rollouts`, the
-rollouts scored in total, are reported by **every `gen` task**, on the same terms
-as `n_unextracted`: they describe the generation rather than the draw, so neither
-is confined to `n > 1`. Unlike every other key here the *runner* injects them, so
-a task cannot report zero truncation by having forgotten to look.
+either by a token/context limit, output filtering, or refusal — and
+`n_scored_rollouts`, the rollouts scored in total, are reported by **every `gen`
+task**, on the same terms as `n_unextracted`: they describe the generation rather
+than the draw, so neither is confined to `n > 1`. Unlike every other key here
+the *runner* injects them, so a task cannot report zero truncation by having
+forgotten to look.
 
-Google's `candidate.finishReason` policy stops count as output filtering;
+Google's `candidate.finishReason` policy stops (including `LANGUAGE` for an
+unsupported response language) count as output filtering;
 `promptFeedback.blockReason` stops do not, because no candidate was generated.
 Both retain their provider-verbatim reason, with the source recorded separately.
 Older Google records without that source cannot distinguish the two and are not
 retroactively counted as filtered output.
+
+Anthropic's `stop_reason=refusal` counts as an interrupted output, including
+refusals that yielded no text. OpenAI Chat/Completions `finish_reason=content_filter`
+also counts. A Chat `message.refusal` without a filtering finish reason is not
+represented in the stored finish reasons and cannot be counted here. A refusal
+content part in OpenAI Responses currently raises an output-contract error
+rather than producing a scoreable rollout; it does not contribute to
+`n_truncated`.
 
 They arrive as a **pair or not at all**. The count alone says nothing about how
 much of a score it explains — `26` is a different fact at 600 rollouts than at 30
@@ -540,10 +550,11 @@ count has no such value.
 
 Read `n_truncated` as a count of interrupted outputs, **not** a budget-only
 diagnosis. Inspect each call's raw `finish_reasons` to separate budget exhaustion
-from policy filtering. Raising `max_tokens` can help only with token-limit stops;
-it does not fix content filtering. The count is independent of `n_unextracted`:
-an interrupted answer can still parse (for example, the stop lands after the
-boxed answer). When both occur, check the stop reason before changing the budget.
+from policy filtering or refusal. Raising `max_tokens` can help only with
+token-limit stops; it does not fix filtering or refusal. The count is
+independent of `n_unextracted`: an interrupted answer can still parse (for
+example, the stop lands after the boxed answer). When both occur, check the stop
+reason before changing the budget.
 
 ### Pairs that must be read together
 

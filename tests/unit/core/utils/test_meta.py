@@ -330,15 +330,22 @@ class TestCountTruncatedRollouts:
             "MAX_TOKENS",
             "CONTINUATION",
             "content_filter",
+            "refusal",
         ):
             assert (
                 count_truncated_rollouts([_inferred({"finish_reasons": [reason]})]) == 1
             )
 
+    def test_anthropic_refusal_and_natural_stop(self):
+        calls = _inferred({"finish_reasons": ["refusal", "end_turn"]})
+        assert count_truncated_rollouts([calls]) == 1
+        assert count_scored_rollouts([calls]) == 2
+
     def test_google_policy_counts_only_candidate_stops(self):
         reasons = (
             "SAFETY",
             "RECITATION",
+            "LANGUAGE",
             "BLOCKLIST",
             "PROHIBITED_CONTENT",
             "SPII",

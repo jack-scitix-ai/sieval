@@ -2903,6 +2903,30 @@ class TestReportTruncation:
         assert report["n_scored_rollouts"] == 3
 
     @pytest.mark.anyio
+    async def test_refusal_counts_in_report_and_anomalies(self, tmp_path):
+        class RefusingChatModel(MockChatModel):
+            async def _stub_arun(self, req):
+                response = await super()._stub_arun(req)
+                if prompt_of(req) != "What is 2+3?":
+                    return response
+                return replace(response, texts=("",), finish_reasons=("refusal",))
+
+        task = GenTask(
+            dataset=MockDataset(),
+            model=RefusingChatModel(answers=DEFAULT_ANSWERS),
+            name="anthropic_refusal",
+        )
+        runner = TaskRunner(task, make_config(tmp_path, detect_anomalies=True))
+        report = await runner.arun()
+
+        assert report["n_truncated"] == 1
+        assert report["n_scored_rollouts"] == 3
+        saved = orjson.loads((runner.root_dir / "report.json").read_bytes())
+        assert saved["n_truncated"] == 1
+        anomalies = orjson.loads((runner.root_dir / "anomalies.json").read_bytes())
+        assert anomalies["summary"]["anomaly_sample_details"]["truncated_output"] == 1
+
+    @pytest.mark.anyio
     async def test_google_prompt_block_is_not_candidate_truncation_after_resume(
         self, tmp_path
     ):

@@ -10,21 +10,23 @@ from sieval.core.models import ModelCallMeta, ModelOutput
 from sieval.core.tasks.consts import TaskStage
 from sieval.core.tasks.context import TaskStageMeta
 
-#: Finish reasons for candidate generation interrupted by a limit or filter.
+#: Finish reasons for candidate generation interrupted by a limit, filter, or refusal.
 #:
 #: Every spelling, not one canonical name: the IR does not normalize these, so a
 #: set holding only ``length`` (OpenAI-compatible Chat/Completions and SGLang
 #: native) would read zero against ``max_output_tokens`` (OpenAI Responses),
 #: ``max_tokens`` or ``model_context_window_exceeded`` (Anthropic), or
 #: ``MAX_TOKENS`` or ``CONTINUATION`` (Google generateContent).
-#: ``content_filter`` and Google's candidate policy stops also count: the output
-#: was interrupted, although raising ``max_tokens`` would not fix filtering.
+#: ``content_filter``, Anthropic's ``refusal``, and Google's candidate policy
+#: stops also count: the output was interrupted, although raising ``max_tokens``
+#: would not fix filtering or refusal.
 #: Google's promptFeedback reasons can use the same spelling; their source must
 #: be checked before counting. Shared by live anomaly and persisted report paths.
 _GOOGLE_POLICY_FINISH_REASONS = frozenset(
     {
         "SAFETY",
         "RECITATION",
+        "LANGUAGE",
         "BLOCKLIST",
         "PROHIBITED_CONTENT",
         "SPII",
@@ -34,7 +36,7 @@ _GOOGLE_POLICY_FINISH_REASONS = frozenset(
         "ESCALATION",
     }
 )
-TRUNCATION_FINISH_REASONS = (
+_TRUNCATION_FINISH_REASONS = (
     frozenset(
         {
             "length",
@@ -44,6 +46,7 @@ TRUNCATION_FINISH_REASONS = (
             "MAX_TOKENS",
             "CONTINUATION",
             "content_filter",
+            "refusal",
         }
     )
     | _GOOGLE_POLICY_FINISH_REASONS
@@ -58,7 +61,7 @@ def is_truncated_finish_reason(reason: str, source: str | None = None) -> bool:
     """
     if source == "promptFeedback.blockReason":
         return False
-    return reason in TRUNCATION_FINISH_REASONS and (
+    return reason in _TRUNCATION_FINISH_REASONS and (
         reason not in _GOOGLE_POLICY_FINISH_REASONS
         or source == "candidate.finishReason"
     )
@@ -241,8 +244,8 @@ def count_truncated_rollouts(
 ) -> int | None:
     """Rollouts whose candidate output was interrupted, over scored records.
 
-    A token limit and an output filter can both end generation prematurely;
-    only the former is addressed by increasing ``max_tokens``. Raw finish reasons
+    A token limit, output filter, or refusal can end generation prematurely;
+    only the first is addressed by increasing ``max_tokens``. Raw finish reasons
     retain the cause, and Google prompt blocks are not candidate interruptions.
 
     Counted per rollout, not per sample -- one truncated draw in four is a
