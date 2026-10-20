@@ -5,34 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.10.0] - 2026-10-20
 
-### Changed
-
-- **BREAKING — `manifest.json` is removed.** A sample's state is its latest shard record, found through `.idx`; read per-sample status from the `.idx` columns or the record's `error_*` fields (#148).
-- **BREAKING — every exit path finalizes the same way.** `report.json` gains a `sieval` block (`total`, `final`, `failed`, `anomalies`) that decides a fast resume; `anomalies.json` covers every iteration and loses `summary` and its timestamped backups; `runs[].rules_hash` names the rules applied (#148).
-- `meta.json` records `config` (the session's `effective_config.yaml`) and `runs[].id`, a run ID sortable by start time; the leaderboard scanner reads them instead of walking up the filesystem (#148).
-- **BREAKING — a resume compares stage identities, not config text.** Changed data or prompt reruns those samples, a changed grader regrades on the recorded inference, a changed inference is refused. `effective_config.yaml` and `infer_plans.yaml` no longer refuse a resume; `gate_resume_identity` is removed (#148).
+A minor bump for four breaking changes, all in on-disk or CLI-report contracts:
+`manifest.json` is gone, every exit path finalizes `report.json` and
+`anomalies.json` the same way, a resume compares stage identities instead of
+config text, and `sieval infer` reports `engine_pid` instead of `handle_id`. The
+theme is RFC #148: `meta.json` now records where a result directory came from,
+and a resume reruns, regrades or refuses by which stage changed. Two native
+provider dialects (Anthropic Messages, Google GenAI) and auto-started vendored
+services land alongside.
 
 ### Added
 
-- `--resume-from DIR` / `runner_config.resume_from`: start from another, possibly read-only, run of another task (#148).
-- `Task.grader_args()`: task arguments folded into the grader identity (#148), read after `setup()`. A task excludes arguments that cannot change a verdict via `GRADER_ARGS_EXCLUDED`.
-- SIGTERM stops `sieval run` and `sieval eval` as Ctrl+C does; exit 143.
-- Google `request_params` record `no_effect` for a thinking budget or summary the reply shows no sign of.
+- **Per-stage resume.** `--resume` and the new `--resume-from DIR` / `runner_config.resume_from` (start from another, possibly read-only, run of another task) compare the four stage identities: changed data or prompt reruns those samples, a changed grader regrades on the recorded inference, a changed inference or an unknown stage it would reuse is refused (#157).
+- `Task.grader_args()`: task arguments folded into the grader identity, read after `setup()`; a task excludes arguments that cannot change a verdict via `GRADER_ARGS_EXCLUDED` (#157, #158).
+- **Stage identities and run history in `meta.json`.** `identity` (schema 1) holds `data`, `prompt`, `inference` and `grader` digests — the inference digest folds in what each sample was actually sent, the grader digest walks the task's MRO, its static imports and plugin packages, and records each judge's model, version, sampling and prompt (never its `api_base`). `runs[]` is append-only, and `meta.json` is rewritten atomically on every run (#150, #154).
+- **`dialect: anthropic_messages`** — native Anthropic Messages JSON and SSE, with explicit capability admission, request auditing, replay-safe extended-thinking continuations, and refusals lifted as scoreable terminal outcomes. `max_tokens` is required (#145).
+- **`dialect: google_genai`** — native Gemini `generateContent` (`v1` / `v1beta`): streaming, function and hosted tools, thinking, logprobs, seeds, opaque continuation. Google enforces model limits itself, so a provider 400 is the error and a gateway alias skips nothing; a YAML-bound model takes reasoning and logprobs as supported, while tools, structured output, images and continuation still fail reconciliation with `model_outcome_missing` until Google model profiles exist (#147, #153, #156).
+- **SiEval starts the services it vendors.** A task declares them in `Task.services`; the ten families that post to `SIEVAL_CODE_EVAL_API` declare `code-eval`. `sieval run`, `sieval eval` and `sieval leaderboard run` start each declared service whose endpoint variable is unset — once per run, on a free port, stopped when the run ends. The started evaluator grades **without a sandbox** and warns so; point the variable at a containerized endpoint to avoid it. Running it with SiEval's own interpreter needs the new `code-eval` dependency group. `identity.grader.services` records each service as `vendored` (commit, code digest, interpreter runtime) or `external` (#155).
+- SIGTERM stops `sieval run` and `sieval eval` as Ctrl+C does; exit 143 (#158).
+- Google `request_params` record `no_effect` for a thinking budget or summary the reply shows no sign of (#158).
 
 ### Fixed
 
-- Atomic writes create `report.json`, `meta.json` and `manifest.json` as `0o666 & ~umask`, not `0600`.
-- A run interrupted before every sample passed `preprocess` resumes instead of refusing on `data`; a refused resume appends no `runs[]` entry.
-- A directory holding shards counts as started whatever `meta.json` says: a fresh run refuses it instead of adopting its samples, and a resume without a usable `meta.json` (a killed v0.6 run, including the latest `outputs/<task>/<timestamp>`, no longer skipped) is refused by the version gate (#148).
-- An interrupt or failed write mid-run keeps every finished sample.
-- Refinalizing a run whose `end_run` failed writes `anomalies.json`.
-- The grader identity covers patch packages and whole plugin packages, including modules loaded with `importlib`.
-- A resume with another model regrades the recorded inference, and is refused if it would infer any sample.
-- Google's request envelope is marked explicitly, not detected by a `path` key.
-- A bad code-eval copy or interpreter fails before any engine starts; service logs move to `logs/services/<name>/`.
-- Unmatched `SIEVAL_JUDGE_MODEL_REF` roles are warned about; `tunedModels/` is stripped like `models/`.
+- A directory holding shards counts as started whatever `meta.json` says: a fresh run refuses it instead of adopting its samples, and a resume without a usable `meta.json` (a killed v0.6 run, including the latest `outputs/<task>/<timestamp>`, no longer skipped) is refused by the version gate (#160).
+- A run stopped mid-way keeps every finished sample: the saver flushes on every exit, samples still in the storage stream are drained to disk, and a failed or cancelled flush re-queues its batch instead of dropping it (#154, #158).
+- A run interrupted before every sample passed `preprocess` resumes instead of refusing on `data`; a refused resume appends no `runs[]` entry (#158).
+- A fast resume that finds `report.json` from a run that never ended finalizes again instead of reusing it; refinalizing a run whose `end_run` failed writes `anomalies.json` (#154, #158).
+- Atomic writes use a unique temp file with fsync, and create `report.json` and `meta.json` as `0o666 & ~umask`, not `0600` (#154, #158).
+- The grader identity covers patch packages and whole plugin packages, including modules loaded with `importlib` (#154, #158).
+- A resume with another model regrades the recorded inference, and is refused if it would infer any sample (#158).
+- The inference requests digest keeps only the request body and a normalized stream flag, so Google's model path or a gateway prefix no longer moves it (#154).
+- Google usage: `output_tokens` includes thoughts and `input_tokens` the tool-use prompt, so `reasoning_tokens` is a breakdown of its parent; Google's `error.message` is appended to the HTTP error, so a failed sample's `error_msg` names the reason (#147, #156).
+- Google's request envelope is marked explicitly, not detected by a `path` key (#158).
+- A bad code-eval copy or interpreter fails before any engine starts; service logs move to `logs/services/<name>/` (#158). LiveOIBench refuses an evaluator whose `/languages` lacks `cpp`, and fails a rollout that could not compile for want of `g++` instead of scoring it 0 (#155).
+- `SIEVAL_JUDGE_MODEL_REF` is validated when a runner is built and unmatched roles are warned about; `tunedModels/` is stripped like `models/` (#154, #158).
+- `sieval run` no longer collides with an `infer start` of the same model; every handle write goes through one locked transition, and a pending handle stays held while any of its engines is alive (#149, #155).
+- The resume benchmarks seed their result directory with a real run, so the `benchmark` gate and `tests/performance/test_resume_speed.py` pass again after per-stage resume; each resume test now asserts it re-infers only the missing samples (#161).
+
+### Changed
+
+- **BREAKING — `manifest.json` is removed.** A sample's state is its latest shard record, found through `.idx`; read per-sample status from the `.idx` columns or the record's `error_*` fields (#159).
+- **BREAKING — every exit path finalizes the same way.** `report.json` gains a `sieval` block (`total`, `final`, `failed`, `anomalies`) that decides a fast resume; `anomalies.json` covers every iteration and loses `summary` and its timestamped backups; `runs[].rules_hash` names the rules applied (#159).
+- **BREAKING — a resume compares stage identities, not config text.** `effective_config.yaml` and `infer_plans.yaml` no longer refuse a resume and are audit records; `gate_resume_identity` and `_append_resume_note` are removed, and YAML headers keep only the first run's provenance. The version-series gate stays (#150, #157).
+- **BREAKING — `sieval infer start/list/show/stop` JSON reports `engine_pid` instead of `handle_id`.** Handle files use `owner_pid`/`engine_pid` (old `pid`/`handle_id` files still load and are rewritten on the next transition). `sieval run` keeps its handles under `~/.sieval/handles/run-<pid>/`. Engine logs move to `<result_dir>/logs/<model>/<role>.log` for `sieval run` with a result_dir, else `~/.sieval/logs/<model>/<role>-<deployment_id>.log`, pruned at launch to the last N per model and role (`--keep-logs` → `SIEVAL_KEEP_LOGS` → 3; 0 deletes on stop; negative keeps all) (#149).
+- **Behavior change — `n_truncated` counts every interrupted output**, not just budget stops: Google `MAX_TOKENS`/`CONTINUATION` and candidate policy stops (`SAFETY`, `RECITATION`, …), and Anthropic `refusal` and context-window stops. A new per-choice `finish_reason_sources` records which. Anthropic runs that refuse show higher `n_truncated` than before — not a regression. The rule prose changed, so `rules_hash` rotates fleet-wide to `2c440347324b1edb` (#145, #147).
+- `meta.json` records `config` (the session's `effective_config.yaml`) and `runs[].id`, a run ID sortable by start time; the leaderboard scanner reads them instead of walking up the filesystem (#159).
+- A failed write of `meta.json` or `report.json` now fails the task (#150). A task named `logs` is refused: `<result_dir>/logs/` is reserved (#155).
+- `google_genai` no longer validates Gemini limits by model name: unsupported thinking levels and budgets get Google's own 400, Gemini 3 `candidateCount > 1` is allowed, and Gemini 3 `temperature`/`top_p`/`top_k` are forwarded and recorded (#153, #156).
+- User-visible dialect and capability errors describe current behavior instead of citing PR numbers (#146).
+- Agent configuration is harness-neutral: `AGENTS.md` is the instruction source of truth with a generated rule map, and skills live under `.agents/skills/` (#144).
+
+### Docs
+
+- Contributor docs say bare `ty check`, which also checks `tests/`, as CI does (#149).
 
 ## [0.9.0] - 2026-09-11
 
@@ -304,6 +331,7 @@ Mainstream benchmarks registered in `sieval/meta/index.json`:
 - Project-wide preflight (`scripts/check_preflight.py`): links, deps, tasks, datasets, imports, examples, meta-index sync, version.
 - Tooling: `ruff`, `ty`, `mypy strict`, `pytest`.
 
+[0.10.0]: https://github.com/scitix/sieval/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/scitix/sieval/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/scitix/sieval/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/scitix/sieval/compare/v0.6.0...v0.7.0
