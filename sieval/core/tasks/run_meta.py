@@ -23,7 +23,8 @@ The four stage identities describe the run that produced the current
                are left out.
 ``grader``     The source of every module the task class reaches by a static
                import walk under :data:`GRADER_PACKAGES` and the ``sieval_*``
-               plugin package of each class in its MRO, the task class, its
+               plugin package of each class in its MRO, keyed by file path;
+               the task class, its
                :meth:`~sieval.core.tasks.task.Task.grader_args`, each judge's
                model, version, sampling arguments and prompt, and each service
                the task declares, vendored or external.
@@ -130,7 +131,7 @@ class JudgeIdentity(TypedDict):
 
 
 class GraderIdentity(TypedDict):
-    """``task`` is the task class's import path and ``args`` its
+    """``task`` is :func:`grader_task` and ``args`` the task's
     :meth:`~sieval.core.tasks.task.Task.grader_args`, both absent in a block
     written before they counted; ``services`` is present only for a task that
     declares one."""
@@ -433,15 +434,12 @@ def _own_root(module: str) -> str | None:
 
     A plugin need not be named ``sieval_plugins``: a task class in
     ``sieval_sysbench_plugin.task`` makes ``sieval_sysbench_plugin`` part of its
-    grader. Only ``sieval_*`` packages with source on disk count, so a test
-    module, a third-party base class or ``sieval`` itself (whose ``core`` and
-    ``datasets`` stay out) never widens the walk.
+    grader. Only ``sieval_*`` packages on disk count, namespace packages
+    included, so a test module, a third-party base class or ``sieval`` itself
+    (whose ``core`` and ``datasets`` stay out) never widens the walk.
     """
     top = module.partition(".")[0]
-    if not top.startswith("sieval_"):
-        return None
-    located = _locate(top)
-    if located is None or located[0] is None:
+    if not top.startswith("sieval_") or not _root_dirs(top):
         return None
     return top
 
@@ -572,26 +570,64 @@ def _function_modules(task_cls: type) -> set[str]:
     return found
 
 
-def _package_files(name: str, init: str) -> list[str]:
-    """Every module under package *name*, whose ``__init__`` is *init*.
+def _package_files(top: str) -> list[str]:
+    """Every module under top-level package *top*, in each of its locations.
 
     A package may load modules with ``importlib``, which no import statement
     shows, so the walk digests it whole.
     """
-    root = os.path.dirname(init)
     found: list[str] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(
-            d for d in dirnames if not d.startswith((".", "__pycache__"))
-        )
-        rel = os.path.relpath(dirpath, root)
-        prefix = name if rel == "." else f"{name}.{rel.replace(os.sep, '.')}"
-        for filename in sorted(filenames):
-            if not filename.endswith(".py"):
-                continue
-            stem = filename[:-3]
-            found.append(prefix if stem == "__init__" else f"{prefix}.{stem}")
+    for root in _root_dirs(top):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                d for d in dirnames if not d.startswith((".", "__pycache__"))
+            )
+            rel = os.path.relpath(dirpath, root)
+            prefix = top if rel == "." else f"{top}.{rel.replace(os.sep, '.')}"
+            for filename in sorted(filenames):
+                if not filename.endswith(".py"):
+                    continue
+                stem = filename[:-3]
+                found.append(prefix if stem == "__init__" else f"{prefix}.{stem}")
     return found
+
+
+#: File-key label of the task class's own plugin package, whatever its name.
+OWN_PACKAGE = "."
+
+
+def _file_key(name: str, path: str, own: str | None) -> str:
+    """``<label>/<path in package>`` for module *name* at *path*.
+
+    The label is the top-level package's name, or :data:`OWN_PACKAGE` when
+    that is *own*, so a plugin package copied under another name (as a runner
+    merging several into one process does) keys the same.
+    """
+    top = name.partition(".")[0]
+    label = OWN_PACKAGE if top == own else top
+    for root in _root_dirs(top):
+        rel = os.path.relpath(path, root)
+        if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
+            return "/".join((label, *rel.split(os.sep)))
+    raise ValueError(f"{path} is outside package {top}")
+
+
+def _own_package(task_cls: type) -> str | None:
+    """The plugin package of the first class in *task_cls*'s MRO that has one."""
+    for klass in task_cls.__mro__:
+        if (root := _own_root(klass.__module__)) is not None:
+            return root
+    return None
+
+
+def grader_task(task_cls: type) -> str:
+    """``<file key>:<qualname>``, or the import path for a class with no source."""
+    module = task_cls.__module__
+    located = _locate(module)
+    if located is None or located[0] is None:
+        return f"{module}.{task_cls.__qualname__}"
+    key = _file_key(module, located[0], _own_package(task_cls))
+    return f"{key}:{task_cls.__qualname__}"
 
 
 def grader_modules(task_cls: type) -> dict[str, str]:
@@ -601,9 +637,11 @@ def grader_modules(task_cls: type) -> dict[str, str]:
     function they hold, so a patched-in method counts. It follows
     :data:`GRADER_PACKAGES`, each class's plugin package (:func:`_own_root`)
     and each patch's package (:func:`_patch_root`) by a static AST walk, so
-    nothing is imported or run. Every package reached is digested whole
-    (:func:`_package_files`), except the :data:`GRADER_PACKAGES` roots. Returns
-    ``{module: "sha256:…"}`` over each module's source bytes.
+    nothing is imported or run. A package outside ``sieval`` that the walk
+    reaches is digested whole (:func:`_package_files`); under ``sieval`` only
+    what is reached counts. Returns ``{file key: "sha256:…"}`` over each
+    module's source bytes (:func:`_file_key`). A file naming its own package,
+    as an absolute self-import does, digests per name; import it relatively.
     """
     starts = {klass.__module__ for klass in task_cls.__mro__}
     own = {root for module in starts if (root := _own_root(module)) is not None}
@@ -614,9 +652,8 @@ def grader_modules(task_cls: type) -> dict[str, str]:
     }
     extra = sorted((own | patched) - set(GRADER_PACKAGES))
     roots = (*GRADER_PACKAGES, *extra)
+    own_package = _own_package(task_cls)
     pending = [m for m in starts | _function_modules(task_cls) if _followed(m, roots)]
-    # A plugin or patch package is digested whole, from its root.
-    pending.extend(extra)
     seen: set[str] = set()
     modules: dict[str, str] = {}
     while pending:
@@ -624,6 +661,9 @@ def grader_modules(task_cls: type) -> dict[str, str]:
         if name in seen or not _followed(name, roots):
             continue
         seen.add(name)
+        top = name.partition(".")[0]
+        if top != "sieval":
+            pending.extend(_package_files(top) if name == top else (top,))
         located = _locate(name)
         if located is None:
             continue
@@ -632,10 +672,9 @@ def grader_modules(task_cls: type) -> dict[str, str]:
             continue
         with open(path, "rb") as f:
             source = f.read()
-        modules[name] = "sha256:" + hashlib.sha256(source).hexdigest()
+        key = _file_key(name, path, own_package)
+        modules[key] = "sha256:" + hashlib.sha256(source).hexdigest()
         pending.extend(_imports_of(name, source, is_package, roots))
-        if is_package and name not in GRADER_PACKAGES:
-            pending.extend(_package_files(name, path))
     return dict(sorted(modules.items()))
 
 
