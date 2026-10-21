@@ -9,17 +9,19 @@ the temporary task compatibility checks.
 AI-Generated Code - GPT-5.6 (OpenAI)
 """
 
+from collections.abc import Mapping
 from types import MappingProxyType, TracebackType
 from typing import Any, Self, cast
 from uuid import uuid4
 
 import anyio
+import httpx
 from openai import AsyncOpenAI
 
 from sieval.core.types import JSONValue
 
 from .capabilities import Capability
-from .connection_factory import DEFAULT_REQUEST_TIMEOUT
+from .connection_factory import DEFAULT_REQUEST_TIMEOUT, resolve_client_timeout
 from .deployment import (
     ConnectionIdentity,
     ConnectionPool,
@@ -144,6 +146,7 @@ class SglangGenModel(Model):
         parent_limiter: anyio.CapacityLimiter | None = None,
         extra: dict[str, JSONValue] | None = None,
         transport: SglangTransport | None = None,
+        client_timeout: httpx.Timeout | Mapping[str, float] | None = None,
         **kwargs: object,
     ) -> None:
         self._model = model
@@ -152,7 +155,11 @@ class SglangGenModel(Model):
             base_url=api_base,
             api_key=api_key,
             max_retries=max_retries,
-            timeout=DEFAULT_REQUEST_TIMEOUT,
+            timeout=resolve_client_timeout(
+                client_timeout,
+                default=DEFAULT_REQUEST_TIMEOUT,
+                subject=f"Model '{model}'",
+            ),
         )
         self._kwargs = dict(kwargs)
         self._extra = dict(extra) if extra is not None else None

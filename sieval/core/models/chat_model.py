@@ -12,6 +12,7 @@ from collections.abc import Iterable, Mapping
 from typing import cast
 
 import anyio
+import httpx
 
 from sieval.core.types import JSONValue
 
@@ -36,6 +37,7 @@ class ChatModel(Model):
         parent_limiter: anyio.CapacityLimiter | None = None,
         extra: dict[str, JSONValue] | None = None,
         transport: Dialect | None = None,
+        client_timeout: httpx.Timeout | Mapping[str, float] | None = None,
         **kwargs: object,
     ) -> None:
         binding = build_legacy_openai_binding(
@@ -46,6 +48,7 @@ class ChatModel(Model):
             max_retries=max_retries,
             concurrency_limit=concurrency_limit,
             parent_limiter=parent_limiter,
+            client_timeout=client_timeout,
         )
         # Compatibility hooks in downstream subclasses historically inspect
         # these fields while constructing their transport double.
