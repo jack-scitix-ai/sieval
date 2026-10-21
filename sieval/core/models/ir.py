@@ -385,6 +385,18 @@ class TopKEntry:
 
 @sieval_record
 @dataclass(frozen=True)
+class ChoiceLogprobs:
+    """One choice's ``logprobs`` / ``top_logprobs``, used when ``n > 1``.
+
+    ``top_logprobs`` is ``None`` unless requested, else aligned with ``tokens``.
+    """
+
+    tokens: tuple[TokenLogprob, ...]
+    top_logprobs: tuple[tuple[TopKEntry, ...], ...] | None = None
+
+
+@sieval_record
+@dataclass(frozen=True)
 class InputScoringResult:
     token_logprobs: tuple[TokenLogprob, ...]
     byte_count: int | None = None
@@ -556,6 +568,11 @@ class Response:
     top_logprobs: tuple[tuple[TopKEntry, ...], ...] | None = field(
         default=None, metadata=_SINGULAR_CHANNEL
     )
+    #: Per-choice logprobs at ``n > 1``, where the two fields above stay
+    #: ``None``; at ``n == 1`` only those are filled.
+    choice_logprobs: tuple[ChoiceLogprobs, ...] | None = field(
+        default=None, metadata=_CHOICE_CHANNEL
+    )
     input_scoring: InputScoringResult | None = field(
         default=None, metadata=_SINGULAR_CHANNEL
     )
@@ -583,6 +600,10 @@ class Response:
             object.__setattr__(self, "request_params", dict(self.request_params))
         if self.reasoning is not None and len(self.reasoning) != len(self.texts):
             raise ValueError("Response.reasoning must align with Response.texts")
+        if self.choice_logprobs is not None and len(self.choice_logprobs) != len(
+            self.texts
+        ):
+            raise ValueError("Response.choice_logprobs must align with Response.texts")
         if self.finish_reasons is not None and len(self.finish_reasons) != len(
             self.texts
         ):

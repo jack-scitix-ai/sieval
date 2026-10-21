@@ -40,12 +40,14 @@ from sieval.core.models.dialect import (
     WireEvidence,
     WireObservation,
     active_request_leaves,
+    validate_choice_logprobs,
     validate_input_scoring,
     validate_request_invariants,
     validate_runtime_binding_plan,
     validate_top_logprobs,
 )
 from sieval.core.models.ir import (
+    ChoiceLogprobs,
     CompletionInput,
     InputScoringResult,
     Request,
@@ -135,6 +137,9 @@ OUTPUT_CONTRACT = OutputContract(
         "structured_output": OutputRule(Guarantee.NEVER),
         "logprobs": OutputRule(Guarantee.PRESENT_OR_ERROR, _validate_token_logprobs),
         "top_logprobs": OutputRule(Guarantee.PRESENT_OR_ERROR, validate_top_logprobs),
+        "choice_logprobs": OutputRule(
+            Guarantee.PRESENT_OR_ERROR, validate_choice_logprobs
+        ),
         "input_scoring": OutputRule(Guarantee.PRESENT_OR_ERROR, validate_input_scoring),
         "citations": OutputRule(Guarantee.NEVER),
         "grounding": OutputRule(Guarantee.NEVER),
@@ -206,6 +211,7 @@ _IR_OWNED_BODY_KEYS = BINDING_RESOURCE_KEYS | frozenset(
 class _CompletionContext:
     n: int
     input_scoring: bool
+    top_logprobs: int
 
 
 @dataclass(frozen=True)
@@ -525,6 +531,7 @@ class OpenAICompletionsDialect:
             context=_CompletionContext(
                 n=sampling.n,
                 input_scoring=scoring.input_scoring,
+                top_logprobs=scoring.top_logprobs,
             ),
         )
         return prepared
@@ -627,11 +634,16 @@ class _Accumulator:
         self._texts = [""] * context.n
         self._finish_reasons = [""] * context.n
         self._seen_indices: set[int] = set()
-        self._tokens: list[str] = []
-        self._token_logprobs: list[float | None] = []
-        self._top_logprobs: list[dict[str, float]] = []
-        self._saw_top_logprobs = False
-        self._saw_logprobs = False
+        # Logprob buffers, one per choice index.
+        self._choice_tokens: list[list[str]] = [[] for _ in range(context.n)]
+        self._choice_token_logprobs: list[list[float | None]] = [
+            [] for _ in range(context.n)
+        ]
+        self._choice_top_logprobs: list[list[dict[str, float]]] = [
+            [] for _ in range(context.n)
+        ]
+        self._choice_saw_top_logprobs = [False] * context.n
+        self._choice_saw_logprobs = [False] * context.n
         self._response_model: str | None = None
         self._system_fingerprint: str | None = None
 
@@ -661,12 +673,10 @@ class _Accumulator:
             if isinstance(finish_reason, str):
                 self._finish_reasons[index] = finish_reason
 
-            if index != 0:
-                continue
             logprobs = getattr(choice, "logprobs", None)
             if logprobs is None:
                 continue
-            self._saw_logprobs = True
+            self._choice_saw_logprobs[index] = True
             raw_tokens = _logprob_sequence(
                 getattr(logprobs, "tokens", None),
                 "completion logprobs.tokens",
@@ -702,10 +712,51 @@ class _Accumulator:
                     raise OutputContractError(
                         "completion top-logprob positions are inconsistent"
                     )
-                self._saw_top_logprobs = True
-                self._top_logprobs.extend(parsed_top_logprobs)
-            self._tokens.extend(parsed_tokens)
-            self._token_logprobs.extend(parsed_logprobs)
+                self._choice_saw_top_logprobs[index] = True
+                self._choice_top_logprobs[index].extend(parsed_top_logprobs)
+            self._choice_tokens[index].extend(parsed_tokens)
+            self._choice_token_logprobs[index].extend(parsed_logprobs)
+
+    def _lift_choice(
+        self, index: int
+    ) -> tuple[tuple[TokenLogprob, ...], tuple[tuple[TopKEntry, ...], ...] | None]:
+        tokens = self._choice_tokens[index]
+        token_logprobs = self._choice_token_logprobs[index]
+        top_logprobs = self._choice_top_logprobs[index]
+        if len(token_logprobs) != len(tokens):
+            raise OutputContractError(
+                "completion token and token-logprob counts are inconsistent"
+            )
+        saw_top = self._choice_saw_top_logprobs[index]
+        if saw_top and len(top_logprobs) != len(tokens):
+            raise OutputContractError(
+                "completion top-logprob positions are inconsistent"
+            )
+        sampled = tuple(
+            TokenLogprob(token=token, logprob=logprob)
+            for token, logprob in zip(tokens, token_logprobs, strict=True)
+        )
+        top = (
+            tuple(
+                tuple(
+                    TopKEntry(token=token, logprob=logprob)
+                    for token, logprob in position.items()
+                )
+                for position in top_logprobs
+            )
+            if saw_top
+            else None
+        )
+        return sampled, top
+
+    def _choice_logprobs(self, index: int) -> ChoiceLogprobs:
+        if not self._choice_saw_logprobs[index]:
+            raise OutputContractError(
+                f"completion response omitted logprobs for choice index {index}"
+            )
+        sampled, top = self._lift_choice(index)
+        # Top-k the request did not ask for is dropped, as in chat.
+        return ChoiceLogprobs(sampled, top if self._context.top_logprobs else None)
 
     def response(self, usage: UsageStats | None) -> Response:
         missing = sorted(set(range(self._context.n)) - self._seen_indices)
@@ -724,38 +775,20 @@ class _Accumulator:
                 raise OutputContractError(
                     "input scoring requires a usage prompt-token boundary"
                 )
-            if not self._saw_logprobs:
+            if not self._choice_saw_logprobs[0]:
                 raise OutputContractError(
                     "input scoring response omitted echoed token logprobs"
                 )
             self._validate_input_scoring_boundary(usage)
 
-        if self._saw_logprobs:
-            if len(self._token_logprobs) != len(self._tokens):
-                raise OutputContractError(
-                    "completion token and token-logprob counts are inconsistent"
+        choice_logprobs: tuple[ChoiceLogprobs, ...] | None = None
+        if self._context.n > 1:
+            if any(self._choice_saw_logprobs):
+                choice_logprobs = tuple(
+                    self._choice_logprobs(index) for index in range(self._context.n)
                 )
-            if self._saw_top_logprobs and len(self._top_logprobs) != len(self._tokens):
-                raise OutputContractError(
-                    "completion top-logprob positions are inconsistent"
-                )
-            all_tokens = tuple(
-                TokenLogprob(token=token, logprob=logprob)
-                for token, logprob in zip(
-                    self._tokens, self._token_logprobs, strict=True
-                )
-            )
-            all_top = (
-                tuple(
-                    tuple(
-                        TopKEntry(token=token, logprob=logprob)
-                        for token, logprob in position.items()
-                    )
-                    for position in self._top_logprobs
-                )
-                if self._saw_top_logprobs
-                else None
-            )
+        elif self._choice_saw_logprobs[0]:
+            all_tokens, all_top = self._lift_choice(0)
             if self._context.input_scoring:
                 assert usage is not None
                 boundary = usage.input_tokens
@@ -771,6 +804,7 @@ class _Accumulator:
             finish_reasons=tuple(self._finish_reasons),
             logprobs=sampled,
             top_logprobs=top,
+            choice_logprobs=choice_logprobs,
             input_scoring=input_scoring,
             usage=usage,
             request_params=self._request_params,
@@ -779,8 +813,8 @@ class _Accumulator:
         )
 
     def _validate_input_scoring_boundary(self, usage: UsageStats) -> None:
-        token_count = len(self._tokens)
-        if len(self._token_logprobs) != token_count:
+        token_count = len(self._choice_tokens[0])
+        if len(self._choice_token_logprobs[0]) != token_count:
             raise OutputContractError(
                 "input scoring token and token-logprob counts are inconsistent"
             )
@@ -798,7 +832,10 @@ class _Accumulator:
                 "usage completion-token count contradicts echoed logprob positions"
             )
         # No total-token check: the total is computed from these two counts.
-        if self._top_logprobs and len(self._top_logprobs) != token_count:
+        if (
+            self._choice_top_logprobs[0]
+            and len(self._choice_top_logprobs[0]) != token_count
+        ):
             raise OutputContractError(
                 "input scoring top-logprob positions are inconsistent"
             )

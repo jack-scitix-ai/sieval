@@ -35,6 +35,7 @@ from typing import Any, cast
 
 from sieval.core.models.capabilities import Capability
 from sieval.core.models.ir import (
+    ChoiceLogprobs,
     CompletionInput,
     InputScoringResult,
     Request,
@@ -333,11 +334,35 @@ class SglangTransport:
                 "--disable-radix-cache."
             )
 
+    def _choice_logprobs(self, meta: dict[str, Any], top_k: int) -> ChoiceLogprobs:
+        """Lift one sample's output logprobs from its own ``meta_info``.
+
+        This facade runs no output contract, so shape checks live here. An
+        empty token list is valid (a sample that generated nothing); an absent
+        one is not.
+        """
+        raw_tokens = meta.get("output_token_logprobs")
+        if raw_tokens is None:
+            raise RuntimeError(
+                "sglang /generate returned no output_token_logprobs for a sample."
+            )
+        tokens = self._triples_to_tokens(raw_tokens)
+        if top_k == 0:
+            return ChoiceLogprobs(tokens=tokens)
+        top = self._triples_to_topk(meta.get("output_top_logprobs") or []) or ()
+        if len(top) != len(tokens):
+            raise RuntimeError(
+                "sglang /generate returned top logprobs for "
+                f"{len(top)} of {len(tokens)} sampled tokens."
+            )
+        return ChoiceLogprobs(tokens=tokens, top_logprobs=top)
+
     def _lift(
         self,
         results: list[dict[str, Any]],
         body: dict[str, JSONValue],
         *,
+        n: int,
         score_input: bool,
         want_logprobs: bool,
     ) -> Response:
@@ -349,10 +374,15 @@ class SglangTransport:
         input_scoring: InputScoringResult | None = None
         logprobs: tuple[TokenLogprob, ...] | None = None
         top_logprobs: tuple[tuple[TopKEntry, ...], ...] | None = None
+        choice_logprobs: tuple[ChoiceLogprobs, ...] | None = None
 
-        if want_logprobs or score_input:
-            # Logprobs are read from the first sample only (alogprobs enforces
-            # n=1; direct IR callers sampling n>1 with logprobs get sample 0).
+        if want_logprobs and n > 1:
+            # Input scoring is singular, so request invariants refuse it here.
+            top_k = cast(int, body["top_logprobs_num"])
+            choice_logprobs = tuple(
+                self._choice_logprobs(meta, top_k) for meta in metas
+            )
+        elif want_logprobs or score_input:
             meta = metas[0]
             if score_input:
                 self._guard_radix_cache(meta)
@@ -374,6 +404,7 @@ class SglangTransport:
             texts=texts,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
+            choice_logprobs=choice_logprobs,
             input_scoring=input_scoring,
             usage=usage,
             finish_reasons=finish_reasons,
@@ -395,9 +426,15 @@ class SglangTransport:
                 "sglang /generate returned an unexpected response shape "
                 "(missing meta_info)."
             )
+        if len(results) != req.sampling.n:
+            raise RuntimeError(
+                f"sglang /generate returned {len(results)} samples for "
+                f"n={req.sampling.n}."
+            )
         return self._lift(
             results,
             body,
+            n=req.sampling.n,
             score_input=req.scoring.input_scoring,
             want_logprobs=req.scoring.sampled_logprobs,
         )

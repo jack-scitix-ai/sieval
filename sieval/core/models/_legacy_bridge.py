@@ -22,6 +22,7 @@ from sieval.core.utils.serialization import sieval_record
 from ._shared import named_json_value
 from .deployment import BINDING_RESOURCE_KEYS
 from .ir import (
+    ChoiceLogprobs,
     CompletionInput,
     DialectOptions,
     FunctionToolCall,
@@ -38,6 +39,7 @@ from .ir import (
     StructuredOutputParams,
     TokenLogprob,
     ToolParams,
+    TopKEntry,
     UsageStats,
 )
 
@@ -84,6 +86,19 @@ class ModelCallMeta(TypedDict):
 
 @sieval_record
 @dataclass
+class RolloutLogprobs:
+    """One rollout's logprobs, under ``ModelOutput``'s single-sequence names.
+
+    ``top_logprobs`` is ``None`` unless top-k was requested.
+    """
+
+    logprobs_tokens: list[str]
+    logprobs: list[float | None]
+    top_logprobs: list[dict[str, float]] | None = None
+
+
+@sieval_record
+@dataclass
 class ModelOutput:
     """Legacy return type preserved while tasks migrate to ``Response``."""
 
@@ -98,6 +113,9 @@ class ModelOutput:
     logprobs_tokens: list[str] | None = None
     logprobs: list[float | None] | None = None
     top_logprobs: list[dict[str, float]] | None = None
+    #: Per-rollout logprobs, aligned with ``texts``, at ``n > 1``; the three
+    #: fields above then stay ``None``.
+    choice_logprobs: list[RolloutLogprobs] | None = None
     usage: ModelUsage | None = None
     request_params: dict[str, JSONValue] | None = None
     response_model: str | None = None
@@ -429,6 +447,36 @@ def _model_usage(counts: UsageStats) -> ModelUsage:
     return usage
 
 
+def _flat_top_logprobs(
+    positions: tuple[tuple[TopKEntry, ...], ...],
+) -> list[dict[str, float]]:
+    """One ``{token: logprob}`` per position, keeping the best of a repeated token."""
+
+    flat: list[dict[str, float]] = []
+    for position in positions:
+        merged: dict[str, float] = {}
+        for item in position:
+            previous = merged.get(item.token)
+            if previous is None or item.logprob > previous:
+                merged[item.token] = item.logprob
+        flat.append(merged)
+    return flat
+
+
+def _rollout_logprobs(choice: ChoiceLogprobs) -> RolloutLogprobs:
+    # An empty top-k stays ``[]`` (a rollout with no tokens), unlike the
+    # singular field.
+    return RolloutLogprobs(
+        logprobs_tokens=[item.token for item in choice.tokens],
+        logprobs=[item.logprob for item in choice.tokens],
+        top_logprobs=(
+            _flat_top_logprobs(choice.top_logprobs)
+            if choice.top_logprobs is not None
+            else None
+        ),
+    )
+
+
 def response_to_model_output(model_meta: ModelMeta, response: Response) -> ModelOutput:
     """Shape a canonical ``Response`` into the legacy ``ModelOutput``."""
 
@@ -448,15 +496,11 @@ def response_to_model_output(model_meta: ModelMeta, response: Response) -> Model
 
     top_logprobs: list[dict[str, float]] | None = None
     if response.top_logprobs is not None:
-        top_logprobs = []
-        for position in response.top_logprobs:
-            merged: dict[str, float] = {}
-            for item in position:
-                previous = merged.get(item.token)
-                if previous is None or item.logprob > previous:
-                    merged[item.token] = item.logprob
-            top_logprobs.append(merged)
-        top_logprobs = top_logprobs or None
+        top_logprobs = _flat_top_logprobs(response.top_logprobs) or None
+
+    choice_logprobs: list[RolloutLogprobs] | None = None
+    if response.choice_logprobs is not None:
+        choice_logprobs = [_rollout_logprobs(item) for item in response.choice_logprobs]
 
     usage = _model_usage(response.usage) if response.usage is not None else None
     reasoning_texts: list[str] | None = None
@@ -487,6 +531,7 @@ def response_to_model_output(model_meta: ModelMeta, response: Response) -> Model
         logprobs_tokens=logprobs_tokens,
         logprobs=logprobs,
         top_logprobs=top_logprobs,
+        choice_logprobs=choice_logprobs,
         usage=usage,
         request_params=(
             dict(response.request_params)
