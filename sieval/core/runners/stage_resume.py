@@ -32,6 +32,7 @@ from sieval.core.tasks.run_meta import (
     empty_identity,
     prompt_of,
 )
+from sieval.core.utils.atomic import atomic_write
 
 
 class StageResumeError(RuntimeError):
@@ -110,6 +111,33 @@ def iteration_dirs(root: Path) -> list[Path]:
     return sorted(p for p in root.iterdir() if p.is_dir() and p.name.isdigit())
 
 
+#: Written before :func:`copy_recorded_dir` copies anything, removed by
+#: :func:`end_copy` once ``meta.json`` records the run. Until then the shards
+#: are only a copy, possibly partial, and the next copy replaces them.
+COPY_MARKER = ".copying"
+
+
+def copy_pending(root: Path) -> str | None:
+    """The source named by *root*'s :data:`COPY_MARKER`, or ``None``."""
+    try:
+        return (root / COPY_MARKER).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def end_copy(root: Path) -> None:
+    """Remove *root*'s :data:`COPY_MARKER`."""
+    (root / COPY_MARKER).unlink(missing_ok=True)
+
+
+def abandon_copy(root: Path, created: list[Path]) -> None:
+    """Undo a copy into *root* no run began on. The marker stays while any
+    shard directory does, so leftovers remain replaceable."""
+    remove_copied(created)
+    if not iteration_dirs(root):
+        end_copy(root)
+
+
 def copy_recorded_dir(src: Path, dst: Path) -> list[Path]:
     """Copy *src*'s shards into *dst* for a resume across tasks.
 
@@ -119,16 +147,20 @@ def copy_recorded_dir(src: Path, dst: Path) -> list[Path]:
     read-only source yields writable copies. Returns the
     directories created, for :func:`remove_copied` to undo.
 
-    The caller has established that no run started in *dst*, so it holds no
-    ``.idx``; shard directories already there are replaced.
+    :data:`COPY_MARKER` is written first; the caller removes it with
+    :func:`end_copy` once ``meta.json`` records the run.
+
+    The caller has established that *dst* holds no run, only perhaps an
+    unfinished copy, whose shard directories are replaced.
     """
-    remove_copied(iteration_dirs(dst))
     dst.mkdir(parents=True, exist_ok=True)
-    tops = iteration_dirs(src)
-    idx_files = [p for top in tops for p in top.rglob("*.idx")]
-    shift = max((_last_run(p) for p in idx_files), default=0)
+    atomic_write(dst / COPY_MARKER, str(src).encode())
     created: list[Path] = []
     try:
+        remove_copied(iteration_dirs(dst))
+        tops = iteration_dirs(src)
+        idx_files = [p for top in tops for p in top.rglob("*.idx")]
+        shift = max((_last_run(p) for p in idx_files), default=0)
         for top in tops:
             created.append(dst / top.name)
             for dirpath, _dirnames, filenames in os.walk(top):
@@ -140,7 +172,7 @@ def copy_recorded_dir(src: Path, dst: Path) -> list[Path]:
                     elif name.endswith(".idx"):
                         _copy_idx(Path(dirpath) / name, dst / rel / name, shift)
     except BaseException:
-        remove_copied(created)
+        abandon_copy(dst, created)
         raise
     return created
 

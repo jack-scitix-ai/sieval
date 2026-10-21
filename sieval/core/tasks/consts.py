@@ -17,6 +17,11 @@ class TaskStage(StrEnum):
     FAILED = "failed"
 
 
+#: Names of the ``<iteration>/<stage>/`` shard directories; no other
+#: directory under ``<iteration>/`` is read.
+STAGE_DIRS = frozenset(stage.value for stage in TaskStage)
+
+
 class TaskAction(StrEnum):
     """Executable stage actions that advance a sample through the pipeline."""
 
