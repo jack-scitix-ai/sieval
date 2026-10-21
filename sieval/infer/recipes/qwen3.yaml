@@ -431,6 +431,9 @@ qwen3-30b-a3b:
           dtype: bfloat16
           mem_fraction_static: 0.90
           context_length: 16384
+    # 80GB SGLang: 0.87, measured on H100-80G with SGLang 0.5.13.post1 at
+    # tp2×dp4, where 0.90 OOMs DP0's piecewise CUDA graph capture
+    # (scitix/sieval#168). fp8 shares it; A100-80G copies it, unmeasured.
     A100-80G:
       bf16:
         vllm:
@@ -439,7 +442,7 @@ qwen3-30b-a3b:
           max_model_len: 32768
         sglang:
           dtype: bfloat16
-          mem_fraction_static: 0.90
+          mem_fraction_static: 0.87
           context_length: 32768
     H100-80G:
       bf16:
@@ -449,14 +452,14 @@ qwen3-30b-a3b:
           max_model_len: 32768
         sglang:
           dtype: bfloat16
-          mem_fraction_static: 0.90
+          mem_fraction_static: 0.87
           context_length: 32768
       fp8:
         vllm:
           gpu_memory_utilization: 0.95
           max_model_len: 32768
         sglang:
-          mem_fraction_static: 0.90
+          mem_fraction_static: 0.87
           context_length: 32768
     H200-141G:
       bf16:
