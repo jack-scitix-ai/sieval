@@ -39,6 +39,7 @@ AI-Generated Code - Claude Opus 5.5 (Anthropic)
 """
 
 import ast
+import codecs
 import hashlib
 import importlib.util
 import json
@@ -57,7 +58,8 @@ from sieval.core.types import JSONValue
 
 from .services import ServiceIdentity
 
-#: Version of the ``identity`` block's layout.
+#: Version of the ``identity`` block's layout. A digest computed differently is
+#: not a layout change: it reruns one stage, a new schema would discard them all.
 IDENTITY_SCHEMA = 1
 
 #: A per-sample digest of a value that was legitimately absent: the prompt of a
@@ -577,19 +579,40 @@ def _package_files(top: str) -> list[str]:
     shows, so the walk digests it whole.
     """
     found: list[str] = []
+    for _, rel, filenames in _package_dirs(top):
+        prefix = top if rel == "." else f"{top}.{rel.replace(os.sep, '.')}"
+        for filename in sorted(filenames):
+            if not filename.endswith(".py"):
+                continue
+            stem = filename[:-3]
+            found.append(prefix if stem == "__init__" else f"{prefix}.{stem}")
+    return found
+
+
+def _package_dirs(top: str) -> Iterable[tuple[str, str, list[str]]]:
+    """``(root, dir relative to root, file names)`` for each directory of *top*."""
     for root in _root_dirs(top):
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = sorted(
                 d for d in dirnames if not d.startswith((".", "__pycache__"))
             )
-            rel = os.path.relpath(dirpath, root)
-            prefix = top if rel == "." else f"{top}.{rel.replace(os.sep, '.')}"
-            for filename in sorted(filenames):
-                if not filename.endswith(".py"):
-                    continue
-                stem = filename[:-3]
-                found.append(prefix if stem == "__init__" else f"{prefix}.{stem}")
-    return found
+            yield root, os.path.relpath(dirpath, root), filenames
+
+
+def _absent_inits(top: str) -> dict[str, str]:
+    """``{file key: empty digest}`` for each directory of *top* lacking ``__init__.py``.
+
+    sieval-plugins' variant rewrite adds an empty one to each, so a renamed
+    copy keys the same only if a missing one reads as empty.
+    """
+    empty = "sha256:" + hashlib.sha256(b"").hexdigest()
+    return {
+        "/".join(
+            (OWN_PACKAGE, *([] if rel == "." else rel.split(os.sep)), "__init__.py")
+        ): empty
+        for _, rel, filenames in _package_dirs(top)
+        if "__init__.py" not in filenames
+    }
 
 
 #: File-key label of the task class's own plugin package, whatever its name.
@@ -610,6 +633,80 @@ def _file_key(name: str, path: str, own: str | None) -> str:
         if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
             return "/".join((label, *rel.split(os.sep)))
     raise ValueError(f"{path} is outside package {top}")
+
+
+#: The task's own plugin package as its imports are digested; no import spells it.
+SELF_IMPORT = "<package>"
+
+
+def _names_own(module: str | None, own: str) -> bool:
+    return module is not None and (module == own or module.startswith(own + "."))
+
+
+def _self_import_text(node: ast.Import | ast.ImportFrom, own: str) -> str | None:
+    """*node* with *own* spelt :data:`SELF_IMPORT`, or ``None`` if it names none.
+
+    An unaliased ``import own.x`` also binds ``own``, so it reads as
+    ``import <package>.x, <package> as own``, the form sieval-plugins' variant
+    rewrite writes; a following ``own as n`` is taken as that binding. A
+    hand-written ``import own.x, own as n`` therefore still digests per name.
+    """
+    moved = len(own)
+    if isinstance(node, ast.ImportFrom):
+        if node.level or not _names_own(node.module, own):
+            return None
+        module = SELF_IMPORT + cast(str, node.module)[moved:]
+        return ast.unparse(ast.ImportFrom(module=module, names=node.names, level=0))
+    if not any(_names_own(alias.name, own) for alias in node.names):
+        return None
+    names: list[ast.alias] = []
+    for i, alias in enumerate(node.names):
+        if not _names_own(alias.name, own):
+            names.append(alias)
+            continue
+        target = SELF_IMPORT + alias.name[moved:]
+        if alias.asname or alias.name == own:
+            names.append(ast.alias(name=target, asname=alias.asname or own))
+            continue
+        names.append(ast.alias(name=target))
+        following = node.names[i + 1] if i + 1 < len(node.names) else None
+        if following is None or following.name != own or not following.asname:
+            names.append(ast.alias(name=SELF_IMPORT, asname=own))
+    return ast.unparse(ast.Import(names=names))
+
+
+def _without_own_name(source: bytes, own: str) -> bytes:
+    """*source* with each absolute import of *own* as :func:`_self_import_text`.
+
+    Nothing outside those spans changes; comments inside one drop out, as in
+    the variant rewrite. A file that is not UTF-8 or does not parse is returned
+    unchanged.
+    """
+    bom = codecs.BOM_UTF8 if source.startswith(codecs.BOM_UTF8) else b""
+    body = source[len(bom) :]
+    try:
+        # Decoded first, so a coding cookie cannot move the UTF-8 byte offsets.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(body.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, ValueError):
+        return source
+    edits = [
+        (node.lineno, node.col_offset, node.end_lineno, node.end_col_offset, text)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        and (text := _self_import_text(node, own)) is not None
+    ]
+    if not edits:
+        return source
+    starts = [0]
+    for line in body.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    for row, col, end_row, end_col, text in sorted(edits, reverse=True):
+        start = starts[row - 1] + col
+        end = starts[cast(int, end_row) - 1] + cast(int, end_col)
+        body = body[:start] + text.encode("utf-8") + body[end:]
+    return bom + body
 
 
 def _own_package(task_cls: type) -> str | None:
@@ -640,8 +737,10 @@ def grader_modules(task_cls: type) -> dict[str, str]:
     nothing is imported or run. A package outside ``sieval`` that the walk
     reaches is digested whole (:func:`_package_files`); under ``sieval`` only
     what is reached counts. Returns ``{file key: "sha256:…"}`` over each
-    module's source bytes (:func:`_file_key`). A file naming its own package,
-    as an absolute self-import does, digests per name; import it relatively.
+    module's source bytes (:func:`_file_key`). So that a renamed copy of the
+    task's own plugin package digests the same, its imports of itself are
+    digested without its name (:func:`_without_own_name`) and a missing
+    ``__init__.py`` as an empty one (:func:`_absent_inits`).
     """
     starts = {klass.__module__ for klass in task_cls.__mro__}
     own = {root for module in starts if (root := _own_root(module)) is not None}
@@ -673,8 +772,11 @@ def grader_modules(task_cls: type) -> dict[str, str]:
         with open(path, "rb") as f:
             source = f.read()
         key = _file_key(name, path, own_package)
-        modules[key] = "sha256:" + hashlib.sha256(source).hexdigest()
+        hashed = _without_own_name(source, top) if top == own_package else source
+        modules[key] = "sha256:" + hashlib.sha256(hashed).hexdigest()
         pending.extend(_imports_of(name, source, is_package, roots))
+    if own_package is not None:
+        modules = _absent_inits(own_package) | modules
     return dict(sorted(modules.items()))
 
 
