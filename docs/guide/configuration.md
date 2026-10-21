@@ -61,6 +61,45 @@ tasks:
   `SIEVAL_CODE_EVAL_API` is set; see [Services a task needs](infer.md#services-a-task-needs)
 - **Class resolution**: built-in classes (exported by `sieval.tasks` / `sieval.datasets`) use short names; custom classes must use full module paths (`my_pkg.my_module.MyTask`)
 
+## Credentials
+
+Write a key as `api_key`, or name the environment variable holding it with
+`api_key_env` (the loader does not expand `${VAR}`). Either is accepted on a
+root model (top level or `args`) and on an inline `grader` / `extractor`, on
+every dialect. A derived model (`base:`) uses its root's key.
+
+```yaml
+models:
+    candidate:
+        name: org/candidate
+        api_base: https://gateway.example/v1
+        api_key_env: CANDIDATE_API_KEY
+
+tasks:
+    simpleqa_verified_0shot_gen:
+        class: SimpleQAVerifiedZeroShotGenTask
+        dataset: simpleqa
+        model: candidate
+        args:
+            grader:
+                model: gemini-3.8-flash
+                dialect: google_genai
+                api_base: https://generativelanguage.googleapis.com
+                api_key_env: SIEVAL_JUDGE_API_KEY
+```
+
+- Setting both is refused. An unset or empty variable fails before any engine
+  starts, `--dry-run` included.
+- `effective_config.yaml` and `infer_plans.yaml` keep the variable name but
+  write every `api_key` / `authorization` value as `<redacted>`; rerunning such
+  a file is refused until the key is supplied again.
+- Credentials are in no identity: rotating a key, renaming its variable or
+  switching forms resumes without a rerun or regrade. `runs[].config` records
+  a switch of form, not a rotated value.
+
+With neither set, `openai_chat` / `openai_completions` fall back to
+`OPENAI_API_KEY`, as the OpenAI client does.
+
 ## Task Pipeline
 
 Each task implements a typed 5-stage pipeline:
