@@ -161,6 +161,26 @@ class RunIdentity(TypedDict):
     grader: GraderIdentity | None
 
 
+class LimiterPeak(TypedDict):
+    """The most requests a limiter held at once, against its cap."""
+
+    peak: int
+    limit: int | None
+
+
+class RequestCounts(TypedDict):
+    """One phase x model's model requests in a run: calls, attempts, outcomes."""
+
+    calls: int
+    attempts: int
+    outcomes: dict[str, int]
+    in_flight: dict[str, LimiterPeak]
+
+
+#: Request counts by phase, then model id.
+type RunRequests = dict[str, dict[str, RequestCounts]]
+
+
 class RunFrom(TypedDict):
     dir: str
     identity: RunIdentity
@@ -182,6 +202,7 @@ RunRecord = TypedDict(
         "config": NotRequired[list[str]],
         "model": NotRequired[str],
         "from": NotRequired[RunFrom],
+        "requests": NotRequired[RunRequests],
     },
 )
 """One ``runs[]`` entry, appended when a run starts.
@@ -202,6 +223,11 @@ only when it differs from the directory's ``model``, which stays the one whose
 samples are on disk. ``from`` names
 the directory a resume across tasks copied, with that directory's identity when
 it was copied (``None`` stages for a directory that recorded none).
+``requests`` counts the run's model requests by phase and model; absent when
+it made none or ``record_requests`` was off. It is the durable copy:
+``requests.jsonl`` rotates, ``profile.json`` is rewritten by every run, and a
+fast resume keeps ``report.json``'s ``sieval.requests`` from the run that
+wrote it. Not part of any identity.
 """
 
 
