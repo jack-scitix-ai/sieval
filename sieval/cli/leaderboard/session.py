@@ -1418,6 +1418,33 @@ def _reify_cli_overrides(
     return cfg
 
 
+def _refuse_endpoint_with_realized_deployment(
+    config: Mapping[str, Any], realized_deployments: Mapping[str, Deployment]
+) -> None:
+    """Refuse a configured ``api_base`` that differs from the realized one.
+
+    The realized deployment would silently replace it.
+    """
+
+    for name, model_cfg in (config.get("models") or {}).items():
+        deployment = realized_deployments.get(name)
+        if deployment is None or not isinstance(model_cfg, dict):
+            continue
+        args = model_cfg.get("args")
+        configured = {
+            "api_base": model_cfg.get("api_base"),
+            "args.api_base": args.get("api_base") if isinstance(args, dict) else None,
+        }
+        keys = [k for k, v in configured.items() if v and v != deployment.api_base]
+        if keys:
+            raise ValueError(
+                f"Model '{name}' sets {' and '.join(repr(k) for k in keys)} "
+                f"but its realized deployment serves {deployment.api_base!r}; "
+                "remove the api_base to use the deployment, or drop the "
+                "deployment to use the endpoint"
+            )
+
+
 def _apply_endpoint_injection(
     cfg: dict[str, Any], endpoint_map: Mapping[str, str]
 ) -> dict[str, Any]:
@@ -1770,6 +1797,9 @@ class EvalSession:
         self.config: RootConfigDict = cast(
             RootConfigDict,
             _apply_endpoint_injection(reified, self._legacy_endpoint_map),
+        )
+        _refuse_endpoint_with_realized_deployment(
+            self.config, self._realized_deployments
         )
 
         self.deterministic: bool = resolve_deterministic(
@@ -4167,7 +4197,7 @@ class EvalSession:
             if credential is not None:
                 args["api_key"] = credential
             realized = self._realized_deployments.get(name)
-            # A launched engine wins, as on the canonical path.
+            # A conflicting configured api_base was refused at construction.
             if realized is not None:
                 args["api_base"] = realized.api_base
             elif "api_base" in cfg:

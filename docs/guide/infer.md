@@ -123,6 +123,8 @@ A change to any of these changes the grader identity.
 
 Models with a `path` field (and no `api_base`) or an `infer` section in the YAML config are automatically launched by `sieval run` and stopped after evaluation completes.
 
+A top-level `api_base` turns auto-serve off. An `args.api_base` next to `path` or `infer.checkpoint` is refused before any engine starts: keep one or the other.
+
 ### Anthropic Messages
 
 To call the native Anthropic Messages API, select the dialect explicitly and
