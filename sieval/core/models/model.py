@@ -773,11 +773,14 @@ class Model:
         prompt: object,
         *,
         max_tokens: int = 1,
-        logprobs: int = 5,
+        logprobs: int | None = None,
         echo: bool = True,
         temperature: float = 0.0,
         **kwargs: object,
     ) -> ModelOutput:
+        """``logprobs`` is the top-k breadth; unset, 0 with ``echo`` and 5 without."""
+        if logprobs is None:
+            logprobs = 0 if echo else 5
         if echo:
             self.assert_capability(Capability.InputScoring)
         req = self._build_logprobs_request(
@@ -833,7 +836,7 @@ class Model:
                 "max_tokens": max_tokens,
                 "temperature": temperature,
                 "return_logprobs": not score_input,
-                "top_logprobs": logprobs if not score_input else 0,
+                "top_logprobs": logprobs,
                 "score_input": score_input,
             }
         )

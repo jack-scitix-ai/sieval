@@ -18,9 +18,9 @@ real sglang responses. One improvement over the legacy path: the native
 
 The IR split is cleaner than the legacy ``echo`` concatenation:
 ``input_token_logprobs`` → ``Response.input_scoring`` and
-``output_token_logprobs`` → ``Response.logprobs``, never merged. sglang's
-``input_top_logprobs`` has no IR field and is not lifted (no consumer reads
-prompt-side top-k).
+``output_token_logprobs`` → ``Response.logprobs``, never merged; likewise
+``input_top_logprobs`` → ``InputScoringResult.top_logprobs`` and
+``output_top_logprobs`` → ``Response.top_logprobs``.
 
 ``Request.stream`` is ignored: the native ``/generate`` path has always been a
 single POST (pure scheduling, no content impact). Unrecognized
@@ -277,6 +277,20 @@ class SglangTransport:
             )
         return tuple(result)
 
+    @classmethod
+    def _input_top_logprobs(
+        cls, meta: dict[str, Any], positions: int
+    ) -> tuple[tuple[TopKEntry, ...], ...]:
+        """Lift ``input_top_logprobs``; the first token's ``None`` becomes ``()``."""
+        top = cls._triples_to_topk(meta.get("input_top_logprobs") or [])
+        if top is None or len(top) != positions:
+            raise RuntimeError(
+                "sglang returned input top-k logprobs for "
+                f"{0 if top is None else len(top)} of {positions} echoed input "
+                "tokens; refusing to misalign them."
+            )
+        return top
+
     @staticmethod
     def _parse_usage(metas: list[dict[str, Any]]) -> UsageStats | None:
         """Build usage from sglang ``meta_info`` token counts.
@@ -365,6 +379,7 @@ class SglangTransport:
         n: int,
         score_input: bool,
         want_logprobs: bool,
+        want_top_logprobs: bool,
     ) -> Response:
         metas = [r["meta_info"] for r in results]
         texts = tuple(r.get("text", "") for r in results)
@@ -386,10 +401,14 @@ class SglangTransport:
             meta = metas[0]
             if score_input:
                 self._guard_radix_cache(meta)
+                input_tokens = self._triples_to_tokens(
+                    meta.get("input_token_logprobs") or []
+                )
+                input_top = None
+                if want_top_logprobs:
+                    input_top = self._input_top_logprobs(meta, len(input_tokens))
                 input_scoring = InputScoringResult(
-                    token_logprobs=self._triples_to_tokens(
-                        meta.get("input_token_logprobs") or []
-                    )
+                    token_logprobs=input_tokens, top_logprobs=input_top
                 )
             logprobs = self._triples_to_tokens(meta.get("output_token_logprobs") or [])
             top_logprobs = self._triples_to_topk(meta.get("output_top_logprobs") or [])
@@ -437,4 +456,5 @@ class SglangTransport:
             n=req.sampling.n,
             score_input=req.scoring.input_scoring,
             want_logprobs=req.scoring.sampled_logprobs,
+            want_top_logprobs=req.scoring.top_logprobs > 0,
         )

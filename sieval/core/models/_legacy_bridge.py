@@ -113,6 +113,10 @@ class ModelOutput:
     logprobs_tokens: list[str] | None = None
     logprobs: list[float | None] | None = None
     top_logprobs: list[dict[str, float]] | None = None
+    #: Top-k per echoed input token, aligned with the start of
+    #: ``logprobs_tokens`` (``{}`` for the first). Set when a request scores
+    #: its input with ``top_logprobs > 0``; ``top_logprobs`` stays sampled-only.
+    input_top_logprobs: list[dict[str, float]] | None = None
     #: Per-rollout logprobs, aligned with ``texts``, at ``n > 1``; the three
     #: fields above then stay ``None``.
     choice_logprobs: list[RolloutLogprobs] | None = None
@@ -497,6 +501,12 @@ def response_to_model_output(model_meta: ModelMeta, response: Response) -> Model
     top_logprobs: list[dict[str, float]] | None = None
     if response.top_logprobs is not None:
         top_logprobs = _flat_top_logprobs(response.top_logprobs) or None
+    input_top_logprobs: list[dict[str, float]] | None = None
+    if (
+        response.input_scoring is not None
+        and response.input_scoring.top_logprobs is not None
+    ):
+        input_top_logprobs = _flat_top_logprobs(response.input_scoring.top_logprobs)
 
     choice_logprobs: list[RolloutLogprobs] | None = None
     if response.choice_logprobs is not None:
@@ -531,6 +541,7 @@ def response_to_model_output(model_meta: ModelMeta, response: Response) -> Model
         logprobs_tokens=logprobs_tokens,
         logprobs=logprobs,
         top_logprobs=top_logprobs,
+        input_top_logprobs=input_top_logprobs,
         choice_logprobs=choice_logprobs,
         usage=usage,
         request_params=(

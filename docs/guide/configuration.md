@@ -164,6 +164,12 @@ A refused request fails before any network I/O; a reply missing a rollout's
 logprobs fails that sample. `infer_args` are part of the inference identity,
 so changing them on a resume reruns inference.
 
+With `echo` (`alogprobs(text, echo=True, logprobs=N)` or `infer_args: {echo:
+true, top_logprobs: N}`), each input token's top-N lands in
+`ModelOutput.input_top_logprobs` (`{}` for the first); `top_logprobs` keeps
+the generated tokens'. Served by `sglang_legacy` and `openai_completions`.
+The reply grows by N entries per input token.
+
 ## Task Pipeline
 
 Each task implements a typed 5-stage pipeline:

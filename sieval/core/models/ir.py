@@ -273,6 +273,8 @@ class SamplingParams:
 
 @dataclass(frozen=True)
 class ScoringParams:
+    """``top_logprobs`` applies to every scored position, input ones included."""
+
     input_scoring: bool = False
     sampled_logprobs: bool = False
     top_logprobs: int = 0
@@ -398,9 +400,12 @@ class ChoiceLogprobs:
 @sieval_record
 @dataclass(frozen=True)
 class InputScoringResult:
+    """``top_logprobs``, when requested, aligns with ``token_logprobs``."""
+
     token_logprobs: tuple[TokenLogprob, ...]
     byte_count: int | None = None
     char_count: int | None = None
+    top_logprobs: tuple[tuple[TopKEntry, ...], ...] | None = None
 
 
 @sieval_record
