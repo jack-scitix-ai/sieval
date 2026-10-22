@@ -16,8 +16,8 @@ from typing import Literal
 
 from sieval.core.datasets.meta import DatasetMeta
 from sieval.core.tasks.meta import TaskMeta
-from sieval.datasets.downloaders import resolve as resolve_handler
 from sieval.datasets.downloaders.resolver import extras_unsatisfied
+from sieval.datasets.downloaders.staged import probe_source
 
 MissingKind = Literal["data", "dataset-deps", "task-deps"]
 
@@ -31,13 +31,15 @@ MISSING_KINDS: tuple[MissingKind, ...] = ("data", "dataset-deps", "task-deps")
 class MissingEntry:
     """One concrete remediation step the user can take.
 
-    `kind="data"` populates `sources` (raw `source` strings from DatasetMeta);
+    `kind="data"` populates `sources` (raw `source` strings from DatasetMeta)
+    and `stale` (source → reason, for the subset staged with other bytes);
     `kind="dataset-deps"` / `"task-deps"` populate `group` (extras group name)
     and `unmet` (verbatim output of `extras_unsatisfied`).
     """
 
     kind: MissingKind
     sources: tuple[str, ...] = ()
+    stale: tuple[tuple[str, str], ...] = ()
     group: str | None = None
     unmet: tuple[str, ...] = ()
 
@@ -61,7 +63,8 @@ class ReadinessReport:
 def missing_entry_to_dict(e: MissingEntry) -> dict:
     """Flatten a MissingEntry to its wire-format shape (kind-specific keys)."""
     if e.kind == "data":
-        return {"kind": "data", "sources": list(e.sources)}
+        # `stale` is always present (possibly empty), like `sources`.
+        return {"kind": "data", "sources": list(e.sources), "stale": dict(e.stale)}
     return {"kind": e.kind, "group": e.group, "unmet": list(e.unmet)}
 
 
@@ -82,17 +85,24 @@ def _probe_dataset(
     entries: list[MissingEntry] = []
     had_unknown = False
 
+    # A stale source counts as missing: it is not the data the registry pins.
     data_missing: list[str] = []
+    stale: list[tuple[str, str]] = []
     for src in ds_meta.source:
         try:
-            handler = resolve_handler(src)
+            probe = probe_source(ds_meta, src, data_dir)
         except NotImplementedError:
             had_unknown = True
             continue
-        if not handler.is_downloaded(src, data_dir, ds_meta.name):
-            data_missing.append(src)
+        if probe.status == "pinned":
+            continue
+        data_missing.append(src)
+        if probe.reason is not None:
+            stale.append((src, probe.reason))
     if data_missing:
-        entries.append(MissingEntry(kind="data", sources=tuple(data_missing)))
+        entries.append(
+            MissingEntry(kind="data", sources=tuple(data_missing), stale=tuple(stale))
+        )
 
     # Dataset-deps axis — runs regardless of the data-axis outcome.
     if ds_meta.deps_group:

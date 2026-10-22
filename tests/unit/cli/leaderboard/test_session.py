@@ -8,6 +8,7 @@ AI-Generated Code - Claude Opus 4.6 (Anthropic)
 import dataclasses
 import hashlib
 import json
+import os
 import re
 import types
 from pathlib import Path
@@ -9640,3 +9641,86 @@ datasets:
         )
         with pytest.raises(ValueError, match="frontmatter"):
             EvalSession(yaml_path)
+
+
+# ── _refuse_unpinned_staging ──
+
+
+def _stage_aime_2024(dest_root, commit):
+    """Stage `HuggingFaceH4/aime_2024` with a download record naming *commit*,
+    or, for ``None``, as a hand-placed file with no record (issue #179)."""
+    local_dir = dest_root / "HuggingFaceH4" / "aime_2024"
+    local_dir.mkdir(parents=True)
+    (local_dir / "train.jsonl").write_text("{}\n")
+    if commit is not None:
+        record = local_dir / ".cache/huggingface/download/train.jsonl.metadata"
+        record.parent.mkdir(parents=True)
+        record.write_text(f"{commit}\netag\n1786191938.5\n")
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["HuggingFaceH4/aime_2024", "${SIEVAL_DATA_DIR}/HuggingFaceH4/aime_2024"],
+)
+def test_refuse_unpinned_staging_refuses_a_hand_placed_copy(
+    monkeypatch, tmp_path, path
+):
+    """Both YAML spellings of the staged path resolve to the same directory."""
+    from sieval.cli.leaderboard.session import _refuse_unpinned_staging
+    from sieval.datasets import AIME2024Dataset
+
+    monkeypatch.setenv("SIEVAL_DATA_DIR", str(tmp_path))
+    _stage_aime_2024(tmp_path, None)
+    with pytest.raises(RuntimeError) as exc_info:
+        _refuse_unpinned_staging("aime", AIME2024Dataset, os.path.expandvars(path))
+    message = str(exc_info.value)
+    assert "train.jsonl has no download record" in message
+    assert "sieval dataset download aime_2024 --force" in message
+
+
+def test_refuse_unpinned_staging_passes_the_pinned_snapshot(monkeypatch, tmp_path):
+    from sieval.cli.leaderboard.session import _refuse_unpinned_staging
+    from sieval.datasets import AIME2024Dataset
+    from sieval.datasets.aime_2024 import AIME_2024_REVISION
+
+    monkeypatch.setenv("SIEVAL_DATA_DIR", str(tmp_path))
+    _stage_aime_2024(tmp_path, AIME_2024_REVISION)
+    _refuse_unpinned_staging("aime", AIME2024Dataset, "HuggingFaceH4/aime_2024")
+
+
+def test_refuse_unpinned_staging_passes_a_path_outside_staging(monkeypatch, tmp_path):
+    """A user's own copy elsewhere has no pin to compare against."""
+    from sieval.cli.leaderboard.session import _refuse_unpinned_staging
+    from sieval.datasets import AIME2024Dataset
+
+    monkeypatch.setenv("SIEVAL_DATA_DIR", str(tmp_path / "data"))
+    _stage_aime_2024(tmp_path / "data", None)
+    own = tmp_path / "mine"
+    own.mkdir()
+    _refuse_unpinned_staging("aime", AIME2024Dataset, str(own))
+
+
+def test_refuse_unpinned_staging_skips_an_undecorated_class(monkeypatch, tmp_path):
+    from sieval.cli.leaderboard.session import _refuse_unpinned_staging
+
+    class Custom:
+        pass
+
+    monkeypatch.setenv("SIEVAL_DATA_DIR", str(tmp_path))
+    _stage_aime_2024(tmp_path, None)
+    _refuse_unpinned_staging("x", Custom, "HuggingFaceH4/aime_2024")
+
+
+def test_setup_datasets_refuses_a_hand_placed_staging_dir(monkeypatch, tmp_path):
+    """Wired into `_setup_datasets`: the load never runs on unpinned bytes."""
+    monkeypatch.setenv("SIEVAL_DATA_DIR", str(tmp_path))
+    _stage_aime_2024(tmp_path, None)
+    session = TestSetupDatasetsErrors()._make_runner(
+        {"aime": {"class": "AIME2024Dataset", "path": "HuggingFaceH4/aime_2024"}}
+    )
+    with (
+        patch("sieval.datasets.AIME2024Dataset.load") as mock_load,
+        pytest.raises(RuntimeError, match="no download record"),
+    ):
+        session._setup_datasets()
+    mock_load.assert_not_called()

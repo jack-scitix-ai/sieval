@@ -25,6 +25,7 @@ from sieval.datasets.downloaders import resolve as resolve_handler
 from sieval.datasets.downloaders.hf import parse_hf_source
 from sieval.datasets.downloaders.local import LocalSourceUnavailable
 from sieval.datasets.downloaders.resolver import extras_unsatisfied
+from sieval.datasets.downloaders.staged import probe_source, staged_dir
 from sieval.datasets.downloaders.verify import verify_checksums
 from sieval.meta import load_index
 
@@ -313,7 +314,15 @@ def _download_one(
     already_present = 0
     for src in m.source:
         h = resolve_handler(src)
-        if h.is_downloaded(src, dest_root, m.name) and not force:
+        probe = None if force else probe_source(m, src, dest_root)
+        if probe is not None and probe.status == "stale":
+            # Refuse, not clear: in a shared data dir they may be someone's copy.
+            raise RuntimeError(
+                f"{src} is staged at {staged_dir(m, src, dest_root)} but is not "
+                f"the pinned data: {probe.reason}. Re-run "
+                f"`sieval dataset download {m.name} --force` to replace it."
+            )
+        if probe is not None and probe.status == "pinned":
             # Progress, not result data: `log_user` keeps it on stderr so
             # `--output json` stays parseable on stdout.
             log_user("[{}] already present: {}", m.name, src)

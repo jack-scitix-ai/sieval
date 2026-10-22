@@ -13,6 +13,8 @@ indirection, no offline/online split inside ``datasets.load_dataset``.
 AI-Generated Code - Claude Opus 4.7 (1M context) (Anthropic)
 """
 
+import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,6 +56,9 @@ class HFHandler:
 
         parsed = parse_hf_source(source)
         local_dir = dest_root / parsed.repo_id
+        if force and local_dir.exists():
+            # `snapshot_download` keeps files it did not write.
+            shutil.rmtree(local_dir)
         local_dir.mkdir(parents=True, exist_ok=True)
         snapshot_download(
             repo_id=parsed.repo_id,
@@ -90,3 +95,51 @@ class HFHandler:
             if p.suffix in _DATA_SUFFIXES:
                 return True
         return False
+
+
+def pin_mismatch(source: str, dest_root: Path) -> str | None:
+    """Why the staged repo is not the pinned revision; ``None`` if it is.
+
+    ``snapshot_download(local_dir=...)`` records each file as
+    ``.cache/huggingface/download/<path>.metadata``, first line the commit.
+    Files and records must pair up, each naming the pin. An in-place edit of a
+    downloaded file goes unnoticed.
+
+    Parsed here, not via ``huggingface_hub._local_folder``: its reader takes
+    locks and deletes records it cannot parse.
+    """
+    parsed = parse_hf_source(source)
+    local_dir = dest_root / parsed.repo_id
+    record_dir = local_dir / ".cache" / "huggingface" / "download"
+    files = _relative_files(local_dir, skip=".cache")
+    records = {
+        rel.removesuffix(".metadata")
+        for rel in _relative_files(record_dir)
+        if rel.endswith(".metadata")
+    }
+    if deleted := records - files:
+        return f"{min(deleted)} was downloaded but is missing"
+    for rel in sorted(files):
+        try:
+            commit = (record_dir / f"{rel}.metadata").read_text().partition("\n")[0]
+        except OSError:
+            commit = ""
+        if not commit:
+            return f"{rel} has no download record, so its revision is unknown"
+        if parsed.revision is not None and commit != parsed.revision:
+            return f"{rel} is from revision {commit}, expected {parsed.revision}"
+    return None
+
+
+def _relative_files(root: Path, skip: str | None = None) -> set[str]:
+    """POSIX paths of the files under *root*, pruning the top-level *skip* dir.
+
+    ``os.walk`` rather than ``rglob``: a 1k-file repo walks in ~1 ms, not ~90.
+    """
+    out: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        if skip is not None and dirpath == str(root):
+            dirnames[:] = [d for d in dirnames if d != skip]
+        rel = Path(dirpath).relative_to(root).as_posix()
+        out.update(f if rel == "." else f"{rel}/{f}" for f in filenames)
+    return out
