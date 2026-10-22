@@ -6844,6 +6844,98 @@ tasks:
         close.assert_awaited_once()
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("dialect", ["sglang_legacy", "openai_completions"])
+    @pytest.mark.parametrize(
+        "endpoint_config",
+        [
+            "",
+            "    api_base: https://proxy.example/v1\n",
+            "    args:\n      api_base: https://proxy.example/v1\n",
+        ],
+        ids=["none", "top_level", "args"],
+    )
+    async def test_launched_endpoint_wins_for_every_dialect(
+        self, tmp_path: Path, dialect: str, endpoint_config: str
+    ) -> None:
+        from sieval.core.models import (
+            Deployment,
+            Engine,
+            ServingFacts,
+            SglangGenModel,
+        )
+        from sieval.infer import deployment_plan_projection
+
+        config_path = self._config(
+            tmp_path,
+            f"""
+models:
+  m:
+    name: org/model
+    type: gen
+    engine: sglang
+    dialect: {dialect}
+    api_key: local
+{endpoint_config}tasks:
+  completion:
+    class: fake.CompletionTask
+    dataset:
+      class: fake.Dataset
+    model: m
+""",
+        )
+        raw_plan = {"backend": "sglang", "checkpoint": "/models/m", "assignments": []}
+        realized = Deployment(
+            deployment_id="served-m",
+            plan=deployment_plan_projection(raw_plan),
+            engine=Engine("sglang"),
+            engine_source="deployment",
+            api_base="http://127.0.0.1:30000/v1",
+            endpoints={"full": "http://127.0.0.1:30000/v1"},
+            topology=None,
+            metrics_url=None,
+            facts=ServingFacts(),
+        )
+        session = EvalSession(
+            config_path,
+            infer_plans={"m": raw_plan},
+            realized_deployments={"m": realized},
+        )
+
+        def client(**kwargs: Any) -> types.SimpleNamespace:
+            base_url = kwargs["base_url"] or "https://api.openai.com/v1"
+            return types.SimpleNamespace(close=AsyncMock(), base_url=base_url)
+
+        with (
+            patch(
+                "sieval.cli.leaderboard.session.resolve_task_class",
+                return_value=self.CompletionTask,
+            ),
+            patch(
+                "sieval.core.models.sglang_gen_model.AsyncOpenAI",
+                side_effect=client,
+            ) as legacy_client,
+            patch(
+                "sieval.core.models.connection_factory.AsyncOpenAI",
+                side_effect=client,
+            ) as canonical_client,
+        ):
+            session._setup_prelaunch_reconciliation()
+            session._setup_postlaunch_reconciliation()
+            session._setup_models()
+
+        launched = "http://127.0.0.1:30000/v1"
+        calls = [*legacy_client.call_args_list, *canonical_client.call_args_list]
+        assert [call.kwargs["base_url"] for call in calls] == [launched]
+        model = session.models["m"]
+        assert model.deployment.api_base == launched
+        if dialect == "sglang_legacy":
+            assert isinstance(model, SglangGenModel)
+            generate_url = model._legacy_transport._generate_url()
+            assert generate_url == "http://127.0.0.1:30000/generate"
+
+        await session._close_owned_model_resources()
+
+    @pytest.mark.anyio
     async def test_deterministic_sglang_legacy_does_not_auto_inject_request_seed(
         self, tmp_path: Path
     ) -> None:
