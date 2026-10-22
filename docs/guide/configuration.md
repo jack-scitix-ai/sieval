@@ -61,6 +61,27 @@ tasks:
   `SIEVAL_CODE_EVAL_API` is set; see [Services a task needs](infer.md#services-a-task-needs)
 - **Class resolution**: built-in classes (exported by `sieval.tasks` / `sieval.datasets`) use short names; custom classes must use full module paths (`my_pkg.my_module.MyTask`)
 
+## Model on the Command Line
+
+A config without `models:` can name its model at run time:
+
+```bash
+sieval run benchmark.yaml --checkpoint /models/my-sft          # launch, then evaluate
+sieval eval benchmark.yaml --api-base http://localhost:8000/v1 --model my-sft
+```
+
+The flag becomes the config's one `models:` entry, `{path: <absolute
+checkpoint>}` or `{api_base: <url>}`, plus `name: <--model>`. It is keyed by
+the last path segment of `--model`, else of the checkpoint, and recorded in
+`effective_config.yaml`, so that file reruns and resumes with no flags.
+
+- `--checkpoint` launches with the default infer plan; anything more needs
+  `models:`. `sieval eval` has no `--checkpoint`.
+- `--api-base` needs `--model` and turns auto-serve off. Its key comes from
+  `OPENAI_API_KEY`.
+- Both flags, or either on a config that defines `models:`, is refused. A task
+  naming another model (a judge) still needs `models:`.
+
 ## Credentials
 
 Write a key as `api_key`, or name the environment variable holding it with

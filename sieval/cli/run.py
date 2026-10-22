@@ -17,6 +17,12 @@ import typer
 import yaml
 from loguru import logger
 
+from sieval.cli._cli_model import (
+    ApiBaseOption,
+    CheckpointOption,
+    CliModel,
+    apply_cli_model,
+)
 from sieval.cli._resume_option import (
     ResumeCommand,
     ResumeFromOption,
@@ -159,12 +165,16 @@ async def _run_dry_run(
     model: str | None = None,
     result_dir: str | None = None,
     deterministic: bool | None = None,
+    cli_model: CliModel | None = None,
 ) -> dict[str, object]:
     """Resolve the same managed batch and return the pure prelaunch plan."""
 
     from sieval.cli.validation import run_dry_run
 
-    if not config_path.exists():
+    def checks(
+        infer_plans: dict[str, dict[str, Any]] | None = None,
+        self_managed_endpoints: frozenset[str] = frozenset(),
+    ) -> dict[str, object]:
         return dict(
             cast(
                 Mapping[str, object],
@@ -174,37 +184,32 @@ async def _run_dry_run(
                     resume=resume,
                     result_dir_override=result_dir,
                     deterministic_override=deterministic,
+                    infer_plans=infer_plans,
                     invocation=shlex.join(sys.argv),
+                    self_managed_endpoints=self_managed_endpoints,
+                    cli_model=cli_model,
                 ),
             )
         )
+
+    if not config_path.exists():
+        return checks()
 
     with open(config_path) as stream:
         loaded = yaml.safe_load(stream)
     if not isinstance(loaded, dict):
         raise ValueError("evaluation config must be a mapping")
+    try:
+        apply_cli_model(loaded, cli_model, model)
+    except ValueError:
+        return checks()  # reported as the failed cli_model check
     effective_deterministic = resolve_deterministic(deterministic, loaded)
     plan_dicts, prepared_launches = await _prepare_launch_batch(
         config_path,
         loaded,
         effective_deterministic=effective_deterministic,
     )
-
-    return dict(
-        cast(
-            Mapping[str, object],
-            run_dry_run(
-                config_path,
-                model_override=model,
-                resume=resume,
-                result_dir_override=result_dir,
-                deterministic_override=deterministic,
-                infer_plans=plan_dicts or None,
-                invocation=shlex.join(sys.argv),
-                self_managed_endpoints=frozenset(prepared_launches),
-            ),
-        )
-    )
+    return checks(plan_dicts or None, frozenset(prepared_launches))
 
 
 async def _run_all(
@@ -216,12 +221,15 @@ async def _run_all(
     deterministic: bool | None = None,
     ready_timeout: float = DEFAULT_READY_TIMEOUT,
     keep_logs: int | None = None,
+    cli_model: CliModel | None = None,
 ) -> dict[str, object]:
     """Orchestrate: start services -> run eval -> stop services.
 
     Two triggers cause a model to be auto-served:
       1. Explicit ``infer`` section in the model config.
       2. Top-level ``path`` field without ``api_base`` (path-only shortcut).
+
+    *cli_model* is added to the config before either of those is decided.
 
     Handles go under ``run-<pid>/``, removed when the run ends. Engine logs go
     to ``<result_dir>/logs/<model>/<role>.log`` when a result_dir is set,
@@ -234,6 +242,9 @@ async def _run_all(
 
     with open(config_path) as f:
         config = yaml.safe_load(f)
+    if not isinstance(config, dict):
+        raise ValueError("evaluation config must be a mapping")
+    apply_cli_model(config, cli_model, model)
 
     # Path-only models skip resolve_infer_config (which reads YAML
     # `deterministic: true`), so compute the effective flag here and apply
@@ -280,6 +291,7 @@ async def _run_all(
             invocation=invocation,
             self_managed_endpoints=frozenset(prepared_launches),
             check_services=True,
+            cli_model=cli_model,
         )
         launch_patches = {
             root_key: dict(deployment_plan.launch_patch)
@@ -393,6 +405,7 @@ async def _run_all(
             infer_plans=plan_dicts or None,
             invocation=invocation,
             realized_deployments=realized_deployments or None,
+            cli_model=cli_model,
         )
         return reports
 
@@ -426,6 +439,8 @@ def register_run_command(app: typer.Typer) -> None:
                 help="Override model name for all base models",
             ),
         ] = None,
+        checkpoint: CheckpointOption = None,
+        api_base: ApiBaseOption = None,
         resume: ResumeOption = None,
         result_dir: Annotated[
             str | None,
@@ -486,6 +501,9 @@ def register_run_command(app: typer.Typer) -> None:
         """All-in-one: launch inference services, run evaluation, and cleanup."""
         configure_logging(verbose)
         resumed = cli_resume(resume, resume_from)
+        cli_model = CliModel.from_options(
+            checkpoint=checkpoint, api_base=api_base, model=model
+        )
         if dry_run:
 
             async def _go_dry() -> dict[str, object]:
@@ -495,6 +513,7 @@ def register_run_command(app: typer.Typer) -> None:
                     model=model,
                     result_dir=result_dir,
                     deterministic=deterministic,
+                    cli_model=cli_model,
                 )
 
             try:
@@ -538,6 +557,7 @@ def register_run_command(app: typer.Typer) -> None:
                 deterministic=deterministic,
                 ready_timeout=ready_timeout,
                 keep_logs=keep_logs,
+                cli_model=cli_model,
             )
 
         try:
