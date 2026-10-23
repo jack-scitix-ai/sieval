@@ -704,6 +704,32 @@ def validate_eval_config_imports(cfg: dict) -> ValidationResult:
     return result
 
 
+def task_report_metrics_json(
+    cfg: Mapping[str, Any], task: str
+) -> dict[str, list[str]] | None:
+    """*task*'s report metric names and patterns, ``None`` where unknown.
+
+    See :mod:`sieval.core.tasks.report_metrics`. A class that does not resolve
+    is unknown; the imports check reports it.
+
+    Raises:
+        TypeError: if the class's ``report_metrics`` is malformed.
+    """
+    from sieval.meta.report_metrics import task_report_metrics
+
+    tasks = cfg.get("tasks")
+    task_cfg = tasks.get(task) if isinstance(tasks, Mapping) else None
+    spec = task_cfg.get("class") if isinstance(task_cfg, Mapping) else None
+    if not isinstance(spec, str):
+        return None
+    try:
+        task_cls = resolve_task_class(spec)
+    except Exception:
+        return None
+    declared = task_report_metrics(task_cls)
+    return declared.to_json() if declared is not None else None
+
+
 # ---------------------------------------------------------------------------
 # Dry-run orchestration
 # ---------------------------------------------------------------------------

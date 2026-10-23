@@ -399,16 +399,22 @@ def _plan_summary(plans: Mapping[str, RunPlan | Exception]) -> str:
     return f"{len(ok)} task(s): {to_infer} sample(s) to infer, {to_grade} to grade"
 
 
-def _task_json(model: str | None, plan: RunPlan | Exception) -> dict[str, object]:
+def _task_json(
+    model: str | None,
+    plan: RunPlan | Exception,
+    metrics: dict[str, list[str]] | None = None,
+) -> dict[str, object]:
     """A task's entry in the dry-run report.
 
     ``resume_plan`` is the plan's ``outcomes``, the counts ``runs[].resume``
     records, and ``stages`` its stage comparison; both ``None`` for a fresh
     start, which has no recorded samples. ``needs_inference`` is
     :func:`_infers`, the test :func:`_models_to_launch` launches by.
+    ``metrics`` is :func:`~sieval.cli.validation.task_report_metrics_json`,
+    kept beside a refusal.
     """
     if isinstance(plan, Exception):
-        return {"model": model, "error": cli_error_message(plan)}
+        return {"model": model, "error": cli_error_message(plan), "metrics": metrics}
     return {
         "model": model,
         "start": plan["start"],
@@ -420,6 +426,7 @@ def _task_json(model: str | None, plan: RunPlan | Exception) -> dict[str, object
         "to_infer": plan["to_infer"],
         "to_grade": plan["to_grade"],
         "needs_inference": _infers(plan),
+        "metrics": metrics,
     }
 
 
@@ -440,7 +447,7 @@ async def _run_dry_run(
     starts each vendored service a task declares, as the run does.
     """
 
-    from sieval.cli.validation import run_dry_run
+    from sieval.cli.validation import run_dry_run, task_report_metrics_json
 
     def checks(
         infer_plans: dict[str, dict[str, Any]] | None = None,
@@ -526,9 +533,26 @@ async def _run_dry_run(
         result["n_errors"] = cast(int, result["n_errors"]) + 1
         return unplanned(result)
     refused = {t: p for t, p in plans.items() if isinstance(p, Exception)}
+    metrics: dict[str, dict[str, list[str]] | None] = {}
+    malformed: dict[str, TypeError] = {}
+    for task in plans:
+        try:
+            metrics[task] = task_report_metrics_json(loaded, task)
+        except TypeError as exc:
+            metrics[task], malformed[task] = None, exc
     result["tasks"] = {
-        task: _task_json(task_models.get(task), plan) for task, plan in plans.items()
+        task: _task_json(task_models.get(task), plan, metrics[task])
+        for task, plan in plans.items()
     }
+    if malformed:
+        checks_list.append(
+            {
+                "name": "report_metrics",
+                "ok": False,
+                "detail": "; ".join(f"{t}: {e}" for t, e in sorted(malformed.items())),
+            }
+        )
+        result["n_errors"] = cast(int, result["n_errors"]) + 1
     if refused:
         checks_list.append(
             {

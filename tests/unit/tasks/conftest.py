@@ -38,12 +38,17 @@ Skipping happens before fixture setup, so the probe interpreter never starts.
 and the task tests. Deleting the variable alone is not enough: google-auth then
 probes the GCE metadata server, which on a host off GCP costs ~12s of timeouts.
 
+**Report metric names.** Every ``report()`` a test here runs must write only
+numeric keys its declaration (``sieval/meta/report_metrics.py``) names or matches.
+
 AI-Generated Code - Claude Fable 5 (Anthropic)
 """
 
 import contextlib
+import functools
 import importlib
 import os
+import pkgutil
 import tempfile
 from pathlib import Path
 
@@ -131,3 +136,57 @@ def no_bigquery_credentials(monkeypatch):
         raise RuntimeError("no application default credentials")
 
     monkeypatch.setattr(google_auth, "default", _nothing_configured)
+
+
+@functools.cache
+def _owners() -> tuple[type, ...]:
+    """Each built-in class that defines ``report``, from every task module."""
+    import sieval.tasks
+    from sieval.core.tasks.task import Task
+
+    for module in pkgutil.walk_packages(sieval.tasks.__path__, "sieval.tasks."):
+        with contextlib.suppress(ImportError):
+            importlib.import_module(module.name)
+    seen: list[type] = []
+    pending = list(Task.__subclasses__())
+    while pending:
+        cls = pending.pop()
+        pending += cls.__subclasses__()
+        if "report" in vars(cls) and cls.__module__.startswith("sieval.tasks."):
+            seen.append(cls)
+    return tuple(seen)
+
+
+def _numeric(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+@pytest.fixture(autouse=True)
+def _report_writes_only_declared_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail a test whose task report writes a metric its declaration lacks."""
+    from sieval.core.tasks.task import Task
+    from sieval.meta.report_metrics import task_report_metrics
+
+    for owner in _owners():
+
+        def checked(report, owner=owner):
+            @functools.wraps(report)
+            async def wrapper(self, finals, fails):
+                out = await report(self, finals, fails)
+                cls = type(self) if isinstance(self, Task) else owner
+                declared = task_report_metrics(cls)
+                if isinstance(out, dict) and declared is not None:
+                    undeclared = sorted(
+                        key
+                        for key, value in out.items()
+                        if _numeric(value) and declared.match(key) is None
+                    )
+                    assert not undeclared, (
+                        f"{cls.__qualname__}.report() wrote {undeclared}, which "
+                        "sieval/meta/report_metrics.py does not declare"
+                    )
+                return out
+
+            return wrapper
+
+        monkeypatch.setattr(owner, "report", checked(vars(owner)["report"]))

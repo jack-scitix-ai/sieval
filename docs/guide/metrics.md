@@ -663,6 +663,39 @@ unit), `timeouts` (the code family), `exact_match` / `flexible_exact_match`
 `score_<category>` (MMLU, MMLU-Pro), and UGMathBench's `eacc` / `aacc` / `cacc` /
 `delta`. `score_key` always names which of them the headline came from.
 
+## Report metric names
+
+`sieval run --dry-run -o json` reports the keys each task's report may write, as
+`tasks.<task>.metrics` ([What a run would do](configuration.md#what-a-run-would-do)),
+so a criterion naming a metric the task never reports can be refused before the run.
+
+```json
+{"names": ["fails", "n_problems", "score"], "patterns": ["score_{category}"]}
+```
+
+`names` are written as spelled; a `{placeholder}` in a pattern stands for one or
+more characters taken from the data. Either may be absent from a run whose data
+lacks it, or that cannot compute it. Only numeric keys are named; a generative
+task also gets the runner's `n_truncated` and `n_scored_rollouts`.
+
+Built-in tasks are declared in `sieval/meta/report_metrics.py`, not on the class,
+because a task module's source is in its stage identities. A plugin task declares
+on its class:
+
+```python
+from sieval.core.tasks.report_metrics import report_metrics
+
+
+class MyTask(Task[...]):
+    report_metrics = report_metrics("score", "accuracy", patterns=("score_{subset}",))
+```
+
+A subclass inherits the declaration with its parent's `report`. Metrics are
+`null` (unknown, so a check should not refuse) when a subclass defines its own
+`report` without declaring, when `report` comes from another module, or when
+`report_metrics = None`. A malformed declaration fails the dry-run's
+`report_metrics` check.
+
 ## Reading a report across versions
 
 Adding a key is non-destructive: downstream consumers read `score` and
