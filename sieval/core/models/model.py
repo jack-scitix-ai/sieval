@@ -60,6 +60,7 @@ from .dialect_registry import (
     get_dialect_spec,
 )
 from .exceptions import CapabilityError
+from .extra import check_extra
 from .ir import (
     CapabilityEvidence,
     ChatInput,
@@ -368,6 +369,7 @@ class Model:
         self._model = runtime_plan.requested_model_id
         self._api_base = api_base
         self._kwargs = _checked_builder_defaults(builder_defaults)
+        check_extra(extra)
         self._extra = dict(extra) if extra is not None else None
         self._limiter = local_limiter
         self._parent_limiter = parent_limiter
@@ -442,6 +444,7 @@ class Model:
         new_model = copy.copy(self)
         new_model._kwargs = _checked_builder_defaults({**self._kwargs, **kwargs})
         if extra is not None:
+            check_extra(extra)
             new_model._extra = dict(extra)
         if concurrency_limit is not None:
             new_model._limiter = anyio.CapacityLimiter(concurrency_limit)
@@ -659,6 +662,8 @@ class Model:
 
     @property
     def extra(self) -> dict[str, JSONValue]:
+        """What this model offers the tasks evaluating it, by key; never sent
+        (:mod:`sieval.core.models.extra`)."""
         return dict(self._extra) if self._extra else {}
 
     def meta(self) -> ModelMeta:

@@ -10,8 +10,10 @@ produced the current ``report.json``:
 ===============  ============================================================
 ``data``         Every selected sample, keyed by ``(sample_id, repeat_index)``
                  and digested over its whole raw content.
-``preprocess``   Every sample's ``PromptRecord.prompt``, before the model's
-                 chat template.
+``preprocess``   The code ``preprocess`` reaches (:func:`stage_code`), the
+                 task arguments it reads and, for few-shot, the split it draws
+                 exemplars from (:func:`preprocess_identity`). Computed from
+                 code once at setup.
 ``inference``    The candidate's resolved request arguments, dialect and
                  engine, the task's own inference arguments (``n``), the
                  result-changing runner keys and the serving recipe, plus
@@ -27,11 +29,22 @@ produced the current ``report.json``:
 ``report``       The same for ``report`` and ``problem_groups``.
 ===============  ============================================================
 
-A change to one stage reruns it and every stage after it.
+A change to one stage reruns it and every stage after it; a ``preprocess``
+change restarts every sample.
+
+``preprocess`` is code, not the prompts it renders: a prompt is code,
+arguments, data and the model's ``extra``, and ``extra`` reaches the request,
+which ``inference`` digests per sample. So a wrapping model and a plain one
+share ``data`` and ``preprocess`` and differ in ``inference``. The walk is
+static: a prompt that reads an environment variable, or a file through a
+reader outside :data:`_FILE_READS` (``pd.read_csv``), is covered only through
+the argument naming it.
 
 Identity schema 1 (0.10.0 to 0.11.x) named ``preprocess`` ``prompt`` and
 folded the grading stages into one ``grader``. :func:`legacy_grader_keys`
 recomputes it with the walk that wrote it: equal means nothing changed.
+Schemas 1 and 2 hold ``preprocess`` as a digest of rendered prompts; a resume
+renders the recorded samples once to compare (:func:`is_code_identity`).
 
 Every digest is ``sha256:`` over canonical JSON (sorted keys, no whitespace).
 A stage whose input could not be read is ``None``: unknown, never a guess. A
@@ -45,10 +58,12 @@ import ast
 import codecs
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import secrets
 import sys
+import textwrap
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -72,7 +87,7 @@ RESULT_SCHEMA_VERSION = 1
 #: Version of the ``identity`` block's layout. A digest computed differently is
 #: not a layout change: it reruns one stage, a new schema would discard them all.
 #: Schema 1 is still read (:func:`read_identity`).
-IDENTITY_SCHEMA = 2
+IDENTITY_SCHEMA = 3
 
 #: A per-sample digest of a value that was legitimately absent: the prompt of a
 #: sample whose ``preprocess`` failed, the requests of one never inferred. Kept
@@ -203,17 +218,33 @@ class GradingIdentity(TypedDict):
     services: NotRequired[list[ServiceIdentity]]
 
 
+class PreprocessIdentity(TypedDict):
+    """The ``preprocess`` stage: what renders a prompt, but the sample.
+
+    ``modules`` is the code it reaches, ``args`` the ``grader_args()`` it
+    reads, ``splits`` a digest of each split it draws exemplars from, and
+    ``fallback`` why ``modules`` holds all the task's code.
+    """
+
+    digest: str
+    modules: dict[str, str]
+    args: dict[str, JSONValue]
+    splits: NotRequired[dict[str, str]]
+    fallback: NotRequired[str]
+
+
 class RunIdentity(TypedDict):
     """The ``identity`` block. A stage is ``None`` while unknown.
 
     Two runs share a stage only when every digest in it matches: for
     ``inference`` that is ``digest`` *and* ``requests.digest``, and a ``None``
-    digest on either side matches nothing.
+    digest on either side matches nothing. A schema-1 or schema-2
+    ``preprocess`` is a :class:`DigestedStage` of rendered prompts.
     """
 
     schema: int
     data: DigestedStage | None
-    preprocess: DigestedStage | None
+    preprocess: PreprocessIdentity | DigestedStage | None
     inference: InferenceIdentity | None
     postprocess: GradingIdentity | None
     feedback: GradingIdentity | None
@@ -1023,6 +1054,44 @@ _LOADERS = frozenset(
 #: Attribute lookups that name the attribute in an argument.
 _ATTR_CALLS = frozenset({"getattr", "setattr", "delattr", "hasattr"})
 
+#: Names and attributes that read a file whose path only the run knows.
+_FILE_READS = frozenset(
+    {"open", "read_text", "read_bytes", "files", "iterdir", "glob", "rglob"}
+    | {"listdir", "scandir", "connect"}
+)
+
+
+def _loaded_unfollowed(task_cls: type) -> set[str] | None:
+    """The attributes a ``preprocess`` outside the followed packages (a task
+    in a test or a script) loads, by name from its classes' source; ``None``
+    when a class's source cannot be read."""
+    methods: dict[str, list[ast.AST]] = {}
+    for klass in task_cls.__mro__:
+        top = klass.__module__.partition(".")[0]
+        if top in ("sieval", "builtins") or top in sys.stdlib_module_names:
+            continue
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                tree = ast.parse(textwrap.dedent(inspect.getsource(klass)))
+        except (OSError, TypeError, SyntaxError):
+            return None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                methods.setdefault(node.name, []).append(node)
+    pending = ["preprocess", *SHARED_ENTRY_METHODS]
+    seen: set[str] = set()
+    loaded: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        refs = _Refs(methods.get(name, ()))
+        loaded |= refs.loaded
+        pending.extend(a for a in refs.attrs if a in methods)
+    return loaded
+
 
 class _Unattributable(Exception):
     """A construct the static per-method walk cannot attribute to a stage."""
@@ -1181,6 +1250,8 @@ class _Refs:
         #: ``(attribute, attributes read, strings)`` for each ``<x>.<attr> =
         #: <value>``: what the stored value was built from.
         self.stores: list[tuple[str, frozenset[str], frozenset[str]]] = []
+        #: Constructs that read a file at run time (:data:`_FILE_READS`).
+        self.files: list[str] = []
         #: String constants outside such a stored value: an endpoint variable
         #: read where it is used.
         self.strings: set[str] = set()
@@ -1216,12 +1287,16 @@ class _Refs:
                     self.names.add(node.id)
                     if node.id in _DYNAMIC_NAMES:
                         self.dynamic.append(node.id)
+                    if node.id in _FILE_READS:
+                        self.files.append(node.id)
                 elif isinstance(node, ast.Attribute):
                     self.attrs.add(node.attr)
                     if isinstance(node.ctx, ast.Load):
                         self.loaded.add(node.attr)
                     if node.attr in _DYNAMIC_ATTRS:
                         self.dynamic.append(node.attr)
+                    if node.attr in _FILE_READS:
+                        self.files.append(node.attr)
                 elif isinstance(node, ast.Call):
                     self._attr_call(node)
                 elif isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -1431,6 +1506,13 @@ class _StageWalk:
         self.loaded: set[str] = set()
         self.stores: list[tuple[str, frozenset[str], frozenset[str]]] = []
         self.strings: set[str] = set()
+        #: ``(module, where)`` of each function or method reached that reads a
+        #: file at run time.
+        self.file_units: set[tuple[str, str]] = set()
+        #: Modules that read a file at import, or whole modules that read one.
+        self.file_modules: set[str] = set()
+        #: Attributes a whole module reads anywhere: any of its code may run.
+        self.whole_loaded: set[str] = set()
         self._pending: list[tuple[str, str]] = []
         self._pending_shells: list[str] = []
         self._pending_whole: list[str] = []
@@ -1494,7 +1576,14 @@ class _StageWalk:
                 (parsed.name, q) for q in parsed.units if q.startswith(prefix)
             )
 
-    def read(self, parsed: _Module, refs: _Refs, where: str, local: _Bindings) -> None:
+    def read(
+        self,
+        parsed: _Module,
+        refs: _Refs,
+        where: str,
+        local: _Bindings,
+        unit: bool = False,
+    ) -> None:
         """Follow what *refs* read in *parsed*. *local* holds the reading
         unit's own imports: they run whenever it does, so all are reached, and
         a name they bind resolves to them as well as to the module's."""
@@ -1514,6 +1603,11 @@ class _StageWalk:
             )
         for attr in refs.attrs:
             self.reach_attr(attr)
+        if refs.files:
+            if unit:
+                self.file_units.add((parsed.name, where))
+            else:
+                self.file_modules.add(parsed.name)
         self.loaded |= refs.loaded
         self.stores.extend(refs.stores)
         self.strings |= refs.strings
@@ -1551,6 +1645,7 @@ class _StageWalk:
                         _Refs([parsed.units[qualname]]),
                         f"{module}.{qualname}",
                         parsed.unit_bindings(qualname),
+                        unit=True,
                     )
             else:
                 self._whole_step(self._pending_whole.pop())
@@ -1565,7 +1660,11 @@ class _StageWalk:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", SyntaxWarning)
             tree = ast.parse(tree_source)
-        loads = sorted({d for d in _Refs([tree]).dynamic if d in _LOADERS})
+        refs = _Refs([tree])
+        if refs.files:
+            self.file_modules.add(name)
+        self.whole_loaded |= refs.loaded
+        loads = sorted({d for d in refs.dynamic if d in _LOADERS})
         if loads and name.partition(".")[0] != "sieval":
             # It may load any file of its package, which no import shows and
             # another stage may reach. Under `sieval` the walk follows imports
@@ -1641,12 +1740,16 @@ class StageCode(TypedDict):
     judges: list[str]
     services: bool
     fallback: NotRequired[str]
+    args: NotRequired[list[str]]
+    splits: NotRequired[bool]
+    files: NotRequired[list[str]]
 
 
 def stage_code(
     task_cls: type,
     judge_roles: Iterable[str] = (),
     services: Iterable[str] = (),
+    args: Iterable[str] = (),
 ) -> dict[str, StageCode]:
     """The code each stage of *task_cls* reaches, by stage.
 
@@ -1664,8 +1767,20 @@ def stage_code(
     computed name, ``eval``, ``importlib``, ``vars()``, a method with no
     source) makes that grading stage and every later one count all of
     :func:`grader_modules`, every judge and service; ``fallback`` names it.
-    ``preprocess`` falls back on its own: its prompts are digested per sample.
+
+    ``preprocess`` falls back on its own, and also when a function or method
+    it reaches reads a file (:data:`_FILE_READS`): it then counts all of
+    :func:`grader_modules` and the data files of the reading module's package
+    (:func:`_package_data`). A module that reads a file at import adds its
+    package's data files without falling back, named in ``files``.
+
+    ``args`` names the *args* ``preprocess`` reads as ``self.<name>``,
+    ``self._<name>`` or an attribute stored from one; all of them under a
+    fallback, or when the task overrides ``grader_args``, which may return an
+    argument kept under another name. ``splits`` is whether it reads a split
+    beyond the sample (:data:`_SPLIT_READS`).
     """
+    arg_names = sorted(set(args))
     roles = sorted(set(judge_roles))
     markers = {SERVICE_ENDPOINT_ENV[s] for s in services if s in SERVICE_ENDPOINT_ENV}
     unknown_services = any(s not in SERVICE_ENDPOINT_ENV for s in services)
@@ -1691,12 +1806,15 @@ def stage_code(
                 for top in sorted(tops):
                     modules = unreached.get(top, {}) | modules
                 judges = [r for r in roles if own_judges or walk.reads((r, f"_{r}"))]
-                out[stage] = {
+                entry: StageCode = {
                     "modules": dict(sorted(modules.items())),
                     "judges": judges,
                     "services": has_services
                     and (unknown_services or walk.reads((), markers)),
                 }
+                if stage == "preprocess":
+                    _preprocess_entry(entry, walk, walker, arg_names)
+                out[stage] = entry
                 continue
         if stage != "preprocess":
             grading_reason = why
@@ -1708,6 +1826,158 @@ def stage_code(
             "services": has_services,
             "fallback": cast(str, why),
         }
+        if stage == "preprocess":
+            out[stage]["args"] = list(arg_names)
+            out[stage]["splits"] = True
+    return out
+
+
+def _preprocess_entry(
+    entry: StageCode, walk: _StageWalk, walker: _StageWalker, args: list[str]
+) -> None:
+    """Add what :func:`stage_code` records for ``preprocess`` alone to *entry*."""
+    if _overrides_grader_args(walker.task_cls):
+        entry["args"] = list(args)
+        entry["splits"] = bool((walk.loaded | walk.whole_loaded) & _SPLIT_READS)
+    elif "preprocess" in walker.methods:
+        entry["args"] = [a for a in args if walk.reads((a, f"_{a}"))]
+        entry["splits"] = bool((walk.loaded | walk.whole_loaded) & _SPLIT_READS)
+    else:
+        loaded = _loaded_unfollowed(walker.task_cls)
+        if loaded is None:
+            entry["args"], entry["splits"] = list(args), True
+        else:
+            entry["args"] = [a for a in args if {a, f"_{a}"} & loaded]
+            entry["splits"] = bool(loaded & _SPLIT_READS)
+    own = walker.own_package
+    if walk.file_modules:
+        readers = sorted(walk.file_modules)
+        entry["modules"] = dict(
+            sorted((entry["modules"] | _package_data(readers, own)).items())
+        )
+        entry["files"] = readers
+    if walk.file_units:
+        units = sorted(walk.file_units)
+        readers = sorted({module for module, _ in units})
+        whole = grader_modules(walker.task_cls) | _package_data(readers, own)
+        entry["modules"] = dict(sorted((entry["modules"] | whole).items()))
+        entry["args"] = list(args)
+        entry["fallback"] = f"{', '.join(w for _, w in units)} read a file at run time"
+
+
+def _overrides_grader_args(task_cls: type) -> bool:
+    """Whether a class of *task_cls* defines its own ``grader_args``: the
+    base reads each argument back under its own name, an override need not."""
+    return any(
+        "grader_args" in vars(klass) and klass.__module__ != "sieval.core.tasks.task"
+        for klass in task_cls.__mro__
+    )
+
+
+#: Attributes through which a task reads a dataset split other than the
+#: evaluated one, such as few-shot exemplars.
+_SPLIT_READS = frozenset({"dataset_dict", "train_set", "retrieve_samples"})
+
+#: Files beside a module's source that are never data it reads: code and the
+#: agent instruction files. Other Markdown may be a prompt template.
+_NOT_DATA_SUFFIXES = (".py", ".pyc", ".pyi")
+_NOT_DATA_NAMES = frozenset({"AGENTS.md", "CLAUDE.md", "README.md"})
+
+
+def _package_data(modules: Iterable[str], own: str | None) -> dict[str, str]:
+    """``{file key: digest}`` of every data file under each of *modules*'
+    package directories: a module that reads a file the walk cannot name most
+    likely reads one shipped beside it (a template, few-shot examples)."""
+    out: dict[str, str] = {}
+    for module in modules:
+        located = _locate(module)
+        if located is None or located[0] is None:
+            continue
+        root = os.path.dirname(located[0])
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                d for d in dirnames if not d.startswith((".", "__pycache__"))
+            )
+            for filename in sorted(filenames):
+                if (
+                    filename.startswith(".")
+                    or filename.endswith(_NOT_DATA_SUFFIXES)
+                    or filename in _NOT_DATA_NAMES
+                ):
+                    continue
+                path = os.path.join(dirpath, filename)
+                out[_file_key(module, path, own)] = (
+                    "sha256:" + hashlib.sha256(_read_source(path)).hexdigest()
+                )
+    return out
+
+
+def is_code_identity(stage: object) -> bool:
+    """Whether a recorded ``preprocess`` identity is the code-based one.
+
+    Schemas 1 (as ``prompt``) and 2 recorded a digest over every sample's
+    rendered prompt (:class:`DigestedStage`), which holds no ``modules``.
+    """
+    if not isinstance(stage, Mapping):
+        return False
+    return isinstance(cast(Mapping[str, Any], stage).get("modules"), Mapping)
+
+
+def preprocess_key(stage: object) -> str | None:
+    """What a resume compares of a ``preprocess`` identity, and stamps on each
+    ``preprocess`` record: every field but ``digest`` and ``fallback``.
+
+    ``fallback`` only explains ``modules``, and spells import names. ``None``
+    for an identity that is not code-based or is malformed.
+    """
+    if not is_code_identity(stage):
+        return None
+    payload = {
+        k: v
+        for k, v in cast(Mapping[str, Any], stage).items()
+        if k not in ("digest", "fallback")
+    }
+    try:
+        return digest(payload)
+    except (TypeError, ValueError):
+        return None
+
+
+def preprocess_identity(
+    code: StageCode,
+    args: Mapping[str, JSONValue],
+    splits: Mapping[str, str] | None = None,
+) -> PreprocessIdentity:
+    """Build the ``preprocess`` identity from ``stage_code()["preprocess"]``.
+
+    *args* is :meth:`~sieval.core.tasks.task.Task.grader_args`; only those the
+    code reads count. *splits* digests each dataset split
+    (:func:`split_digests`), used when the code reads one.
+    """
+    read = set(code.get("args", args))
+    identity: PreprocessIdentity = {
+        "digest": "",
+        "modules": dict(code["modules"]),
+        "args": {k: v for k, v in args.items() if k in read},
+    }
+    if code.get("splits"):
+        identity["splits"] = dict(splits or {})
+    if "fallback" in code:
+        identity["fallback"] = code["fallback"]
+    identity["digest"] = digest({k: v for k, v in identity.items() if k != "digest"})
+    return identity
+
+
+def split_digests(splits: Mapping[str, Iterable[object]]) -> dict[str, str] | None:
+    """``{split: digest}`` over each split's rows in order, as ``data`` digests
+    them; ``None`` when a row cannot be digested."""
+    out: dict[str, str] = {}
+    for name in sorted(splits):
+        try:
+            rows = [digest(row) for row in splits[name]]
+        except (TypeError, ValueError):
+            return None
+        out[name] = digest(rows)
     return out
 
 
@@ -2005,20 +2275,22 @@ def empty_identity() -> RunIdentity:
 def read_identity(
     block: object,
 ) -> tuple[RunIdentity, Mapping[str, Any] | None] | None:
-    """A recorded ``identity`` block as schema 2, with a schema-1 ``grader``.
+    """A recorded ``identity`` block as this schema, with a schema-1 ``grader``.
 
-    Schema 2 is read as written. Schema 1 maps ``data`` and ``inference``
-    across and ``prompt`` to ``preprocess`` (:data:`SCHEMA_1_STAGES`); its
-    ``grader`` cannot be split, so the grading stages read as unknown and the
-    ``grader`` is returned beside them, for the caller to compare whole
-    (:func:`legacy_grader_keys`). ``None`` for any other schema.
+    Schemas 2 and 3 are read as written; schema 2's ``preprocess`` is a digest
+    of rendered prompts, which :func:`is_code_identity` tells apart. Schema 1
+    maps ``data`` and ``inference`` across and ``prompt`` to ``preprocess``
+    (:data:`SCHEMA_1_STAGES`); its ``grader`` cannot be split, so the grading
+    stages read as unknown and the ``grader`` is returned beside them, for the
+    caller to compare whole (:func:`legacy_grader_keys`). ``None`` for any
+    other schema.
     """
     if not isinstance(block, Mapping):
         return None
     block = cast(Mapping[str, Any], block)
     out = empty_identity()
     schema = block.get("schema")
-    if schema == IDENTITY_SCHEMA:
+    if schema in (2, IDENTITY_SCHEMA):
         for stage in STAGES:
             if isinstance(block.get(stage), dict):
                 out[stage] = block[stage]  # type: ignore[literal-required]
@@ -2033,7 +2305,7 @@ def read_identity(
 
 
 def carried_identity(existing: Mapping[str, Any] | None) -> RunIdentity:
-    """The previous run's identity as schema 2 (:func:`read_identity`), else empty.
+    """The previous run's identity as this schema (:func:`read_identity`), else empty.
 
     A schema-1 block's grading stages are unknown until the run writes them.
     """
