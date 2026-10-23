@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Planned as 0.12.0.
+
+### Migrating from 0.11.x
+
+- **`meta.json` `identity` is schema 2**: `data`, `preprocess` (was `prompt`), `inference`, `postprocess`, `feedback`, `report`. The combined `grader` is gone; judges and services move to `feedback`. Readers must accept schema 1 too. `RESULT_SCHEMA_VERSION` stays 1, so 0.10.x and 0.11.0 directories resume, and an unchanged task's schema-1 directory upgrades in place without regrading.
+- `TaskSaver.begin_run(identity={...})` and `set_identity(**stages)` replace the per-stage keyword arguments.
+
+### Changed
+
+- **A resume reruns from the earliest stage that changed** (#210). An extraction change reruns from `postprocess`, a scoring change (judge, prompt, sampling, service, `feedback` code) from `feedback`, and a `report`-only change recomputes `report.json` from the records with no engine or judge call. Before, each of these regraded every sample. Code is attributed to stages by a static walk; a run-time lookup (`getattr(self, <expr>)`, `eval`, `importlib`) falls back to all grading code. No built-in task falls back.
+- `runs[].resume` counts what a resume did with each recorded sample.
+
+### Added
+
+- `sieval.core.runners.task_resume_plan` / `plan_resume`: the per-stage resume plan, without running anything.
+
 ## [0.11.0] - 2026-10-23
 
 A minor bump: `sieval leaderboard` is removed and SiEval is scoped to an

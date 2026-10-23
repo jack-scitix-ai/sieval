@@ -257,22 +257,41 @@ A run killed between appending a record and indexing it reruns that stage.
 ## Resume
 
 A resume compares each task's recorded stage identities (`meta.json`) with this
-run's:
+run's, and reruns each sample from the earliest stage that changed:
 
 | Differs | Resume |
 | --- | --- |
-| Data or prompt | Those samples rerun from the start; the rest are kept |
-| Inference | Refused, naming the stage |
-| Grader (grading code, `grader_args()`, judges) | `postprocess`, `feedback` and `report` rerun on the recorded inference |
+| `data` (the selected samples) or `preprocess` (the prompt) | Those samples rerun from the start; the rest are kept |
+| `inference` | Refused, naming the stage |
+| `postprocess` (answer extraction) | `postprocess`, `feedback` and `report` rerun on the recorded inference |
+| `feedback` (scoring: judges, their prompts and sampling, services) | `feedback` and `report` rerun on the recorded `postprocess` |
+| `report` (metric aggregation) | `report.json` is recomputed from the recorded samples: no engine starts, no judge is called |
 
-So a grader-only change is a plain `--resume`. `grader_args()` counts every
-constructor argument, read after `setup()`, except those in
-`GRADER_ARGS_EXCLUDED`; a task extends it with arguments that cannot change a
-verdict: `Task.GRADER_ARGS_EXCLUDED | {"grade_timeout"}`.
+So a grading or report change is a plain `--resume`. A sample past iteration 0
+restarts instead of rolling back to a grading stage.
+
+Each grading stage's identity holds the code its Task method reaches, the task
+class and `grader_args()`; `feedback` also holds every judge and service.
+`grader_args()` counts every constructor argument, read after `setup()`, except
+those in `GRADER_ARGS_EXCLUDED`; a task extends it with arguments that cannot
+change a verdict: `Task.GRADER_ARGS_EXCLUDED | {"grade_timeout"}`.
+
+Code is attributed to stages by a static walk from each stage method; code two
+stages reach counts in both. A stage that reaches code by a name only known at
+run time (`getattr(self, name)`, `eval`, `importlib`) counts all grading code,
+and so does every stage after it; `stage_code()` names the construct.
+
+A schema-1 `meta.json` (0.10.0 to 0.11.x) folds the grading stages into one
+`grader`. If it still matches the task's code, every verdict is kept and the
+block is upgraded in place; otherwise every sample regrades.
 
 A same-directory resume reruns a sample with no recorded identity, such as one
 interrupted before `preprocess`. Under `record_meta: false` no sample has one,
 so every recorded sample reruns, with a warning.
+
+`runs[].resume` counts what a resume did with each recorded sample.
+`sieval.core.runners.task_resume_plan()` returns the same plan without running
+anything.
 
 A resume with another model regrades and reports on the recorded inference:
 `model` stays the recorded one, the invoking model goes in `runs[].model`, and
