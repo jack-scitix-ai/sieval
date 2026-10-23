@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Resume compatibility is keyed on the result schema version, not the package version.** `meta.json` gains `result_schema_version` (`RESULT_SCHEMA_VERSION`, starting at 1), versioning the result directory a resume reads; a resume refuses another one, naming both schema versions and both SiEval versions. A directory without the field maps from its `version`: 0.10.0 and later, local builds included, is 1, so 0.10.x directories resume under this release, and older, unparseable or `0.0.0` ones are refused as before. Dev and local builds (`0.10.2+gc18745b`) now resume across builds when the schema matches. This release keeps schema 1. The package version stays in `version` and `runs[].sieval` as provenance. `resume_version_verdict` is replaced by `resume_schema_verdict` (#202).
+
 ## [0.10.2] - 2026-10-22
 
 No on-disk format or stage identity changes: `IDENTITY_SCHEMA` stays 1, every
