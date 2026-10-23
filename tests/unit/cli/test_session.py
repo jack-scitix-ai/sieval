@@ -7439,6 +7439,7 @@ class TestEvalSessionWrappers:
             realized_deployments=None,
             resume_from=None,
             cli_model=None,
+            infer_gpu=None,
         )
         assert result == {"task_a": {"ok": True}}
 
@@ -7472,6 +7473,7 @@ class TestEvalSessionWrappers:
             realized_deployments=None,
             resume_from=None,
             cli_model=None,
+            infer_gpu=None,
         )
         assert result == {"task_a": {"ok": True}}
 
@@ -7534,6 +7536,7 @@ class TestEvalSessionWrappers:
             realized_deployments=None,
             resume_from=None,
             cli_model=None,
+            infer_gpu=None,
         )
 
     def test_run_session_forwards_legacy_external_endpoint_adapter_positionally(
@@ -9697,6 +9700,33 @@ class TestDiffLines:
             "- m.api_key_env: None → 'KEY'",
             "- m.args.authorization: <redacted> → <redacted>",
         ]
+
+
+class TestHoldsSecret:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"api_key": "k"},
+            {"a": [{"b": {"authorization": "Bearer x"}}]},
+        ],
+    )
+    def test_whatever_redact_secrets_would_redact(self, value):
+        from sieval.cli.session import holds_secret, redact_secrets
+
+        assert redact_secrets(value) != value
+        assert holds_secret(value)
+        # And so does what it wrote: the marker stands where the secret was.
+        assert holds_secret(redact_secrets(value))
+
+    @pytest.mark.parametrize(
+        "value",
+        [{"api_key": None}, {"api_key_env": "KEY"}, ["api_key"], "api_key", {}],
+    )
+    def test_nothing_else(self, value):
+        from sieval.cli.session import holds_secret, redact_secrets
+
+        assert not holds_secret(value)
+        assert redact_secrets(value) == value
 
 
 # ── Tests for env expansion + error-hint wrapping in _setup_datasets ──
