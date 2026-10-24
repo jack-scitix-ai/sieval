@@ -197,8 +197,9 @@ The reply grows by N entries per input token.
 asks for a capability by key and does nothing different when it is absent.
 SiEval records it in the inference identity and checks the shape of the keys
 below, so a typo fails before the run. Set it on a model (top level or
-`args`) or per task in `infer_args`; a task's `infer_args.extra` replaces the
-model's.
+`args`, not both) or per task in `infer_args`. A derived model inherits its
+base's `extra` unless it sets its own, and `infer_args.extra` replaces the
+model's; keys never merge.
 
 ```yaml
 models:
