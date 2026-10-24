@@ -467,6 +467,32 @@ declares; neither writes under the result directory. A sample that `feedback`
 sends to another iteration after a rerun from `feedback` is not counted, since
 the plan cannot know it.
 
+### Exit codes
+
+`sieval run`, `sieval eval` and `sieval infer start` exit with a fixed code
+when they refuse a run on purpose. Retrying the same command on the same node
+refuses again.
+
+| Exit | Means |
+| --- | --- |
+| 0 | Success |
+| 1 | Any other failure, including a crash, any failed `--dry-run`, and a batch whose tasks fail in more than one way |
+| 2 | Usage error |
+| 3 | Resume refused: start fresh, or match the stage the refusal names |
+| 4 | Hardware refused: an engine is needed and `nvidia-smi` finds no GPU (and none is declared), or the GPUs differ from `SIEVAL_TARGET_GPU` |
+| 130 / 143 | Interrupted by Ctrl+C / SIGTERM |
+
+Each refusal, except under `--dry-run`, also writes one stderr line:
+
+```text
+SIEVAL_REFUSAL {"v": 1, "kind": "resume", "reason": "inference", "task": "echo", "message": "Resume refused: stage `inference` differs (recorded 3f…, now 9a…)."}
+```
+
+`kind` is `resume` (`reason`: `schema`, `data`, `inference`) or `hardware`
+(`no_gpu`, `mismatch`). `task` is present for a per-task refusal; `message`
+is the error's first line, at most 200 characters. `v` is bumped when any of
+these change.
+
 Removed in 0.12: `--resume-from DIR` (use `--resume DIR`), and
 `runner_config.auto_resume` / `runner_config.resume_from` (use
 `runner_config.resume: true` / `resume: <dir>`). A config that still sets

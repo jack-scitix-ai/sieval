@@ -20,6 +20,7 @@ import yaml
 from loguru import logger
 
 from sieval.cli._readiness import MISSING_KINDS
+from sieval.cli.refusal import report_refusals
 from sieval.core.runners import ResultDirExistsError, UnfinishedCopyError
 from sieval.core.utils.logging import log_user
 
@@ -142,7 +143,8 @@ def cli_command(fn: Callable) -> Callable:
     render as text.
 
     Exit codes follow the exception, not the decorator: ``ClickException``
-    keeps its own (``2`` for a usage error), anything else exits ``1``.
+    keeps its own (``2`` for a usage error), a refusal outside ``--dry-run``
+    exits with its code (:mod:`sieval.cli.refusal`), anything else exits ``1``.
     Under text output a ``ClickException`` is re-raised untouched so Click
     still prints its usage hint — only the machine-readable formats, which
     have no such affordance, get the structured form instead.
@@ -182,7 +184,9 @@ def cli_command(fn: Callable) -> Callable:
                 ),
                 _requested_format(kwargs),
             )
-            raise typer.Exit(1) from exc
+            # A dry-run reports a would-be refusal; it does not refuse.
+            code = None if kwargs.get("dry_run") else report_refusals(exc)
+            raise typer.Exit(code or 1) from exc
 
     _WRAPPED.add(wrapper)
     return wrapper

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Refusals exit with their own code.** `sieval run`, `eval` and `infer start` exit 3 on a refused resume and 4 on refused hardware (no GPU for an engine, or not the declared GPUs), and print one `SIEVAL_REFUSAL {json}` line to stderr; both used to exit 1 like a crash. `--dry-run`, and a batch failing in more than one way, still exit 1. An `nvidia-smi` timeout now fails instead of reading as "no GPU". `StageResumeError` and `ResumeVersionError` gain `task`; GPU refusals raise `LaunchGpuError` (a `RuntimeError`). See [Exit codes](docs/guide/configuration.md#exit-codes) (#229).
+
 ### Fixed
 
 - **A model's top-level `extra` reaches the model.** `models.<m>.extra` passed `--dry-run` and was then dropped at binding, so `Model.extra` was `{}` and the inference identity omitted it. It now binds like `args.extra` on every dialect and on derived models; `args.extra` identities are unchanged. A 0.12.0 result directory written from a top-level `extra` ran without it, so its resume is refused as an inference change; start it fresh (#227).

@@ -45,6 +45,10 @@ class ResumeVerdict:
 class ResumeVersionError(RuntimeError):
     """Raised when a resume crosses an incompatible result schema version."""
 
+    def __init__(self, message: str, *, task: str | None = None) -> None:
+        self.task = task
+        super().__init__(message)
+
 
 def schema_from_version(v_run: str) -> int | None:
     """The result schema version a directory without the field was written in.

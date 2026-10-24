@@ -19,7 +19,7 @@ import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 import orjson
@@ -421,7 +421,8 @@ async def detect_local_gpu() -> GPUInfo | None:
 
     Uses ``anyio.open_process`` to run nvidia-smi without blocking the
     event loop — no worker-thread wrapper needed.
-    Returns None if nvidia-smi is not available or no GPUs found.
+    Returns None if nvidia-smi is not available or no GPUs found. A timeout
+    raises instead: a busy driver may answer next time, so it is not "no GPU".
     """
     try:
         process = await anyio.open_process(
@@ -448,8 +449,7 @@ async def detect_local_gpu() -> GPUInfo | None:
     except TimeoutError:
         process.kill()
         await process.wait()
-        logger.warning("nvidia-smi timed out")
-        return None
+        raise RuntimeError("nvidia-smi did not answer within 10s") from None
 
     if process.returncode != 0:
         logger.debug("nvidia-smi failed (exit code {})", process.returncode)
@@ -521,6 +521,17 @@ def declared_target_gpu(environ: Mapping[str, str] | None = None) -> GPUInfo | N
     return parse_target_gpu(raw) if raw.strip() else None
 
 
+LaunchGpuReason = Literal["no_gpu", "mismatch"]
+
+
+class LaunchGpuError(RuntimeError):
+    """An engine launch, or its plan, refused on this node's GPUs."""
+
+    def __init__(self, reason: LaunchGpuReason, message: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
 async def check_launch_gpu(*, required: bool = False) -> None:
     """Refuse to launch an engine on GPUs other than the declared ones.
 
@@ -537,9 +548,10 @@ async def check_launch_gpu(*, required: bool = False) -> None:
     detected = await detect_local_gpu()
     if declared is None:
         if detected is None:
-            raise RuntimeError(
+            raise LaunchGpuError(
+                "no_gpu",
                 "This run needs an inference engine, and nvidia-smi finds no "
-                "GPU on this node. Run it on a GPU node."
+                "GPU on this node. Run it on a GPU node.",
             )
         return
     if detected == declared:
@@ -557,9 +569,10 @@ async def check_launch_gpu(*, required: bool = False) -> None:
             if ours != theirs
         ]
         here = f"{format_target_gpu(detected)!r}: {', '.join(differing)}"
-    raise RuntimeError(
+    raise LaunchGpuError(
+        "mismatch",
         f"The serving plan was resolved for {TARGET_GPU_ENV}="
         f"{format_target_gpu(declared)!r}, but this node has {here}. "
         "Declare the GPUs this node has, or run on a node that has the "
-        "declared ones."
+        "declared ones.",
     )
