@@ -174,6 +174,61 @@ again, which planning cannot foresee. With no engine started it fails at
 `infer`, before any request, and a later `--resume` that starts the engine
 retries it.
 
+### Serving plans: context window and dialect
+
+`sieval run` and `sieval infer start <yaml>` size each served model's context
+window from what its tasks need, before any engine starts (`--dry-run`
+included).
+
+A task needs its `min_context` if set, else the larger of what its class
+declares (`TaskRequirements.min_context`; RULER: `max_seq_length` plus any
+unreserved thinking budget) and its effective `max_tokens`. A root model states
+what it can serve:
+
+```yaml
+models:
+  qwen3-8b:
+    path: /models/Qwen3-8B
+    context:                 # only for a model SiEval launches
+      native: 40960          # default: config.json max_position_embeddings
+      max: 131072            # longest window reachable with scaling
+      scaling:               # engine parameters that reach it
+        json_model_override_args: '{"rope_scaling": {"rope_type": "yarn", "factor": 4, "original_max_position_embeddings": 32768}}'
+tasks:
+  long_math:
+    class: AIME2025ZeroShotGenTask
+    dataset: aime
+    min_context: 38000       # optional: override the derived need
+```
+
+- Within the recipe window: nothing changes.
+- Within `native`: the plan's `context_length` / `max_model_len` is raised to
+  the largest such need, for every task on that model.
+- Within `max`: a plan of its own with `scaling`, in serving group
+  `<model>@<window>`. Scaling changes short-context outputs, so no other task
+  shares that engine.
+- Otherwise, or beyond a window pinned by `infer.overrides` / `context_limit`:
+  refused before launch, naming the task, its need and the model's limit. An
+  unknown native window refuses any raise (set `context.native`).
+
+An `api_base` model is checked against its `context_limit`; without one, an
+overflow shows per sample.
+
+**Resume.** The served window is in each task's inference identity, and a
+resume never reruns inference. A run recorded at a window this release now
+raises is refused: start fresh, or pin the recorded window with
+`infer.overrides`.
+
+Groups run one after another, each group's engines stopped before the next
+start; an engine starts only for a group with tasks on it. `--serving-group
+KEY` (keys as `--dry-run` lists them under `serving`) runs one group, so groups
+can run as separate jobs into one `result_dir`. Each group writes
+`infer_plans[.<key>].yaml` and records its key in `meta.json`
+`runs[].serving.group`.
+
+A `gen` model served by SGLang with no `dialect:` gets `sglang_legacy` when a
+task scores input: SGLang's `/v1/completions` cannot.
+
 ### Anthropic Messages
 
 To call the native Anthropic Messages API, select the dialect explicitly and
