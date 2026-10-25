@@ -1523,7 +1523,7 @@ class TestEvalDryRunCli:
             patch("sieval.cli.validation.resolve_dataset_class"),
             patch(
                 "sieval.cli.validation._capability_reconcile_check",
-                return_value={"name": "capability_reconcile", "ok": True},
+                return_value=[{"name": "capability_reconcile", "ok": True}],
             ),
         ):
             result = cli_runner.invoke(app, ["eval", "--dry-run", str(config)])
@@ -1584,7 +1584,7 @@ class TestRunDryRunCli:
             patch("sieval.cli.validation.resolve_dataset_class"),
             patch(
                 "sieval.cli.validation._capability_reconcile_check",
-                return_value={"name": "capability_reconcile", "ok": True},
+                return_value=[{"name": "capability_reconcile", "ok": True}],
             ),
             # Planning builds the run, which these fake classes cannot.
             patch(
@@ -1657,7 +1657,7 @@ class TestPreparePrelaunchReconciliation:
             )
 
         assert result is expected
-        session.prepare_prelaunch.assert_called_once_with()
+        session.prepare_prelaunch.assert_called_once_with(enforce_python_requires=False)
         normalized = session_type.call_args.kwargs["infer_plans"]["model"]
         assert normalized["assignments"][0]["engine_params"] == {"max_model_len": 4096}
         assert isinstance(normalized["assignments"], list)
@@ -1721,6 +1721,116 @@ class TestRunDryRun:
             encoding="utf-8",
         )
         return config
+
+    _AIME_TASK = "sieval.tasks.aime_2024_0shot_gen.AIME2024ZeroShotGenTask"
+
+    def test_dependencies_check_passes_with_nothing_declared(self, tmp_path):
+        from sieval.cli.validation import run_dry_run
+
+        result = run_dry_run(self._capability_config(tmp_path))
+        check = next(c for c in result["checks"] if c["name"] == "dependencies")
+        assert check == {
+            "name": "dependencies",
+            "ok": True,
+            "detail": "0 declared Python packages installed",
+            "plan": {"unmet": {}, "declared": {}},
+        }
+
+    def test_dependencies_check_fails_on_an_unmet_declaration(self, tmp_path):
+        from sieval.cli.validation import run_dry_run
+        from sieval.tasks.aime_2024_0shot_gen import AIME2024ZeroShotGenTask
+
+        declared = {"packaging": "packaging", "sieval_no_such_mod": "nope>=1"}
+        with patch.object(AIME2024ZeroShotGenTask, "python_requires", declared):
+            result = run_dry_run(self._capability_config(tmp_path))
+        checks = {c["name"]: c for c in result["checks"]}
+        # Reported on its own; the capability check still passes.
+        assert checks["capability_reconcile"]["ok"] is True
+        check = checks["dependencies"]
+        assert check["ok"] is False
+        assert (
+            "- t: nope>=1 [import sieval_no_such_mod]: not installed"
+            in (check["detail"])
+        )
+        assert check["plan"] == {
+            "unmet": {
+                "t": [
+                    {
+                        "import": "sieval_no_such_mod",
+                        "requirement": "nope>=1",
+                        "reason": "not installed",
+                    }
+                ]
+            },
+            "declared": {
+                "t": [
+                    {"import": "packaging", "requirement": "packaging"},
+                    {"import": "sieval_no_such_mod", "requirement": "nope>=1"},
+                ]
+            },
+        }
+        assert result["n_errors"] == 1
+
+    def test_dependencies_check_reads_the_per_config_hook(self, tmp_path):
+        from sieval.cli.validation import run_dry_run
+        from sieval.tasks.aime_2024_0shot_gen import AIME2024ZeroShotGenTask
+
+        seen = []
+
+        def hook(context):
+            seen.append(context)
+            return {"sieval_no_such_mod": "nope"}
+
+        with patch.object(
+            AIME2024ZeroShotGenTask, "python_requires_for", side_effect=hook
+        ):
+            result = run_dry_run(self._capability_config(tmp_path))
+        check = next(c for c in result["checks"] if c["name"] == "dependencies")
+        assert check["ok"] is False
+        assert len(seen) == 1
+
+    def test_prepare_prelaunch_refuses_an_unmet_declaration(self, tmp_path):
+        from sieval.cli.validation import prepare_prelaunch_reconciliation
+        from sieval.core.tasks.python_requires import MissingPythonRequirementsError
+        from sieval.tasks.aime_2024_0shot_gen import AIME2024ZeroShotGenTask
+
+        with (
+            patch.object(
+                AIME2024ZeroShotGenTask,
+                "python_requires",
+                {"sieval_no_such_mod": "nope"},
+            ),
+            pytest.raises(MissingPythonRequirementsError) as excinfo,
+        ):
+            prepare_prelaunch_reconciliation(
+                self._capability_config(tmp_path), check_python_requires=True
+            )
+        assert excinfo.value.task == "t"
+
+    def test_prepare_prelaunch_ignores_python_requires_unless_asked(self, tmp_path):
+        """`infer start` only serves a model, so a grader package is not its concern."""
+        from sieval.cli.validation import prepare_prelaunch_reconciliation
+        from sieval.tasks.aime_2024_0shot_gen import AIME2024ZeroShotGenTask
+
+        with patch.object(
+            AIME2024ZeroShotGenTask, "python_requires", {"sieval_no_such_mod": "nope"}
+        ):
+            result = prepare_prelaunch_reconciliation(self._capability_config(tmp_path))
+        assert result.binding_plans
+
+    def test_dependencies_check_is_absent_when_reconcile_fails(self, tmp_path):
+        """Not evaluated, so absent: one root cause counts as one error."""
+        from sieval.cli.validation import run_dry_run
+
+        with patch(
+            "sieval.cli.session.EvalSession.prepare_prelaunch",
+            side_effect=ValueError("binding is invalid"),
+        ):
+            result = run_dry_run(self._capability_config(tmp_path))
+        checks = {c["name"]: c for c in result["checks"]}
+        assert checks["capability_reconcile"]["detail"] == "binding is invalid"
+        assert "dependencies" not in checks
+        assert result["n_errors"] == 1
 
     def test_returns_dict_on_valid_config(self, tmp_path):
         from sieval.cli.validation import run_dry_run

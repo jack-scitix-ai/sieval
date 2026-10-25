@@ -33,7 +33,7 @@ from sieval.cli.resolution import (
     validate_configured_engine_id,
     validate_task_config_args,
 )
-from sieval.cli.session import RootConfigDict
+from sieval.cli.session import EvalSession, RootConfigDict
 from sieval.core.models import check_extra
 from sieval.core.models.capabilities import (
     CAPABILITY_KEYS,
@@ -51,6 +51,7 @@ from sieval.core.models.dialect_registry import (
 from sieval.core.models.reconcile import ReconcileResult
 from sieval.core.runners import TaskRunnerConfig
 from sieval.core.tasks.consts import TaskAction
+from sieval.core.tasks.python_requires import MissingPythonRequirementsError
 from sieval.core.tasks.run_meta import STATED_SERVING_KEYS
 
 # Known top-level keys from RootConfigDict
@@ -817,31 +818,19 @@ class DryRunResult(TypedDict):
     n_warnings: int
 
 
-def prepare_prelaunch_reconciliation(
+def _prelaunch_session(
     config: str | Path,
     *,
-    model_override: str | None = None,
-    resume: bool | str | Path | None = None,
-    result_dir_override: str | None = None,
-    deterministic_override: bool | None = None,
-    infer_plans: Mapping[str, object] | None = None,
-    invocation: str | None = None,
-    self_managed_endpoints: frozenset[str] = frozenset(),
-    check_services: bool = False,
-    cli_model: CliModel | None = None,
-) -> ReconcileResult:
-    """Run the shared pure prelaunch reconciliation and fail loud on errors.
-
-    *check_services* also checks each vendored service the run would start, for
-    a caller about to launch engines.
-
-    This root-level CLI seam keeps the ``infer`` subpackage off the eval
-    engine.  It also converts typed infer-layer plans into the plain mapping
-    :class:`EvalSession` consumes and persists.
-
-    Exceptions deliberately propagate.  Only presentation boundaries such as
-    :func:`run_dry_run` may turn them into structured diagnostics.
-    """
+    model_override: str | None,
+    resume: bool | str | Path | None,
+    result_dir_override: str | None,
+    deterministic_override: bool | None,
+    infer_plans: Mapping[str, object] | None,
+    invocation: str | None,
+    self_managed_endpoints: frozenset[str],
+    cli_model: CliModel | None,
+) -> EvalSession:
+    # Looked up at call time, so the session module stays the one seam.
     from sieval.cli.session import EvalSession, unwrap_proxies
 
     normalized_plans: dict[str, dict[str, Any]] | None = None
@@ -855,7 +844,7 @@ def prepare_prelaunch_reconciliation(
                 )
             normalized_plans[model_name] = normalized
 
-    session = EvalSession(
+    return EvalSession(
         config,
         model_override=model_override,
         resume=resume,
@@ -866,13 +855,90 @@ def prepare_prelaunch_reconciliation(
         self_managed_endpoints=self_managed_endpoints,
         cli_model=cli_model,
     )
-    result = session.prepare_prelaunch()
+
+
+def prepare_prelaunch_reconciliation(
+    config: str | Path,
+    *,
+    model_override: str | None = None,
+    resume: bool | str | Path | None = None,
+    result_dir_override: str | None = None,
+    deterministic_override: bool | None = None,
+    infer_plans: Mapping[str, object] | None = None,
+    invocation: str | None = None,
+    self_managed_endpoints: frozenset[str] = frozenset(),
+    check_services: bool = False,
+    check_python_requires: bool = False,
+    cli_model: CliModel | None = None,
+) -> ReconcileResult:
+    """Run the shared pure prelaunch reconciliation and fail loud on errors.
+
+    For a caller about to grade, *check_services* also checks each vendored
+    service the run would start, and *check_python_requires* raises
+    :class:`~sieval.core.tasks.python_requires.MissingPythonRequirementsError`
+    for a task's unmet ``python_requires``. ``infer start`` asks for neither:
+    it only serves a model.
+
+    This root-level CLI seam keeps the ``infer`` subpackage off the eval
+    engine.  It also converts typed infer-layer plans into the plain mapping
+    :class:`EvalSession` consumes and persists.
+
+    Exceptions deliberately propagate.  Only presentation boundaries such as
+    :func:`run_dry_run` may turn them into structured diagnostics.
+    """
+    session = _prelaunch_session(
+        config,
+        model_override=model_override,
+        resume=resume,
+        result_dir_override=result_dir_override,
+        deterministic_override=deterministic_override,
+        infer_plans=infer_plans,
+        invocation=invocation,
+        self_managed_endpoints=self_managed_endpoints,
+        cli_model=cli_model,
+    )
+    result = session.prepare_prelaunch(enforce_python_requires=check_python_requires)
     if check_services:
         # A vendored service that cannot start fails here, before any engine.
         from sieval.cli.services import check_vendored_services
 
         check_vendored_services(session.required_services)
     return result
+
+
+def _dependencies_check(session: EvalSession) -> DryRunCheck:
+    """Each task's declared ``python_requires`` against this interpreter."""
+    unmet_by_task = session.unmet_python_requires
+    plan = {
+        task: [
+            {"import": import_name, "requirement": requirement}
+            for import_name, requirement in declared.items()
+        ]
+        for task, declared in session.python_requires.items()
+        if declared
+    }
+    n_declared = sum(len(entries) for entries in plan.values())
+    check: DryRunCheck = {"name": "dependencies", "ok": not unmet_by_task}
+    if unmet_by_task:
+        check["detail"] = str(MissingPythonRequirementsError(unmet_by_task))
+        check["plan"] = {
+            "unmet": {
+                task: [
+                    {
+                        "import": entry.import_name,
+                        "requirement": entry.requirement,
+                        "reason": entry.reason,
+                    }
+                    for entry in unmet
+                ]
+                for task, unmet in unmet_by_task.items()
+            },
+            "declared": plan,
+        }
+    else:
+        check["detail"] = f"{n_declared} declared Python packages installed"
+        check["plan"] = {"unmet": {}, "declared": plan}
+    return check
 
 
 def _capability_reconcile_check(
@@ -886,11 +952,15 @@ def _capability_reconcile_check(
     invocation: str | None = None,
     self_managed_endpoints: frozenset[str] = frozenset(),
     cli_model: CliModel | None = None,
-) -> DryRunCheck:
-    """Run the same pure prelaunch reconcile used by normal execution."""
+) -> list[DryRunCheck]:
+    """Run the same pure prelaunch reconcile used by normal execution.
+
+    Returns the ``capability_reconcile`` check, then the ``dependencies`` check,
+    which is absent when reconciliation fails (like any check not evaluated).
+    """
 
     try:
-        result = prepare_prelaunch_reconciliation(
+        session = _prelaunch_session(
             config,
             model_override=model_override,
             resume=resume,
@@ -901,14 +971,16 @@ def _capability_reconcile_check(
             self_managed_endpoints=self_managed_endpoints,
             cli_model=cli_model,
         )
+        result = session.prepare_prelaunch(enforce_python_requires=False)
     except Exception as exc:
-        return {
-            "name": "capability_reconcile",
-            "ok": False,
-            # Preserve the normal prepare error verbatim so dry-run and run
-            # give users one diagnostic contract.
-            "detail": str(exc),
-        }
+        return [
+            {
+                "name": "capability_reconcile",
+                "ok": False,
+                # Verbatim, so dry-run and run give one diagnostic contract.
+                "detail": str(exc),
+            }
+        ]
 
     check: DryRunCheck = {
         "name": "capability_reconcile",
@@ -926,7 +998,7 @@ def _capability_reconcile_check(
     ]
     if warnings:
         check["warnings"] = warnings
-    return check
+    return [check, _dependencies_check(session)]
 
 
 def run_dry_run(
@@ -1041,7 +1113,7 @@ def run_dry_run(
         # unresolved third-party classes, so composition cannot truthfully
         # inspect their TaskRequirements and the check remains unavailable.
         if import_ok and not import_warnings:
-            capability_check = _capability_reconcile_check(
+            prelaunch_checks = _capability_reconcile_check(
                 config,
                 model_override=model_override,
                 resume=resume,
@@ -1052,8 +1124,9 @@ def run_dry_run(
                 self_managed_endpoints=self_managed_endpoints,
                 cli_model=cli_model,
             )
-            checks.append(capability_check)
-            result.warnings.extend(capability_check.get("warnings", ()))
+            for prelaunch_check in prelaunch_checks:
+                checks.append(prelaunch_check)
+                result.warnings.extend(prelaunch_check.get("warnings", ()))
     else:
         schema_check: DryRunCheck = {"name": "schema", "ok": False}
         errors_detail = "; ".join(result.errors)

@@ -112,6 +112,9 @@ class NonRetriableSampleError(Exception):
     exception classes without knowing about ``sieval.tasks``, so the runner tests
     ``isinstance`` and any subclass inherits the behaviour.
 
+    Never raise it for a missing third-party package, which a resume would then
+    never regrade; declare it in ``Task.python_requires`` instead.
+
     It says nothing about scoring. The sample is still ``FAILED``, and a task
     declaring ``DENOMINATOR_REQUESTED`` still counts it in the denominator --
     excluding a sample from the denominator would need a terminal state that
