@@ -2040,7 +2040,7 @@ class TestServingGroups:
                 "long": {
                     "class": "GSM8KZeroShotGenTask",
                     "dataset": "d",
-                    "infer_args": {"max_tokens": 100000},
+                    "infer_args": {"max_tokens": 95904},
                 },
             },
         }

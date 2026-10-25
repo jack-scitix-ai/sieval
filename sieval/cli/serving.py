@@ -23,6 +23,10 @@ DEFAULT_GROUP = "default"
 
 _MAX_TOKENS_KEYS = ("max_tokens", "max_completion_tokens")
 
+#: Prompt room added to a ``max_tokens``-derived need: engines refuse
+#: prompt + ``max_tokens`` > window. Longer prompts set ``min_context``.
+PROMPT_HEADROOM = 4096
+
 
 class ServingShortfallError(ValueError):
     """A task needs a longer context window than its model can serve."""
@@ -122,8 +126,9 @@ def parse_model_context(name: str, config: Mapping[str, Any]) -> ModelContext:
 def task_context_needs(config: Mapping[str, Any]) -> dict[str, ContextNeed]:
     """The context window each task needs, by task name.
 
-    A task with no ``min_context``, no declared need and no ``max_tokens``
-    needs nothing known and is left out.
+    A need from ``max_tokens`` adds :data:`PROMPT_HEADROOM`; ``min_context``
+    and a declared need already count the prompt. A task with none of the
+    three is left out.
     """
     models = validate_named_config_map("models", config.get("models", {}))
     tasks = validate_named_config_map("tasks", config.get("tasks", {}))
@@ -141,7 +146,7 @@ def task_context_needs(config: Mapping[str, Any]) -> dict[str, ContextNeed]:
             candidates.append((requirements.min_context, "requires"))
         max_tokens = _effective_max_tokens(task_name, task_config, models)
         if max_tokens is not None:
-            candidates.append((max_tokens, "max_tokens"))
+            candidates.append((max_tokens + PROMPT_HEADROOM, "max_tokens"))
         if candidates:
             tokens, source = max(candidates)
             needs[task_name] = ContextNeed(root, tokens, source)
@@ -356,7 +361,7 @@ def _shortfall(task: str, need: ContextNeed, limit: str) -> str:
 _SOURCES: dict[str, str] = {
     "min_context": "its min_context",
     "requires": "declared by the task",
-    "max_tokens": "its max_tokens",
+    "max_tokens": f"its max_tokens plus {PROMPT_HEADROOM} for the prompt",
 }
 
 
