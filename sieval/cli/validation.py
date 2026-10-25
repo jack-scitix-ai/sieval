@@ -51,6 +51,7 @@ from sieval.core.models.dialect_registry import (
 from sieval.core.models.reconcile import ReconcileResult
 from sieval.core.runners import TaskRunnerConfig
 from sieval.core.tasks.consts import TaskAction
+from sieval.core.tasks.run_meta import STATED_SERVING_KEYS
 
 # Known top-level keys from RootConfigDict
 _ROOT_KEYS: set[str] = set(RootConfigDict.__annotations__)
@@ -163,6 +164,41 @@ def _validate_structure(cfg: dict, result: ValidationResult) -> bool:
     return can_continue
 
 
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _is_nonempty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _check_stated_serving(
+    name: str, stated: object, *, launched: bool, result: ValidationResult
+) -> None:
+    """Refuse a root model's ``serving`` that is not a mapping of
+    :data:`STATED_SERVING_KEYS`, or that describes an engine the run launches,
+    whose serving SiEval records itself."""
+    if not isinstance(stated, Mapping):
+        return  # absent, or refused as not a mapping with the other root keys
+    stated = cast(Mapping[str, object], stated)
+    where = f"Model '{name}': 'serving'"
+    if launched:
+        result.errors.append(
+            f"{where} describes an external endpoint; an engine `sieval run` "
+            "launches records its own serving"
+        )
+        return
+    unknown = sorted(set(stated) - set(STATED_SERVING_KEYS))
+    if unknown:
+        result.errors.append(
+            f"{where} has unknown key(s) {', '.join(unknown)}; expected "
+            f"{', '.join(STATED_SERVING_KEYS)}"
+        )
+    version = stated.get("engine_version")
+    if version is not None and not _is_nonempty_str(version):
+        result.errors.append(f"{where}.engine_version must be a non-empty string")
+
+
 def _validate_models(cfg: dict, result: ValidationResult) -> None:
     """Validate model configurations."""
     models = cfg.get("models", {})
@@ -210,6 +246,22 @@ def _validate_models(cfg: dict, result: ValidationResult) -> None:
                     )
                 except (TypeError, ValueError) as exc:
                     result.errors.append(str(exc))
+
+        # What the root serves: a derived model shares its weights and window.
+        for key, kind, check in (
+            ("context_limit", "a positive integer", _is_positive_int),
+            ("weights", "a non-empty string", _is_nonempty_str),
+            ("serving", "a mapping", lambda value: isinstance(value, dict)),
+        ):
+            if key not in mcfg:
+                continue
+            if has_base:
+                result.errors.append(
+                    f"Model '{name}': derived models cannot set '{key}'; it is "
+                    "inherited from the base model. Set it on the base instead."
+                )
+            elif not check(mcfg[key]):
+                result.errors.append(f"Model '{name}': '{key}' must be {kind}")
 
         raw_model_args = mcfg.get("args")
         for where, extra in (
@@ -268,6 +320,13 @@ def _validate_models(cfg: dict, result: ValidationResult) -> None:
                     "auto-serve. Add a checkpoint or set api_base explicitly."
                 )
 
+            # As `sieval run` decides: `args.api_base` does not stop a launch.
+            _check_stated_serving(
+                name,
+                mcfg.get("serving"),
+                launched=bool(checkpoint or path) and not mcfg.get("api_base"),
+                result=result,
+            )
             base_names.add(name)
 
     all_model_names = set(models)

@@ -281,6 +281,47 @@ class TestValidateModels:
         result = validate_eval_config(cfg)
         assert result.ok, result.errors
 
+    @pytest.mark.parametrize(
+        ("key", "good", "bad"),
+        [
+            ("context_limit", 32768, 0),
+            ("weights", "sha256:w", ""),
+            ("serving", {"hardware": "H100"}, "H100"),
+        ],
+    )
+    def test_what_a_root_serves(self, key, good, bad):
+        def check(models):
+            return validate_eval_config({"models": models, "datasets": {}, "tasks": {}})
+
+        assert check({"m": {"name": "x", key: good}}).ok
+        result = check({"m": {"name": "x", key: bad}})
+        assert any(f"'{key}' must be" in e for e in result.errors)
+        result = check({"m": {"name": "x", key: True}})
+        assert any(f"'{key}' must be" in e for e in result.errors)
+        result = check({"b": {"name": "x"}, "d": {"base": "b", key: good}})
+        assert any(f"cannot set '{key}'" in e for e in result.errors)
+
+    def test_stated_serving_describes_an_endpoint(self):
+        def errors(model):
+            cfg = {"models": {"m": model}, "datasets": {}, "tasks": {}}
+            return validate_eval_config(cfg).errors
+
+        pd = {"engine_version": "0.5.4", "topology": {"prefill": 1, "decode": 3}}
+        assert errors({"api_base": "http://x/v1", "name": "x", "serving": pd}) == []
+        assert any(
+            "unknown key(s) gpus" in e
+            for e in errors({"name": "x", "serving": {"gpus": 8}})
+        )
+        assert any(
+            "engine_version must be" in e
+            for e in errors({"name": "x", "serving": {"engine_version": 5}})
+        )
+        # An engine the run launches records its own serving.
+        assert any(
+            "describes an external endpoint" in e
+            for e in errors({"path": "/ckpt", "serving": {"hardware": "H100"}})
+        )
+
     def test_engine_on_derived_model(self):
         cfg = {
             "models": {

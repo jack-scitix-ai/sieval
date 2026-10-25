@@ -1008,6 +1008,9 @@ class ModelConfigDict(TypedDict, total=False):
     max_retries: int
     client_timeout: dict[str, float]  # connect/read/write/pool seconds
     concurrency_limit: int
+    context_limit: int  # Context window of an endpoint SiEval does not serve
+    weights: str  # The weights served, compared on resume instead of the name
+    serving: dict[str, JSONValue]  # How an endpoint serves it; recorded only
     infer: _InferDict  # infer config for `sieval infer`
     infer_meta: _InferMetaDict  # infer metadata for audit
 
@@ -1222,6 +1225,33 @@ def _configured_credential(
 def _nested_args(config: Mapping[str, object]) -> Mapping[str, object]:
     args = config.get("args")
     return cast(Mapping[str, object], args) if isinstance(args, Mapping) else {}
+
+
+#: Engine parameters that set the context window an engine serves.
+_CONTEXT_LIMIT_PARAMS = ("max_model_len", "context_length")
+
+
+def _planned_context_limit(plan: Mapping[str, Any]) -> int | None:
+    """The context window a serving plan launches its engine with: the
+    smallest across roles, since a prompt overflows on the first that refuses
+    it. ``None`` when a role leaves it to the checkpoint's default.
+    """
+    limits: list[int] = []
+    for assignment in plan.get("assignments") or ():
+        params = (
+            assignment.get("engine_params") if isinstance(assignment, Mapping) else None
+        ) or {}
+        role = [
+            value
+            for key, value in params.items()
+            if key in _CONTEXT_LIMIT_PARAMS
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+        ]
+        if not role:
+            return None
+        limits.extend(role)
+    return min(limits) if limits else None
 
 
 def _default_client_timeout(deployment: Deployment | None) -> httpx.Timeout:
@@ -4889,6 +4919,9 @@ class EvalSession:
                 task,
                 config=runner_config,
                 inference_recipe=self._inference_recipe_for(candidate.config_name),
+                context_limit=self._context_limit_for(candidate.config_name),
+                weights=self._weights_for(candidate.config_name),
+                stated_serving=self._stated_serving_for(candidate.config_name),
                 resume_config_diff=list(self._resume_config_diff),
                 legacy_match=self._legacy_match_for(task_name, runner_config),
                 unserved_candidate=(
@@ -5004,6 +5037,52 @@ class EvalSession:
             if isinstance(attachment, dict):
                 attachment.pop("address", None)
         return cast(dict[str, JSONValue], recipe)
+
+    def _context_limit_for(self, model_name: str) -> int | None:
+        """*model_name*'s context window in tokens, for the inference identity:
+        its serving plan's for an engine the run launches, else the root
+        model's ``context_limit``; ``None`` when unknown.
+
+        A launched engine enforces only its plan's, so a ``context_limit`` the
+        plan does not pin to the same value is refused.
+        """
+        root = self._root_model(model_name)
+        configured = (
+            self._get_named_config_map("models").get(root, {}).get("context_limit")
+        )
+        plan = (self._infer_plans or {}).get(root)
+        if plan is None:
+            return configured
+        planned = _planned_context_limit(plan)
+        if configured is not None and configured != planned:
+            launched = (
+                f"the {planned} its serving plan launches the engine with"
+                if planned is not None
+                else "pinned by its serving plan"
+            )
+            raise ValueError(
+                f"Model '{root}': context_limit {configured} is not {launched}; "
+                "remove context_limit, or set the limit in infer.overrides"
+            )
+        if planned is None:
+            logger.warning(
+                "Model '{}': its serving plan leaves the context window to the "
+                "checkpoint, so the inference identity records it as unknown; "
+                "set it in infer.overrides to make it comparable",
+                root,
+            )
+        return planned
+
+    def _weights_for(self, model_name: str) -> str | None:
+        """The root model's ``weights``, else ``None``."""
+        root = self._root_model(model_name)
+        return self._get_named_config_map("models").get(root, {}).get("weights")
+
+    def _stated_serving_for(self, model_name: str) -> dict[str, JSONValue] | None:
+        """The root model's ``serving``; ``None`` when absent or empty."""
+        root = self._root_model(model_name)
+        stated = self._get_named_config_map("models").get(root, {}).get("serving")
+        return dict(stated) if stated else None
 
     def _resolve_task_dataset(
         self, task_cfg: TaskConfigDict, task_name: str

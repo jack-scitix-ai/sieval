@@ -307,13 +307,49 @@ run's, and reruns each sample from the earliest stage that changed:
 | --- | --- |
 | `data` (the selected samples) | Those samples rerun from the start; the rest are kept |
 | `preprocess` (prompt rendering: its code and the arguments it reads) | Every sample reruns from the start |
-| `inference` | Refused, naming the stage |
+| `inference` (what the model is asked: request arguments, dialect, the task's inference arguments, `deterministic`, `max_iterations`, `max_retries`, context limit) | Refused, naming the stage |
 | `postprocess` (answer extraction) | `postprocess`, `feedback` and `report` rerun on the recorded inference |
 | `feedback` (scoring: judges, their prompts and sampling, services) | `feedback` and `report` rerun on the recorded `postprocess` |
 | `report` (metric aggregation) | `report.json` is recomputed from the recorded samples: no engine starts, no judge is called |
 
 So a grading or report change is a plain `--resume`. A sample past iteration 0
 restarts instead of rolling back to a grading stage.
+
+How the model is served is not part of `inference`, so it never refuses a
+resume: a run on 1 GPU resumes on 8, and one served by an engine `sieval run`
+launched resumes against an endpoint serving the same weights. Each `runs[]`
+entry records its own `serving` (`engine`, `engine_version`, `launch`:
+`in_run` or `external`, and `recipe`: the plan without checkpoint or host), so
+a reader sees what changed.
+
+The context limit does count, since it decides which prompts overflow. A
+launched engine's is the plan's `max_model_len` (vLLM) or `context_length`
+(SGLang), the smallest across roles; a plan with a role that pins neither
+records it as unknown, with a warning. An endpoint states it on its root
+model, along with two optional keys:
+
+```yaml
+models:
+  subject:
+    api_base: http://gpu-node:30000/v1
+    name: qwen3-8b
+    context_limit: 32768   # refused unless a launched engine's plan pins the same
+    weights: sha256:3f…    # compared on resume instead of the name
+    serving:               # recorded as given in runs[].serving.stated
+      engine_version: 0.5.4
+      topology: {prefill: 1, decode: 3}
+      hardware: 4x H200
+```
+
+- `weights`: a resume compares the model under test by it when both runs
+  state one, else by name. Recorded next to `model` in `meta.json`, and kept
+  by a resume that does not state it.
+- `serving`: `engine_version`, `topology` and `hardware`, any value; never
+  compared. Refused on a model `sieval run` launches, which records its own.
+  So a single-node run can resume on a prefill/decode deployment of the same
+  weights.
+
+None of the three is allowed on a derived model.
 
 Each grading stage's identity holds the code its Task method reaches, the task
 class and `grader_args()`; `feedback` also holds every judge and service.
@@ -347,7 +383,12 @@ block is upgraded in place; otherwise every sample regrades.
 
 Schemas 1 and 2 recorded `preprocess` as rendered-prompt digests. A resume
 renders each recorded sample once: if all match, the block is upgraded to
-schema 3 in place; otherwise every sample reruns.
+the current schema in place; otherwise every sample reruns.
+
+Schemas 1 to 3 digested `inference` with the engine and serving recipe. A
+resume of such a directory compares that digest as it was written, so the
+engine and recipe must still match once; the block is then rewritten without
+them, and later resumes compare only what the model is asked.
 
 A same-directory resume reruns a sample with no recorded identity, such as one
 interrupted before `preprocess`. Under `record_meta: false` no sample has one,
@@ -413,7 +454,7 @@ in `SIEVAL_TARGET_GPU` ([Resolving for declared GPUs](infer.md#resolving-for-dec
       "samples": 3,
       "resume_plan": {"kept": 2, "rereported": 0, "regraded": 0, "repostprocessed": 0, "restarted": 0, "dropped": 0},
       "stages": {
-        "identity_schema": 3,
+        "identity_schema": 4,
         "stages": {"data": "differs", "preprocess": "same", "inference": "same", "postprocess": "same", "feedback": "same", "report": "same"},
         "rerun_from": null,
         "refused": null,
