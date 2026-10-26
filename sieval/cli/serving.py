@@ -1,17 +1,19 @@
 """Reconcile serving with what tasks need: each task's context window, what a
-model can serve (its ``context:`` block), and the serving groups a run launches.
+model can serve (its ``context:`` block), the memory input scoring needs, and
+the serving groups a run launches.
 
 AI-Generated Code - Claude Opus 5.5 (Anthropic)
 """
 
 import dataclasses
-from collections.abc import Mapping
+import math
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from sieval.cli.resolution import config_task_candidates, validate_named_config_map
 from sieval.infer.config import ParamValue
-from sieval.infer.introspect import native_context_window
+from sieval.infer.introspect import logit_shape, native_context_window
 from sieval.infer.topology import DeploymentPlan
 
 #: The engine parameter that sets the served context window, by backend.
@@ -30,8 +32,38 @@ _MAX_TOKENS_KEYS = ("max_tokens", "max_completion_tokens")
 PROMPT_HEADROOM = 4096
 
 
+#: The engine parameters the input-scoring headroom sets, by backend: the GPU
+#: memory share taken up front, and the tokens of one prefill batch, which
+#: bound the rows of logits it computes (SGLang charges every request of the
+#: batch against it: ``rem_chunk_tokens`` in
+#: https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/srt/managers/schedule_policy.py#L846).
+#: SGLang only; vLLM's prompt-logprob path has no measured rule yet.
+MEMORY_PARAMS: dict[str, str] = {"sglang": "mem_fraction_static"}
+PREFILL_PARAMS: dict[str, str] = {"sglang": "chunked_prefill_size"}
+
+#: Bytes per scored logit beyond the model dtype's: SGLang's worst case holds
+#: three fp32 vocabulary rows per token (``matrices_per_chunk`` in
+#: https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/srt/layers/logprob_processor.py#L561-L564).
+SCORING_FP32_BYTES = 3 * 4
+
+#: The most of one GPU's memory the reserve may take: a large vocabulary
+#: shortens the prefill cap instead of shrinking the KV pool.
+SCORING_RESERVE_SHARE = 0.10
+
+#: The prefill cap is a multiple of this, unless one step exceeds the budget.
+SCORING_PREFILL_STEP = 1024
+
+#: The prefill cap never exceeds SGLang's own default on 80 to 160 GB GPUs.
+SCORING_MAX_PREFILL = 8192
+
+
 class ServingShortfallError(ValueError):
     """A task needs a longer context window than its model can serve."""
+
+
+class ScoringHeadroomError(ValueError):
+    """A pinned prefill cap needs more memory for its logits than the
+    input-scoring budget allows."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,12 +94,44 @@ class ServedWindow:
 
 
 @dataclass(frozen=True)
+class ScoringHeadroom:
+    """The memory reserved on one engine for the tasks that score input.
+
+    *params* maps each changed engine parameter (``<role>.<param>`` on a plan
+    with several roles) to its value before (``None``: unset) and after.
+    *prefill_tokens* and *reserve_mib* are the largest role's, ``None`` when
+    the reserve could not be sized; *reason* then says why.
+    """
+
+    tasks: tuple[str, ...]
+    reason: str
+    prefill_tokens: int | None = None
+    reserve_mib: int | None = None
+    params: Mapping[str, tuple[ParamValue | None, ParamValue]] = field(
+        default_factory=dict
+    )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "tasks": list(self.tasks),
+            "prefill_tokens": self.prefill_tokens,
+            "reserve_mib": self.reserve_mib,
+            "params": {
+                key: {"recipe": before, "served": after}
+                for key, (before, after) in self.params.items()
+            },
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class ServingGroup:
     """Engines launched together, and the tasks they serve.
 
     *plans* holds one plan per served root model; *launches* are the roots
     some task of this group runs on. The default group also holds every task
-    a model ``sieval run`` does not serve.
+    a model ``sieval run`` does not serve. *headroom* is the input-scoring
+    reserve of each root some task of this group scores input on.
     """
 
     key: str
@@ -75,6 +139,7 @@ class ServingGroup:
     tasks: tuple[str, ...]
     windows: Mapping[str, ServedWindow]
     launches: frozenset[str]
+    headroom: Mapping[str, ScoringHeadroom] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -84,7 +149,8 @@ class SessionServing:
     *tasks* are the tasks it runs, ``None`` for all of them. *group* is its
     key, recorded in each served task's ``runs[].serving.group``. The plans go
     to *infer_plans_file*, so groups sharing a ``result_dir`` keep one each,
-    with *recipes*: the recipe plans a scaled group's plans started from.
+    with *recipes*: the recipe plans this group's changed plans started from
+    (scaled, or given input-scoring headroom).
     """
 
     tasks: frozenset[str] | None = None
@@ -239,14 +305,17 @@ def check_context_fits(
 def plan_serving_groups(
     config: Mapping[str, Any],
     base_plans: Mapping[str, DeploymentPlan],
+    gpu_memory_mib: int | None = None,
 ) -> list[ServingGroup]:
     """Group the tasks by the plan that serves them, the default group first.
 
     *base_plans* are the recipe plans by root model. A need within the native
     window raises that plan, a ``max_tokens`` below native to the native
     window itself; one within ``context.max`` gets the group
-    ``<root>@<window>`` with ``context.scaling``. Raises
-    :class:`ServingShortfallError` naming every task no plan can serve.
+    ``<root>@<window>`` with ``context.scaling``. A plan that serves a task
+    scoring input then reserves memory for its logits
+    (:func:`reserve_scoring_headroom`, sized for *gpu_memory_mib* per GPU).
+    Raises :class:`ServingShortfallError` naming every task no plan can serve.
     """
     models = validate_named_config_map("models", config.get("models", {}))
     tasks = validate_named_config_map("tasks", config.get("tasks", {}))
@@ -259,7 +328,24 @@ def plan_serving_groups(
         if candidate is not None and candidate[0] in served:
             served[candidate[0]].append(task_name)
 
+    scoring = {task for task, (_, req) in candidates.items() if req.input_scoring}
+
+    def with_headroom(
+        root: str, plan: DeploymentPlan, group_tasks: Iterable[str]
+    ) -> tuple[DeploymentPlan, ScoringHeadroom | None]:
+        scored = tuple(task for task in group_tasks if task in scoring)
+        if not scored:
+            return plan, None
+        return reserve_scoring_headroom(
+            plan,
+            scored,
+            longest_prompt=_longest_prompt(scored, needs, plan_window(plan)),
+            gpu_memory_mib=gpu_memory_mib,
+            pinned=_pinned_params(models.get(root, {}), plan.backend),
+        )
+
     default_plans: dict[str, DeploymentPlan] = {}
+    default_headroom: dict[str, ScoringHeadroom] = {}
     windows: dict[str, ServedWindow] = {}
     scaled_groups: list[ServingGroup] = []
     shortfalls: list[str] = []
@@ -303,9 +389,12 @@ def plan_serving_groups(
             shortfalls.append(_shortfall(task_name, need, limit, native))
 
         default_plan = plan if raise_to is None else with_window(plan, raise_to, {})
-        default_plans[root] = default_plan
         default_window = served_window(default_plan, native)
         stays = [task for task in served[root] if task not in scaled]
+        default_plan, headroom = with_headroom(root, default_plan, stays)
+        default_plans[root] = default_plan
+        if headroom is not None:
+            default_headroom[root] = headroom
         if stays or not scaled:
             launched.add(root)
         for task_name in stays:
@@ -313,13 +402,17 @@ def plan_serving_groups(
         if scaled:
             scaled_window = max(needs[task].tokens for task in scaled)
             key = f"{root}@{scaled_window}"
+            scaled_plan, headroom = with_headroom(
+                root, with_window(plan, scaled_window, context.scaling), scaled
+            )
             scaled_groups.append(
                 ServingGroup(
                     key,
-                    {root: with_window(plan, scaled_window, context.scaling)},
+                    {root: scaled_plan},
                     tuple(scaled),
                     {task: ServedWindow(key, scaled_window, True) for task in scaled},
                     frozenset({root}),
+                    {root: headroom} if headroom is not None else {},
                 )
             )
     if shortfalls:
@@ -335,8 +428,153 @@ def plan_serving_groups(
         tuple(task for task in tasks if task not in moved),
         windows,
         frozenset(launched),
+        default_headroom,
     )
     return [default, *scaled_groups]
+
+
+def reserve_scoring_headroom(
+    plan: DeploymentPlan,
+    tasks: tuple[str, ...],
+    *,
+    longest_prompt: int | None,
+    gpu_memory_mib: int | None,
+    pinned: frozenset[str] = frozenset(),
+) -> tuple[DeploymentPlan, ScoringHeadroom]:
+    """*plan* with GPU memory set aside for the logits input scoring computes.
+
+    Per GPU (tensor parallelism gathers the full vocabulary on every rank)::
+
+        row     = vocab_size * (dtype_bytes + SCORING_FP32_BYTES)
+        budget  = SCORING_RESERVE_SHARE * gpu_bytes // row
+        prefill = min(budget, longest_prompt, SCORING_MAX_PREFILL), up to a
+                  SCORING_PREFILL_STEP, down again if that exceeds budget
+        memory  = recipe_memory - prefill * row / gpu_bytes, floored to 0.01
+
+    Each role keeps a smaller or pinned prefill cap, and its reserve follows
+    that cap. A memory share pinned in *pinned* or left to the engine is not
+    lowered. A missing fact (backend rule, vocabulary, GPU memory) leaves the
+    plan as it is, and the reason says why.
+
+    Raises :class:`ScoringHeadroomError` when a pinned cap's reserve exceeds
+    the budget and the share would be lowered by it.
+    """
+    memory_key = MEMORY_PARAMS.get(plan.backend)
+    prefill_key = PREFILL_PARAMS.get(plan.backend)
+    if memory_key is None or prefill_key is None:
+        return plan, ScoringHeadroom(
+            tasks, f"unchanged: no headroom rule for backend {plan.backend!r}"
+        )
+    shape = logit_shape(plan.checkpoint)
+    if shape is None:
+        return plan, ScoringHeadroom(
+            tasks, "unchanged: the checkpoint's vocab_size is unknown"
+        )
+    if gpu_memory_mib is None:
+        return plan, ScoringHeadroom(tasks, "unchanged: the GPU memory is unknown")
+    vocab, dtype_bytes = shape
+    gpu_bytes = gpu_memory_mib * 2**20
+    row = int(vocab * (dtype_bytes + SCORING_FP32_BYTES))
+    budget = int(SCORING_RESERVE_SHARE * gpu_bytes) // row
+    wanted = min(budget, longest_prompt or budget, SCORING_MAX_PREFILL)
+    step = SCORING_PREFILL_STEP
+    prefill = min(-(-wanted // step) * step, budget // step * step) or budget
+    if prefill < 1:
+        return plan, ScoringHeadroom(
+            tasks, f"unchanged: one logit row of vocab {vocab} exceeds the budget"
+        )
+
+    def key(role: str, param: str) -> str:
+        return param if len(plan.assignments) == 1 else f"{role}.{param}"
+
+    params: dict[str, tuple[ParamValue | None, ParamValue]] = {}
+    engines: list[dict[str, ParamValue]] = []
+    caps: list[int] = []
+    kept: set[str] = set()
+    for assignment in plan.assignments:
+        engine = dict(assignment.engine_params)
+        cap = prefill
+        current = _count(engine.get(prefill_key))
+        if current is not None and (prefill_key in pinned or current <= prefill):
+            cap = current
+        else:
+            engine[prefill_key] = prefill
+            params[key(assignment.role, prefill_key)] = (current, prefill)
+        memory = engine.get(memory_key)
+        if memory_key in pinned:
+            kept.add(f"{memory_key} kept: set by infer.overrides")
+        elif isinstance(memory, bool) or not isinstance(memory, int | float):
+            kept.add(f"{memory_key} left to the engine")
+        elif cap > budget:
+            raise ScoringHeadroomError(
+                f"Input scoring by {', '.join(tasks)}: the {prefill_key} {cap} "
+                f"pinned in infer.overrides needs {cap * row // 2**20} MiB per "
+                f"GPU for its logits, over {SCORING_RESERVE_SHARE:.0%} of "
+                f"{gpu_memory_mib} MiB. Pin {prefill_key} at most {budget}, "
+                f"or pin {memory_key} as well."
+            )
+        else:
+            lowered = math.floor(round((memory - cap * row / gpu_bytes) * 100, 6))
+            if lowered / 100 < memory:
+                engine[memory_key] = lowered / 100
+                params[key(assignment.role, memory_key)] = (memory, lowered / 100)
+        engines.append(engine)
+        caps.append(cap)
+
+    adjusted = dataclasses.replace(
+        plan,
+        assignments=tuple(
+            dataclasses.replace(assignment, engine_params=engine)
+            for assignment, engine in zip(plan.assignments, engines, strict=True)
+        ),
+    )
+    prefill = max(caps)
+    reserve = prefill * row
+    reason = (
+        f"input scoring by {', '.join(tasks)}: full-vocabulary logits of "
+        f"{prefill} prefill tokens x {vocab} vocab x "
+        f"({dtype_bytes:g}+{SCORING_FP32_BYTES}) B = {reserve // 2**20} MiB "
+        f"per GPU, {reserve / gpu_bytes:.1%} of {gpu_memory_mib} MiB"
+    )
+    if kept:
+        reason += "; " + "; ".join(sorted(kept))
+    return adjusted, ScoringHeadroom(
+        tasks, reason, prefill, reserve // 2**20, dict(sorted(params.items()))
+    )
+
+
+def _longest_prompt(
+    tasks: Iterable[str], needs: Mapping[str, ContextNeed], window: int | None
+) -> int | None:
+    """The longest prompt *tasks* may score, as far as it is known: each one's
+    context need, at most *window*; ``None`` when a task's is unknown."""
+    bounds: list[int] = []
+    for task in tasks:
+        need = needs.get(task)
+        known = [v for v in (need.tokens if need else None, window) if v is not None]
+        if not known:
+            return None
+        bounds.append(min(known))
+    return max(bounds) if bounds else None
+
+
+def _pinned_params(root_config: Mapping[str, Any], backend: str) -> frozenset[str]:
+    """The headroom parameters a root model's ``infer.overrides`` sets, which
+    the reserve keeps."""
+    infer = root_config.get("infer")
+    overrides = infer.get("overrides") if isinstance(infer, Mapping) else None
+    if not isinstance(overrides, Mapping):
+        return frozenset()
+    spelled = {str(key).replace("-", "_") for key in overrides}
+    keys = {MEMORY_PARAMS.get(backend), PREFILL_PARAMS.get(backend)}
+    return frozenset(key for key in keys if key is not None and key in spelled)
+
+
+def _count(value: object) -> int | None:
+    """*value* when it is a positive integer, else ``None``."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
 
 
 def with_window(

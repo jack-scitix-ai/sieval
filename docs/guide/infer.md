@@ -235,6 +235,37 @@ can run as separate jobs into one `result_dir`. Each group writes
 A `gen` model served by SGLang with no `dialect:` gets `sglang_legacy` when a
 task scores input: SGLang's `/v1/completions` cannot.
 
+### Input-scoring headroom
+
+A task that scores its input (`TaskRequirements.input_scoring`: the PPL and
+CLP tasks) makes SGLang compute full-vocabulary logits for every prompt token
+of a prefill batch. A recipe sized for generation leaves too little memory for
+them, and the engine dies under full load. So an SGLang plan serving such a
+task reserves that memory, per GPU:
+
+```text
+row     = vocab_size × (dtype bytes + 12)        # three fp32 copies
+budget  = 10% of GPU memory ÷ row
+prefill = min(budget, longest scored prompt, 8192), rounded to 1024
+reserve = prefill × row
+```
+
+`chunked_prefill_size` is lowered to `prefill`, and `mem_fraction_static` by
+`reserve` as a share of GPU memory. Qwen3-30B-A3B-Base (151936 × bf16) on
+H100 80GB: 3072 tokens, 6231 MiB, so 0.87 becomes 0.79.
+
+- `infer.overrides` wins. A pinned `chunked_prefill_size` sizes the reserve;
+  one whose reserve exceeds the 10% budget is refused unless
+  `mem_fraction_static` is pinned too.
+- A smaller cap already in the plan is kept. A share left to SGLang is not
+  lowered.
+- Unknown vocabulary or GPU memory, or a vLLM plan, leaves the plan unchanged.
+- Scoring and generation tasks share one engine; a scaled group sizes its own.
+
+`--dry-run` reports it as `serving.<group>.engines.<engine>.headroom`. It is
+launch-only, so it is recorded in `infer_plans.yaml` and `runs[].serving`,
+never in the inference identity: older result directories resume.
+
 ### Anthropic Messages
 
 To call the native Anthropic Messages API, select the dialect explicitly and
