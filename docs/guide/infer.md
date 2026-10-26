@@ -174,6 +174,26 @@ again, which planning cannot foresee. With no engine started it fails at
 `infer`, before any request, and a later `--resume` that starts the engine
 retries it.
 
+### Losing an engine mid-run
+
+`sieval run` watches each engine it launched while its samples run. An engine
+is lost when its process exits, or fails its health check for 180 s in a row.
+Every sample still needing it then fails at once: queued ones as
+`engine_died_unsent`, in-flight ones as `engine_died`. Samples on other
+engines carry on.
+
+Each task still writes `report.json`, the engine is stopped, no later serving
+group starts, and the run exits 6 with the engine's exit code (or failing
+health check), the failures per task and its last log lines.
+
+`sieval run --resume` retries both reasons. `engine_died_unsent` spends no
+retry; `engine_died` spends one, so a sample that crashes the engine stops at
+`max_retries`. After an out-of-memory exit, change the plan
+(`infer.overrides`) before resuming.
+
+An engine stopped on purpose, lost after its last sample, or not launched by
+SiEval (`api_base`, `sieval infer start`) is not reported.
+
 ### Serving plans: context window and dialect
 
 `sieval run` and `sieval infer start <yaml>` size each served model's context

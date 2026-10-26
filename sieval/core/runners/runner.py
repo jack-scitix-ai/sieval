@@ -1,5 +1,6 @@
 """Single-task execution engine with dual-stream compute/storage architecture."""
 
+import contextlib
 import os
 import re
 import time
@@ -38,6 +39,8 @@ from sieval.core.tasks.concurrency import (
 )
 from sieval.core.tasks.consts import (
     CONTEXT_OVERFLOW_REASON,
+    ENGINE_DIED_REASON,
+    ENGINE_DIED_UNSENT_REASON,
     NON_RETRIABLE_REASON,
     STAGE_DIRS,
     NonRetriableSampleError,
@@ -105,6 +108,7 @@ from sieval.core.utils.meta import (
     report_versions,
 )
 
+from .engine_loss import EngineDiedError, EngineGuard
 from .resume_gate import (
     ResumeAction,
     ResumeVersionError,
@@ -498,6 +502,7 @@ class TaskRunner:
         legacy_match: LegacyStageMatch | None = None,
         unserved_candidate: bool = False,
         serving_group: str | None = None,
+        engine_guard: EngineGuard | None = None,
     ):
         """*inference_recipe* is the serving plan of the model under test,
         without its checkpoint (``None`` when SiEval does not serve it), and
@@ -511,7 +516,8 @@ class TaskRunner:
         *unserved_candidate* says no engine serves the model under test, since
         a plan found nothing to infer: a run that would infer is refused.
         *serving_group* is the key of the serving group whose engine serves
-        it, recorded in ``runs[].serving``.
+        it, recorded in ``runs[].serving``. *engine_guard* fails a stage
+        that needs a lost engine (:mod:`.engine_loss`).
         """
         # A malformed judge reference would leave every grader identity
         # unknown; refuse it before any work.
@@ -526,6 +532,7 @@ class TaskRunner:
         self._legacy_match = LegacyStageMatch(**(legacy_match or {}))
         self._unserved_candidate = unserved_candidate
         self._serving_group = serving_group
+        self._engine_guard = engine_guard
         # Per-stage resume: what was copied in, and what the comparison chose.
         self._run_from: RunFrom | None = None
         self._copied: list[Path] = []
@@ -1508,35 +1515,46 @@ class TaskRunner:
             return ctx
 
         self._ran_actions.add(action)
+        guard = (
+            self._engine_guard.guard(action)
+            if self._engine_guard is not None
+            else contextlib.nullcontext()
+        )
         try:
-            self._check_served(action)
-            match action:
-                case TaskAction.PREPROCESS:
-                    r = await self._task.preprocess(ctx.raw_sample, ctx)
-                    new_ctx = _run_stage(TaskStage.PREPROCESSED, r)
+            async with guard:
+                self._check_served(action)
+                match action:
+                    case TaskAction.PREPROCESS:
+                        r = await self._task.preprocess(ctx.raw_sample, ctx)
+                        new_ctx = _run_stage(TaskStage.PREPROCESSED, r)
 
-                case TaskAction.INFER:
-                    r, overflows = await self._infer(ctx)
-                    new_ctx = _run_stage(TaskStage.INFERRED, r, overflows=overflows)
+                    case TaskAction.INFER:
+                        r, overflows = await self._infer(ctx)
+                        new_ctx = _run_stage(TaskStage.INFERRED, r, overflows=overflows)
 
-                case TaskAction.POSTPROCESS:
-                    r = await self._task.postprocess(ctx.infer_result, ctx)
-                    new_ctx = _run_stage(TaskStage.POSTPROCESSED, r)
+                    case TaskAction.POSTPROCESS:
+                        r = await self._task.postprocess(ctx.infer_result, ctx)
+                        new_ctx = _run_stage(TaskStage.POSTPROCESSED, r)
 
-                case TaskAction.FEEDBACK:
-                    finalize, fb = await self._task.feedback(
-                        ctx.postprocess_result, ctx
-                    )
-                    new_ctx = _run_stage(TaskStage.FEEDBACK, fb, finalize=finalize)
+                    case TaskAction.FEEDBACK:
+                        finalize, fb = await self._task.feedback(
+                            ctx.postprocess_result, ctx
+                        )
+                        new_ctx = _run_stage(TaskStage.FEEDBACK, fb, finalize=finalize)
 
         except Exception as e:
-            logger.opt(exception=True).error(
+            # The loss itself is reported once, by the CLI.
+            logger.opt(exception=not isinstance(e, EngineDiedError)).error(
                 "Stage {} failed for {}", action, ctx.sample_id
             )
             # A task raising `NonRetriableSampleError` has declared the outcome
             # deterministic in this sample's own input, so it earns the one reason
             # the loader will not roll back.
-            if isinstance(e, ContextOverflowError):
+            if isinstance(e, EngineDiedError):
+                reason = (
+                    ENGINE_DIED_REASON if e.in_flight else ENGINE_DIED_UNSENT_REASON
+                )
+            elif isinstance(e, ContextOverflowError):
                 reason = CONTEXT_OVERFLOW_REASON
             elif isinstance(e, NonRetriableSampleError):
                 reason = NON_RETRIABLE_REASON

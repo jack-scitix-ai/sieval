@@ -5,7 +5,16 @@ field clearing, and record_each_stage behavior.
 AI-Generated Code - Claude Sonnet 4.6 (Anthropic)
 """
 
-from sieval.core.tasks.consts import NON_RETRIABLE_REASON, TaskAction, TaskStage
+import pytest
+
+from sieval.core.tasks.consts import (
+    ENGINE_DIED_REASON,
+    ENGINE_DIED_UNSENT_REASON,
+    ERROR_REASONS_NON_RETRIABLE,
+    NON_RETRIABLE_REASON,
+    TaskAction,
+    TaskStage,
+)
 from sieval.core.tasks.context import TaskContext
 from sieval.core.tasks.loader import TaskLoader
 
@@ -67,6 +76,31 @@ class TestPrepareFailedRetries:
         assert contexts[0].stage == TaskStage.FAILED
         assert contexts[0].retry_count == 0
         assert contexts[0].error_reason == NON_RETRIABLE_REASON
+
+    @pytest.mark.parametrize(
+        ("reason", "retry_count"),
+        [(ENGINE_DIED_UNSENT_REASON, 1), (ENGINE_DIED_REASON, 2)],
+    )
+    def test_an_engine_death_spends_a_retry_only_once_sent(
+        self, tmp_path, reason, retry_count
+    ):
+        """Both are retried. A sample never sent to the lost engine keeps its
+        retries; one in flight may have brought it down, so it spends one."""
+        assert reason not in ERROR_REASONS_NON_RETRIABLE
+        loader = self._make_loader(tmp_path)
+        ctx = make_ctx(
+            0,
+            TaskStage.FAILED,
+            error_action=TaskAction.INFER,
+            error_reason=reason,
+            retry_count=1,
+        )
+        contexts = {0: ctx}
+        loader._prepare_failed_retries(contexts, record_each_stage=True)
+
+        assert contexts[0].stage == TaskStage.PREPROCESSED
+        assert contexts[0].retry_count == retry_count
+        assert contexts[0].error_reason is None
 
     def test_no_error_action_unchanged(self, tmp_path):
         loader = self._make_loader(tmp_path)

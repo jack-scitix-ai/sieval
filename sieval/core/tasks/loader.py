@@ -23,6 +23,7 @@ from sieval.core.utils.serialization import (
 
 from .consts import (
     DEPENDENCY_STAGE_RANKS,
+    ENGINE_DIED_UNSENT_REASON,
     ERROR_ACTION_CLEAR_FIELDS,
     ERROR_ACTION_PREV_STAGE,
     ERROR_REASONS_NON_RETRIABLE,
@@ -755,8 +756,13 @@ class TaskLoader:
                 "error_msg": None,
                 # Pre-increment retry_count so that runner can compare
                 # retry_count > max_retries: retry_count=1 means "on retry #1",
-                # so max_retries=1 allows exactly one retry.
-                "retry_count": c.retry_count + 1,
+                # so max_retries=1 allows exactly one retry. A stage never
+                # sent to a lost engine spends none.
+                "retry_count": (
+                    c.retry_count
+                    if c.error_reason == ENGINE_DIED_UNSENT_REASON
+                    else c.retry_count + 1
+                ),
             }
 
             if record_each_stage:
