@@ -253,6 +253,33 @@ preprocess -> infer -> postprocess -> feedback -> report
 | **Feedback** | check correctness; return `(finalize, feedback)` — `False` to iterate |
 | **Report** | aggregate results into final metrics |
 
+### Stage barriers and `stop_after`
+
+Samples stream through the stages independently. A **barrier** on a stage
+holds every sample of every task until all have finished that stage or failed.
+There is no barrier key: the barriers are `stop_after` plus every model
+lifecycle boundary ([Model lifecycles](infer.md#model-lifecycles)), and
+`--dry-run` lists them under `barriers`.
+
+```yaml
+runner_config:
+  stop_after: inference   # preprocess, inference, postprocess, feedback or report
+```
+
+- `stop_after: S` ends the run after `S`: no later stage runs, no
+  `report.json` (unless `S` is `report`), and `runs[]` records
+  `stopped_after: S`. `--resume` continues from the next stage, with the same
+  identities as an uninterrupted run. Needs `record_each_stage: true`.
+- One `stop_after` per run, session-wide. Several stops are several runs.
+- Barriers are scheduling only: in no identity, never refuse a resume.
+- A barrier on `inference` or `postprocess` is refused for a task with
+  `max_iterations` above 1. With it unset, a sample asking to iterate past
+  one fails `barrier_iteration`, retriable without the barrier.
+
+From Python: `MultiTaskRunner(stop_after=..., barriers=[...], on_barrier=hook)`.
+The async `hook(stage)` runs once per barrier before any sample crosses it; if
+it raises, every task stops.
+
 ### Python packages a task needs
 
 A task whose grader imports a third-party package declares it on the class,
