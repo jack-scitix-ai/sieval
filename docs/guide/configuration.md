@@ -4,6 +4,9 @@
 
 SiEval uses YAML files for batch evaluation. A config defines models, datasets, tasks, and runner options.
 
+A key repeated within one mapping is an error on every entry point, before
+anything starts. Keys a merge (`<<: *anchor`) brings in may still be overridden.
+
 ```yaml
 result_dir: "./outputs/my-eval"
 
