@@ -319,8 +319,9 @@ class TestCountTruncatedRollouts:
         # The IR keeps finish_reasons provider-verbatim: OpenAI-compatible
         # Chat/Completions and SGLang native say `length`, Responses says
         # `max_output_tokens`, Anthropic says `max_tokens` or
-        # `model_context_window_exceeded`, and Google says `MAX_TOKENS` or
-        # `CONTINUATION`. A set holding only one spelling would silently read
+        # `model_context_window_exceeded`, Google generateContent says
+        # `MAX_TOKENS` or `CONTINUATION`, and Gemini Interactions says
+        # `incomplete`. A set holding only one spelling would silently read
         # zero on another provider.
         for reason in (
             "length",
@@ -329,6 +330,7 @@ class TestCountTruncatedRollouts:
             "model_context_window_exceeded",
             "MAX_TOKENS",
             "CONTINUATION",
+            "incomplete",
             "content_filter",
             "refusal",
         ):

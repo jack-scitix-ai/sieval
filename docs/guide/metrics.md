@@ -556,12 +556,15 @@ forgotten to look.
 
 What counts: token/context-limit stops (`length`, `max_tokens`,
 `max_output_tokens`, `model_context_window_exceeded`, Google `MAX_TOKENS` /
-`CONTINUATION`), OpenAI `content_filter`, Anthropic `refusal`, and Google
+`CONTINUATION`), Google Interactions `incomplete`, OpenAI `content_filter`,
+Anthropic `refusal`, and Google
 candidate policy stops (`SAFETY`, `RECITATION`, `LANGUAGE`, …). A Google prompt
 block (`promptFeedback.blockReason`) does not count — no candidate was
 generated — and older Google records that lack `finish_reason_sources` cannot
 tell the two apart, so their policy stops are left uncounted. A Chat
 `message.refusal` without a `content_filter` finish reason is not counted.
+Interactions `incomplete` does not distinguish a token limit from output
+filtering.
 
 They arrive as a **pair or not at all**. The count alone says nothing about how
 much of a score it explains — `26` is a different fact at 600 rollouts than at 30
