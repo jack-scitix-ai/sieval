@@ -422,6 +422,25 @@ def native_context_window(checkpoint: str) -> int | None:
     return _positive_config_int(checkpoint, "max_position_embeddings")
 
 
+def checkpoint_numerics(checkpoint: str) -> dict[str, str] | None:
+    """*checkpoint*'s ``torch_dtype`` (or ``dtype``) and
+    ``quantization_config.quant_method``, from ``config.json`` or its
+    ``text_config``; each absent when unstated, ``None`` when unreadable."""
+    sources = _text_configs(checkpoint)
+    if not sources:
+        return None
+    out: dict[str, str] = {}
+    for source in sources:
+        for key in ("torch_dtype", "dtype"):
+            value = source.get(key)
+            if isinstance(value, str) and "dtype" not in out:
+                out["dtype"] = value
+        quantization = _extract_quantization(source)
+        if quantization is not None and "quantization" not in out:
+            out["quantization"] = quantization.quant_method
+    return out
+
+
 def logit_shape(checkpoint: str) -> tuple[int, float] | None:
     """*checkpoint*'s output vocabulary and the bytes of one logit in its dtype.
 

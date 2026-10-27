@@ -63,6 +63,8 @@ from sieval.core.tasks.run_meta import (
     preprocess_key,
     prompt_of,
     read_identity,
+    read_recorded_numerics,
+    served_numerics,
     split_digests,
     stage_code,
     stage_key,
@@ -194,6 +196,7 @@ def plan_resume(
     current: Mapping[str, Any],
     legacy_grader_keys: Iterable[str] = (),
     legacy_inference: str | None = None,
+    checkpoint_numerics: Mapping[str, JSONValue] | None = None,
 ) -> ResumePlan:
     """Compare a recorded ``meta.json`` with this run's identities, running nothing.
 
@@ -203,8 +206,9 @@ def plan_resume(
     :func:`~sieval.core.tasks.run_meta.legacy_grader_keys` for this task,
     read only for a schema-1 directory, and *legacy_inference*
     :func:`~sieval.core.tasks.run_meta.legacy_inference_digest`, only for one
-    before identity schema 4. The runner plans per sample and is
-    authoritative; this says what a resume of a finished directory does.
+    before identity schema 4; *checkpoint_numerics* resolves a schema-4 plan's
+    unset numerics. The runner plans per sample and is authoritative; this
+    says what a resume of a finished directory does.
     """
     block = (recorded_meta or {}).get("identity")
     schema = block.get("schema") if isinstance(block, Mapping) else None
@@ -221,6 +225,8 @@ def plan_resume(
         block if isinstance(block, Mapping) else None,
         mine.get("digest") if isinstance(mine, Mapping) else None,
         legacy_inference,
+        numerics=mine.get("numerics") if isinstance(mine, Mapping) else None,
+        recorded_numerics=read_recorded_numerics(recorded_meta, checkpoint_numerics),
     )
     stages["inference"] = "unknown" if match is None else _verdict(match)
     stages = {stage: stages[stage] for stage in STAGES}
@@ -285,6 +291,8 @@ def task_resume_plan(
     runner_keys: Mapping[str, JSONValue],
     context_limit: int | None = None,
     recipe: Mapping[str, JSONValue] | None = None,
+    stated_serving: Mapping[str, JSONValue] | None = None,
+    checkpoint_numerics: Mapping[str, JSONValue] | None = None,
 ) -> ResumePlan:
     """:func:`plan_resume` for *task* against a recorded ``meta.json``.
 
@@ -292,9 +300,8 @@ def task_resume_plan(
     :class:`~sieval.core.runners.runner.TaskRunner` does, so call it after
     ``task.setup()``, which may resolve an argument the grading identities
     read. *runner_keys* holds :data:`~sieval.core.tasks.run_meta.INFERENCE_RUNNER_KEYS`
-    and *context_limit* and *recipe* as the runner is given them; *recipe* is
-    read only for a directory before identity schema 4. Reads files,
-    starts nothing and calls no model.
+    and the rest as the runner is given them. Reads files, starts nothing and
+    calls no model.
     """
     task_cls = type(task)
     judges = judge_identities(task.judge_models(), task.judge_prompts())
@@ -311,6 +318,7 @@ def task_resume_plan(
             task_args=task.inference_args(),
             runner_keys=runner_keys,
             context_limit=context_limit,
+            numerics=served_numerics(recipe, stated_serving, checkpoint_numerics),
         ),
         **grading,
     }
@@ -324,6 +332,7 @@ def task_resume_plan(
             runner_keys=runner_keys,
             recipe=recipe,
         ),
+        checkpoint_numerics,
     )
 
 

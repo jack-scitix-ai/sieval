@@ -364,7 +364,7 @@ run's, and reruns each sample from the earliest stage that changed:
 | --- | --- |
 | `data` (the selected samples) | Those samples rerun from the start; the rest are kept |
 | `preprocess` (prompt rendering: its code and the arguments it reads) | Every sample reruns from the start |
-| `inference` (what the model is asked: request arguments, dialect, the task's inference arguments, `deterministic`, `max_iterations`, `max_retries`, context limit) | Refused, naming the stage |
+| `inference` (what the model is asked: request arguments, dialect, the task's inference arguments, `deterministic`, `max_iterations`, `max_retries`, context limit; and what the served model computes with: `dtype`, `quantization`, `kv_cache_dtype`, model overrides) | Refused, naming the stage |
 | `postprocess` (answer extraction) | `postprocess`, `feedback` and `report` rerun on the recorded inference |
 | `feedback` (scoring: judges, their prompts and sampling, services) | `feedback` and `report` rerun on the recorded `postprocess` |
 | `report` (metric aggregation) | `report.json` is recomputed from the recorded samples: no engine starts, no judge is called |
@@ -378,6 +378,22 @@ launched resumes against an endpoint serving the same weights. Each `runs[]`
 entry records its own `serving` (`engine`, `engine_version`, `launch`:
 `in_run` or `external`, and `recipe`: the plan without checkpoint or host), so
 a reader sees what changed.
+
+What the served model computes with does count: these engine parameters
+change the logits, so they are compared as `identity.inference.numerics`.
+
+| `numerics` key | Engine parameters | Unset means |
+| --- | --- | --- |
+| `dtype` | `dtype` | The checkpoint's `torch_dtype`; unknown for float32, which engines downcast |
+| `quantization` | `quantization` | The checkpoint's `quantization_config.quant_method`, else none |
+| `kv_cache_dtype` | `kv_cache_dtype` | `auto` |
+| `model_overrides` | `json_model_override_args` (SGLang), `hf_overrides` (vLLM) | None |
+
+Values are compared as the engine uses them, so stating a default (`dtype:
+auto`, `bf16`) is no change. A key unknown on either side is no difference:
+an endpoint's numerics are only what its root model states under
+`serving.numerics`. A schema-4 `meta.json` has its numerics read from its
+latest run's plan.
 
 The context limit does count, since it decides which prompts overflow. A
 launched engine's is the plan's `max_model_len` (vLLM) or `context_length`
@@ -396,6 +412,7 @@ models:
       engine_version: 0.5.4
       topology: {prefill: 1, decode: 3}
       hardware: 4x H200
+      numerics: {dtype: bfloat16, kv_cache_dtype: fp8_e4m3}   # compared
 ```
 
 - `weights`: a resume compares the model under test by it when both runs
@@ -404,7 +421,7 @@ models:
 - `serving`: `engine_version`, `topology` and `hardware`, any value; never
   compared. Refused on a model `sieval run` launches, which records its own.
   So a single-node run can resume on a prefill/decode deployment of the same
-  weights.
+  weights. `numerics` takes the keys of the table above and is compared.
 
 None of the three is allowed on a derived model.
 
@@ -514,7 +531,7 @@ in `SIEVAL_TARGET_GPU` ([Resolving for declared GPUs](infer.md#resolving-for-dec
       "samples": 3,
       "resume_plan": {"kept": 2, "rereported": 0, "regraded": 0, "repostprocessed": 0, "restarted": 0, "dropped": 0},
       "stages": {
-        "identity_schema": 4,
+        "identity_schema": 5,
         "stages": {"data": "differs", "preprocess": "same", "inference": "same", "postprocess": "same", "feedback": "same", "report": "same"},
         "rerun_from": null,
         "refused": null,
