@@ -50,6 +50,10 @@ from .dialects.openai_responses import (
     CAPABILITY_DECISIONS as OPENAI_RESPONSES_CAPABILITY_DECISIONS,
 )
 from .dialects.openai_responses import OpenAIResponsesDialect
+from .dialects.sglang_native import (
+    CAPABILITY_DECISIONS as SGLANG_NATIVE_CAPABILITY_DECISIONS,
+)
+from .dialects.sglang_native import SglangNativeDialect
 from .ir import (
     ChatInput,
     ChatMessage,
@@ -123,6 +127,8 @@ class DialectSpec:
     #: ignore, on a model that lacks them. A binding with no model profile
     #: takes these as supported and leaves per-model limits to that error.
     provider_enforced_capabilities: frozenset[CapabilityKey] = frozenset()
+    #: Deterministic sampling is pinned at engine startup, not per request.
+    engine_level_seed: bool = False
 
     def __post_init__(self) -> None:
         if not self.dialect_id:
@@ -135,6 +141,13 @@ class DialectSpec:
             )
         if not isinstance(self.request_seed_support, RequestSeedSupport):
             raise TypeError("request_seed_support must be a RequestSeedSupport")
+        if not isinstance(self.engine_level_seed, bool):
+            raise TypeError("engine_level_seed must be a bool")
+        if (
+            self.engine_level_seed
+            and self.request_seed_support is not RequestSeedSupport.UNSUPPORTED
+        ):
+            raise ValueError("an engine-level seed implies no per-request seed")
         if not isinstance(self.provider_enforced_capabilities, frozenset):
             raise TypeError("provider_enforced_capabilities must be a frozenset")
         outcomes = normalize_dialect_capability_outcomes(
@@ -187,6 +200,7 @@ class DialectSpec:
             "connection_family": self.connection_family,
             "implementation_status": self.implementation_status.value,
             "request_seed_support": self.request_seed_support.value,
+            "engine_level_seed": self.engine_level_seed,
             "provider_enforced_capabilities": cast(
                 JSONValue, sorted(self.provider_enforced_capabilities)
             ),
@@ -315,6 +329,7 @@ def _spec(
     input_kinds: tuple[str, ...],
     input_modalities: tuple[str, ...],
     provider_enforced_capabilities: frozenset[CapabilityKey] = frozenset(),
+    engine_level_seed: bool = False,
 ) -> DialectSpec:
     status = (
         DialectImplementationStatus.ACTIVE
@@ -335,6 +350,7 @@ def _spec(
         input_kinds=input_kinds,
         input_modalities=input_modalities,
         provider_enforced_capabilities=provider_enforced_capabilities,
+        engine_level_seed=engine_level_seed,
     )
 
 
@@ -356,6 +372,10 @@ def _bind_anthropic_messages(connection: Any, requested_model_id: str) -> Dialec
 
 def _bind_google_genai(connection: Any, requested_model_id: str) -> Dialect:
     return GoogleGenAIDialect(connection, requested_model_id)
+
+
+def _bind_sglang_native(connection: Any, requested_model_id: str) -> Dialect:
+    return SglangNativeDialect(connection, requested_model_id)
 
 
 def _binder(
@@ -404,6 +424,13 @@ DIALECT_BINDERS: Mapping[str, DialectBinder] = MappingProxyType(
             cast(
                 Mapping[str, DialectCapabilityDecision],
                 GOOGLE_GENAI_CAPABILITY_DECISIONS,
+            ),
+        ),
+        "sglang_native": _binder(
+            _bind_sglang_native,
+            cast(
+                Mapping[str, DialectCapabilityDecision],
+                SGLANG_NATIVE_CAPABILITY_DECISIONS,
             ),
         ),
     }
@@ -467,7 +494,10 @@ DIALECT_SPECS: Mapping[str, DialectSpec] = MappingProxyType(
         "sglang_native": _spec(
             "sglang_native",
             "async_http_json",
-            request_seed_support=RequestSeedSupport.RESERVED,
+            decisions=_registered_decisions("sglang_native"),
+            # /generate has no per-request seed; a managed engine pins one.
+            request_seed_support=RequestSeedSupport.UNSUPPORTED,
+            engine_level_seed=True,
             input_kinds=("completion",),
             input_modalities=("text",),
         ),
@@ -482,12 +512,24 @@ DIALECT_SPECS: Mapping[str, DialectSpec] = MappingProxyType(
 )
 
 
+#: Retired dialect ids and the id that took over their wire protocol.
+_REPLACED_DIALECTS: Mapping[str, str] = MappingProxyType(
+    {"sglang_legacy": "sglang_native"}
+)
+
+
 def get_dialect_spec(dialect_id: str) -> DialectSpec:
     """Resolve one descriptor without falling back to a similar protocol."""
 
     try:
         return DIALECT_SPECS[dialect_id]
     except KeyError as exc:
+        replacement = _REPLACED_DIALECTS.get(dialect_id)
+        if replacement is not None:
+            raise UnknownDialect(
+                f"dialect {dialect_id!r} was replaced by {replacement!r}; "
+                f"set dialect: {replacement}"
+            ) from exc
         known = ", ".join(DIALECT_SPECS)
         raise UnknownDialect(
             f"unknown dialect {dialect_id!r}; expected one of: {known}"
@@ -586,11 +628,6 @@ def bind_dialect(
 
 
 def _not_implemented_message(dialect_id: str) -> str:
-    if dialect_id == "sglang_native":
-        return (
-            "dialect 'sglang_native' has no executable binder; use the explicit "
-            "'sglang_legacy' compatibility bypass"
-        )
     if dialect_id == "vllm_native":
         return "dialect 'vllm_native' is reserved and has no executable binder"
     return f"dialect {dialect_id!r} is reserved and has no executable binder"

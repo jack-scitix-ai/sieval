@@ -1,4 +1,5 @@
-"""Binding construction for the legacy ``ChatModel``/``GenModel`` constructors.
+"""Binding construction for the legacy ``ChatModel``/``GenModel``/``SglangGenModel``
+constructors.
 
 These wrappers accept a bare ``model=``/``api_base=`` pair and must still
 present a truthful :class:`RuntimeBindingPlan`, so this module fabricates one
@@ -25,7 +26,12 @@ from sieval.core.types import JSONValue
 
 from ._fingerprint import fingerprint_mapping
 from .capabilities import RequestDefaults, Supported
-from .connection_factory import DEFAULT_REQUEST_TIMEOUT, resolve_client_timeout
+from .connection_factory import (
+    CONNECTION_FACTORY_REGISTRY,
+    DEFAULT_REQUEST_TIMEOUT,
+    ConnectionRequest,
+    resolve_client_timeout,
+)
 from .deployment import (
     ConnectionIdentity,
     ConnectionPool,
@@ -41,6 +47,8 @@ from .request_log import RecordingOpenAIClient
 type _LegacyCredentialKind = Literal[
     "explicit-credential",
     "environment-credential",
+    # No key and no environment fallback: the family sends no credential.
+    "no-credential",
 ]
 
 
@@ -174,6 +182,7 @@ def _legacy_private_credential_kind(
     stable_credential_scopes = {
         "legacy-private:explicit-credential",
         "legacy-private:environment-credential",
+        "legacy-private:no-credential",
     }
     if quota_scope == "legacy-private":
         if credential_scope in stable_credential_scopes:
@@ -210,6 +219,8 @@ def _legacy_private_credential_kind(
         return "explicit-credential"
     if credential_kind == "environment-credential":
         return "environment-credential"
+    if credential_kind == "no-credential":
+        return "no-credential"
     raise ValueError(
         "legacy-private connection identity has an invalid credential category"
     )
@@ -417,7 +428,81 @@ def build_legacy_openai_binding(
         timeout=timeout,
         http_client=RecordingOpenAIClient(timeout=timeout),
     )
-    endpoint = str(client.base_url).rstrip("/")
+    return _private_binding(
+        dialect_id=dialect_id,
+        model=model,
+        connection=client,
+        endpoint=str(client.base_url).rstrip("/"),
+        credential_kind=(
+            "explicit-credential" if api_key is not None else "environment-credential"
+        ),
+        max_retries=max_retries,
+        concurrency_limit=concurrency_limit,
+        parent_limiter=parent_limiter,
+        engine=Engine("unknown"),
+    )
+
+
+def build_legacy_http_binding(
+    *,
+    dialect_id: str,
+    model: str,
+    api_base: str | None,
+    api_key: str | None,
+    max_retries: int,
+    concurrency_limit: int | None,
+    parent_limiter: anyio.CapacityLimiter | None,
+    engine: Engine,
+    client_timeout: httpx.Timeout | Mapping[str, float] | None = None,
+) -> _LegacyOpenAIBinding:
+    """The same boundary over ``async_http_json``, which reads no environment
+    fallback: ``api_base`` is required and a missing key sends none."""
+
+    if not isinstance(api_base, str) or not api_base.rstrip("/"):
+        raise ValueError(
+            f"Model '{model}': dialect {dialect_id!r} requires an explicit api_base"
+        )
+    endpoint = api_base.rstrip("/")
+    timeout = resolve_client_timeout(
+        client_timeout, default=DEFAULT_REQUEST_TIMEOUT, subject=f"Model '{model}'"
+    )
+    connection = CONNECTION_FACTORY_REGISTRY.create(
+        "async_http_json",
+        ConnectionRequest(
+            endpoint=endpoint,
+            credential=api_key,
+            max_retries=max_retries,
+            timeout=timeout,
+        ),
+    )
+    return _private_binding(
+        dialect_id=dialect_id,
+        model=model,
+        connection=connection,
+        endpoint=endpoint,
+        credential_kind="explicit-credential"
+        if api_key is not None
+        else "no-credential",
+        max_retries=max_retries,
+        concurrency_limit=concurrency_limit,
+        parent_limiter=parent_limiter,
+        engine=engine,
+    )
+
+
+def _private_binding(
+    *,
+    dialect_id: str,
+    model: str,
+    connection: object,
+    endpoint: str,
+    credential_kind: _LegacyCredentialKind,
+    max_retries: int,
+    concurrency_limit: int | None,
+    parent_limiter: anyio.CapacityLimiter | None,
+    engine: Engine,
+) -> _LegacyOpenAIBinding:
+    connection_family = get_dialect_spec(dialect_id).connection_family
     local_limiter = (
         anyio.CapacityLimiter(concurrency_limit)
         if concurrency_limit is not None
@@ -428,30 +513,28 @@ def build_legacy_openai_binding(
         shared_limiter = local_limiter
 
     private_scope = uuid4().hex
-    # Derived once for both the runtime identity and the stable provenance
-    # identity below, so the two cannot disagree.
-    credential_kind: _LegacyCredentialKind = (
-        "explicit-credential" if api_key is not None else "environment-credential"
-    )
     identity = ConnectionIdentity(
         endpoint=endpoint,
-        connection_family="openai_sdk",
+        connection_family=connection_family,
         credential_scope=f"legacy-private:{private_scope}:{credential_kind}",
-        retry_policy=f"openai-sdk:max-retries={max_retries}",
+        retry_policy=CONNECTION_FACTORY_REGISTRY.retry_policy(
+            connection_family, max_retries
+        ),
         quota_scope=f"legacy-private:{private_scope}",
     )
+    known_engine = engine.engine_id != "unknown"
     deployment = Deployment(
         deployment_id=None,
         plan=None,
-        engine=Engine("unknown"),
-        engine_source="unknown",
+        engine=engine,
+        engine_source="config" if known_engine else "unknown",
         api_base=endpoint,
         endpoints={},
         topology=None,
         metrics_url=None,
         facts=ServingFacts(),
     )
-    pool = ConnectionPool(client, identity, shared_limiter)
+    pool = ConnectionPool(connection, identity, shared_limiter)
     runtime_plan = _legacy_runtime_plan(
         dialect_id=dialect_id,
         requested_model_id=model,
