@@ -945,13 +945,13 @@ class TestFinalWireEvidence:
     async def test_execute_checks_the_serialized_body_not_only_the_prepared_one(
         self, monkeypatch: pytest.MonkeyPatch, final_body: object, message: str
     ) -> None:
-        real = google_interactions._strict_json_loads
+        real = google_interactions.strict_json_loads
 
         def serialized(payload: str, path: str) -> object:
             value = real(payload, path)
             return final_body if path == "final Interactions request body" else value
 
-        monkeypatch.setattr(google_interactions, "_strict_json_loads", serialized)
+        monkeypatch.setattr(google_interactions, "strict_json_loads", serialized)
         with pytest.raises(DialectError, match=message):
             await _run(_no_io)
 

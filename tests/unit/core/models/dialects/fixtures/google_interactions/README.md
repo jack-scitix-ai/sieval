@@ -1,56 +1,24 @@
 # Google Interactions response fixtures
 
-Formatting must not change SSE event separators, including the final blank
-lines in the live captures. Only `end-of-file-fixer` excludes `.sse` files in
-this directory; all other hook selection remains unchanged.
+`end-of-file-fixer` skips the `.sse` files here: their final blank lines are
+SSE frame separators.
 
-`stream_thought_summary_completed.sse` and
-`stream_thought_summary_incomplete.sse` come from successful live requests on
-October 27, 2026, to `POST /v1beta/interactions`, using `gemini-3.6-flash`,
-`stream: true`, `store: false`, and `thinking_summaries: auto`. The incomplete
-and completed cases used output budgets of 1024 and 2048 respectively.
+Live captures, from `gemini-3.6-flash` on `POST /v1beta/interactions` with
+`store: false` and `thinking_summaries: auto`, October 27–28, 2026:
 
-Only thought signatures are replaced with `sig-redacted`; the generated text,
-including all spaces and newlines, is preserved. The two streaming captures
-contain no request headers, API keys, or stored interaction IDs. Both terminal
-events omit `steps`.
+- `stream_thought_summary_completed.sse`, `stream_thought_summary_incomplete.sse`:
+  two thought-summary items each, text and whitespace verbatim (budgets 2048
+  and 1024). `ReasoningOutput.text` concatenates them without separators, as
+  Google's [streaming example](https://ai.google.dev/gemini-api/docs/streaming#streaming-with-thinking)
+  prints them.
+- `stream_signature_only_completed.sse`, `stream_multiple_functions_signature_only.sse`,
+  `stream_url_context_signature_only.sse`, `stream_google_search_signature_only.sse`:
+  a thought signature with no summary delta, which `summary: auto` allows.
+- `function_choice_none_provider_violation.json`: after an error function
+  result, the provider emitted a call despite `tool_choice: none`; the dialect
+  must reject it.
 
-Each capture has two thought-summary Content items. Their text already ends
-with three newlines. The scalar reasoning projection concatenates that text
-without adding separators, matching the official streaming example's
-`print(event.delta.content.text, end="")` behavior:
-<https://ai.google.dev/gemini-api/docs/streaming#streaming-with-thinking>.
-The items themselves remain distinct, as the OpenAPI description specifies:
-<https://ai.google.dev/static/api/interactions.openapi.json>.
-
-Tests that derive a non-streaming response or a terminal `steps` snapshot from
-these items are synthetic compatibility tests, not additional live captures.
-
-Four additional streaming fixtures were captured from HTTP 200 responses on
-October 28, 2026, against the same model and endpoint, with `store: false` and
-`thinking_summaries: auto`:
-
-- `stream_signature_only_completed.sse`: completed text with a thought
-  signature but no thought-summary delta.
-- `stream_multiple_functions_signature_only.sse`: two function calls and
-  `requires_action`, with a thought signature but no summary delta.
-- `stream_url_context_signature_only.sse`: URL-context call/result and citations,
-  followed by a signed thought without a summary delta.
-- `stream_google_search_signature_only.sse`: Google Search call/result and
-  citation deltas, followed by a signed thought without a summary delta.
-
-These replies exposed an overly strict requested-summary presence check, which
-the capture-based regression tests now prevent. Optional summary omission does
-not waive validation of provided content or reconciliation with terminal steps.
-The JSON event frames are reserialized; their text and whitespace are unchanged.
-Signatures and call identifiers are replaced with consistent placeholders. These
-four fixtures contain no request headers, API keys or real interaction IDs.
-
-`function_choice_none_provider_violation.json` records another HTTP 200 response
-from October 28, 2026. After an error function result, the provider emitted a new
-`get_code` call despite the request's `tool_choice: none`. This is a negative
-response-contract fixture: SiEval must reject the disallowed call rather than
-silently executing it. Its signature and call identifier are also placeholders.
-
-The final live capability matrix, accounting examples and validation limits are
-recorded in [live_validation.md](live_validation.md).
+All live terminal events omit `steps`. Signatures and call IDs are placeholders,
+and no capture contains request headers, keys or real interaction IDs. The other
+fixtures, and tests that derive a terminal `steps` snapshot from these, are
+synthetic.

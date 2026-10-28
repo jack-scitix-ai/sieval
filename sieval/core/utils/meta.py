@@ -34,9 +34,7 @@ _GOOGLE_POLICY_FINISH_REASONS = frozenset(
 #: Finish reasons for output interrupted by a limit, filter, or refusal. Every
 #: provider spelling is listed because the IR does not normalize them. Shared by
 #: the anomaly rule and the report key so the two cannot drift. ``incomplete`` is
-#: the Gemini Interactions status for a reply that finished with partial results
-#: (e.g. hitting ``max_output_tokens``); no other dialect surfaces that bare word
-#: as a finish reason, since Responses reports ``incomplete_details.reason``.
+#: Gemini Interactions' terminal status (Responses records its reason instead).
 _TRUNCATION_FINISH_REASONS = (
     frozenset(
         {

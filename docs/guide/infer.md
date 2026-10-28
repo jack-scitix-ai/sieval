@@ -465,138 +465,67 @@ Accounting:
 
 ### Google Interactions
 
-To call the native Gemini Interactions REST API (`POST /v1beta/interactions`),
-select the `google_interactions` dialect. Endpoint and key are the same as for
-`google_genai`:
+`dialect: google_interactions` calls the native Gemini Interactions REST API
+(`POST /v1beta/interactions`). Endpoint, key header (`x-goog-api-key`) and
+version selection (an endpoint root is `v1beta`; a trailing `/v1` or `/v1beta`
+picks that version; gateway prefixes are kept) match `google_genai`:
 
 ```yaml
 models:
   gemini:
-    name: gemini-3.8-flash
+    name: gemini-3.6-flash
     type: chat
     dialect: google_interactions
     api_base: https://generativelanguage.googleapis.com
     api_key_env: GEMINI_API_KEY
 ```
 
-An endpoint root uses `v1beta`; an explicit `/v1` or `/v1beta` suffix selects
-that version, and gateway path prefixes are preserved. The key is sent only in
-the `x-goog-api-key` header (see [Credentials](configuration.md#credentials)).
-`client_timeout` configures the shared HTTP client, not the request body. The
-dialect is bound to a model: Interactions agents (`agent`, `agent_config`) are
-not supported.
-
-Supported: text and image input (inline base64 or `uri`), system, user and
-assistant turns, function tools with `tool_choice`, replaying a
-`function_call`/`function_result` exchange as input, the `google_search` and
+Supported: text and image input, system/user/assistant turns, function tools
+with `tool_choice` (`required` is the wire's `any`) and replayed
+`function_call`/`function_result` exchanges, the `google_search` and
 `url_context` hosted tools, JSON-schema structured output, streaming,
-`max_tokens`, `stop`, `seed`, and thinking controls (`effort` and `summary`).
-`temperature` and
-`top_p` are forwarded and recorded on every model without a model-family
-restriction. They are deprecated in the Interactions schema; omit them to
-follow Google's sampling guidance. A successful request records what was
-sent, not a guarantee that the model used every control.
-Ordinary YAML bindings do not yet supply Google
-model-profile outcomes, so a capability that needs one (reasoning, tools,
-structured output, images, opaque continuation) fails reconciliation with
-`model_outcome_missing`; plain text generation, streaming and `dialect_options`
-work today. The `google_genai` provider-enforced capability evidence does not
-apply automatically to Interactions, so YAML reasoning remains guarded until
-this endpoint has its own evidence. HTTP failures include Google's bounded
-`error.message` in the exception and the failed sample's `error_msg`.
+`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, and `reasoning.effort` /
+`reasoning.summary`. Each `function_result` carries the name of its matching
+call, which the live backend requires.
 
-Not supported, and rejected before any network I/O: stateful sessions
-(`previous_response_id`),
-logprobs, input scoring, `n > 1`, `top_k`, penalties, `developer` messages, assistant
-prefill, per-image `detail`, more than one system message, `tools.parallel`,
-and a tool message that carries more than one `ToolResultPart` (the IR has no
-way to group several results into one step). `reasoning.budget_tokens` has no
-equivalent field here; use `effort`. Unlike GenerateContent, the Interactions
-`generation_config` schema has no `top_k` field, so it is rejected for every
-model and alias. Structured output accepts only
-`format: json_schema`; `name` and `strict` have no Interactions field.
+Through a YAML config only plain text, streaming and `dialect_options` work
+today: reasoning, tools, structured output, images and opaque continuation
+need a Google model-profile outcome, which ordinary bindings do not supply, so
+they fail reconciliation with `model_outcome_missing`.
 
-Function tools are declared flat (`{type: function, name, description,
-parameters}`); OpenAI-shaped declarations are normalized. `tool_choice` lowers
-to `generation_config.tool_choice`, where the IR's `required` is the wire's
-`any`. `google_search` accepts only `search_types` (`web_search`,
-`image_search`, `enterprise_web_search`) and `url_context` accepts no config.
-`url_citation` annotations become citations; other annotation kinds fail
-loudly rather than being dropped.
+Rejected before any network I/O: `previous_response_id`, logprobs, input
+scoring, `n > 1`, `top_k`, penalties, `reasoning.budget_tokens` (use
+`effort`), `developer` messages, assistant prefill, more than one system
+message, per-image `detail`, `tools.parallel`, structured output `name` /
+`strict`, a tool message with more than one `ToolResultPart`, `agent` /
+`agent_config`, `background`, a `service_tier` other than `standard` or
+`priority` (others can return a queued interaction), and `dialect_options`
+that set an IR-owned body key.
 
-Each `function_result` includes the function name inferred from its matching
-earlier call, including calls in opaque history. The live-tested Gemini backend
-requires this name even though the OpenAPI marks it optional; the request audit
-verifies it rather than accepting a caller-supplied override.
-
-SiEval **always sends `store: false`** to disable Interactions storage of
-evaluation prompts. The request audit pins this value; `store: true`, non-boolean
-values and `null` are rejected, not treated as opt-ins. Multi-turn conversations
-must be stateless: resend the full history, including each tool call before its
-result. `previous_response_id` is unavailable, and response IDs are never exposed
-as reusable `session_id` values. This is an Interactions storage control, not a
-claim about Google's other data-retention policies.
-`background`, `service_tier` values other than `standard` and `priority` (they
-can return a queued interaction), and the reserved body keys (`model`, `input`,
-`system_instruction`, `generation_config`, `tools`, `response_format`, `stream`,
-`previous_interaction_id`, ...) are rejected; there is no HTTP-header
-passthrough.
+**SiEval always sends `store: false`**, so Interactions does not store
+evaluation prompts; any other `store` value is rejected. Multi-turn calls are
+stateless: resend the full history, or pass the previous reply's
+`ReasoningOutput.opaque_roundtrip` as `session.opaque_continuation` and send
+only the new turn. The continuation carries the native steps, thought
+signatures and system instruction; a conflicting system message or a tool
+result without its call is rejected. No `session_id` is returned.
 
 Accounting:
 
-- `request_params` use the shared HTTP envelope marker. Request identities
-  exclude routing paths and gateway prefixes and include the body's `stream`
-  flag, so endpoint moves preserve the digest while streaming changes it.
-- An Interaction reports one terminal `status`, recorded verbatim as the finish
-  reason. `incomplete` counts toward `n_truncated`; any returned steps are
-  preserved, and a reply without steps produces empty text. The status alone
-  does not distinguish a token limit from output filtering.
-  `requires_action` is terminal only when function tools were declared; it means
-  the model is waiting for a `function_result`, and the call is in `tool_calls`.
-  Any other non-terminal status (`failed`, `budget_exceeded`, `queued`, ...) is
+- The terminal `status` is the finish reason. `incomplete` keeps any partial
+  output and counts toward `n_truncated`, but does not tell a token limit from
+  filtering. `requires_action` is valid only when function tools were
+  declared; every other status (`failed`, `budget_exceeded`, `queued`, …) is
   an error.
-- A reply with no `steps` is valid: a `stop` sequence that fires first returns
-  `completed` with empty text.
-- Streaming sends `interaction.created`, one `step.start` / `step.delta` /
-  `step.stop` run per step, then `interaction.completed` and `data: [DONE]`.
-  Steps are reassembled by index; text deltas concatenate and partial function
-  `arguments` are accumulated as JSON text and decoded at `step.stop`. An
-  unfinished step, a step after `interaction.completed`, an `error` event, or
-  an event after `[DONE]` all fail the call.
+- The request identity includes the body's `stream` flag but not the route or
+  gateway prefix.
 - `input_tokens` is `total_input_tokens + total_tool_use_tokens` and
   `output_tokens` is `total_output_tokens + total_thought_tokens`, so
-  `reasoning_tokens` stays a breakdown of `output_tokens`. Interactions report
-  `total_output_tokens` without thoughts, and it can read 0 for a reply that
-  did produce text, so token counts are observations, not a check on the text.
-- When terminal `usage` is absent, streaming uses the latest cumulative
-  `step.delta.metadata.total_usage` or `step.stop.usage`. These snapshots replace
-  earlier observations; they are not summed, and `step_usage` is not a cumulative
-  fallback. Delta metadata and its counters are validated when received, so
-  malformed values cannot be hidden by later valid usage. Missing counters use
-  the shared defaults; provided counters must be non-negative integers, not
-  booleans or `null`.
-- `reasoning.summary: auto` requests thought summaries. Any returned summaries
-  are preserved even when not requested. `auto` does not guarantee a visible
-  summary: a signed thought without summary Content is valid, with
-  `ReasoningOutput.text` left unset and its opaque continuation preserved.
-  Thought summaries arrive as one or more
-  Content items; `ReasoningOutput.text` concatenates their text verbatim, without
-  adding separators or normalizing provider-supplied whitespace.
-  A terminal snapshot with `steps` is used as the complete reply only when no
-  streamed steps were assembled. When streamed steps exist, any terminal snapshot
-  must agree on summaries and thought presence; conflicting evidence, including
-  snapshot-only summaries or thought presence, fails the call rather than
-  supplementing the streamed output. Contradictory signatures also fail the call.
-- Opaque continuation supports stateless multi-turn calls without enabling
-  provider storage. When a reply contains thought blocks or signatures, its
-  `ReasoningOutput.opaque_roundtrip` preserves the input and generated native
-  steps, including thought-summary Content item boundaries and hosted-tool
-  signatures. Pass it as `session.opaque_continuation` with dialect ID
-  `google_interactions`, and supply only the new turn in `input`. Subsequent
-  replies extend the history even when they contain no new thought signature.
-  The previous system instruction is preserved; a conflicting current system
-  message, malformed history, or a tool result without a matching earlier call
-  is rejected before I/O. `store` remains `false` and no session ID is returned.
+  `reasoning_tokens` stays a breakdown of `output_tokens`. Without terminal
+  `usage`, a stream uses its latest cumulative usage snapshot.
+- Thought summaries are concatenated verbatim into `ReasoningOutput.text`.
+  `summary: auto` does not guarantee one: a signed thought without a summary
+  leaves `text` unset and keeps the continuation.
 
 ## Environment Variables
 

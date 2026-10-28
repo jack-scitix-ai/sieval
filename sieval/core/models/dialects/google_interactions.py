@@ -6,10 +6,7 @@ only where the shared IR has a lossless Interactions representation; every
 other active leaf is rejected before network I/O, and ambiguous replies fail
 loudly instead of being reinterpreted.
 
-An Interaction reports one terminal ``status`` instead of per-candidate finish
-reasons, so ``status`` is recorded verbatim as the finish reason. Streaming
-terminal events may omit ``steps``, including for completed replies.
-Visible reasoning preserves provider text verbatim, including its separators.
+The terminal ``status`` is recorded verbatim as the finish reason.
 
 AI-Generated Code - Claude Sonnet 5.5 (Anthropic)
 """
@@ -80,6 +77,11 @@ from sieval.core.types import JSONValue
 
 from ._google_genai_wire import validate_function_parameters
 from ._google_interactions_wire import resolve_interactions_endpoint
+from ._google_json import (
+    reject_duplicate_keys,
+    reject_json_constant,
+    strict_json_loads,
+)
 from ._http_status import raise_for_provider_status
 
 _THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
@@ -332,35 +334,6 @@ class _LegacyPlan:
     required_output_channels: frozenset[str] = frozenset()
 
 
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-finite JSON constant {value!r}")
-
-
-def _reject_duplicate_keys(
-    pairs: list[tuple[str, JSONValue]],
-) -> dict[str, JSONValue]:
-    result: dict[str, JSONValue] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key {key!r}")
-        result[key] = value
-    return result
-
-
-def _strict_json_loads(payload: str, path: str) -> JSONValue:
-    try:
-        return cast(
-            JSONValue,
-            json.loads(
-                payload,
-                object_pairs_hook=_reject_duplicate_keys,
-                parse_constant=_reject_json_constant,
-            ),
-        )
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        raise OutputContractError(f"{path} is not strict JSON") from exc
-
-
 def _nested(raw: object, *keys: str) -> object:
     current = raw
     for key in keys:
@@ -404,9 +377,9 @@ def _count(
 def _usage(raw: object) -> UsageStats | None:
     """Lift Interactions' counts onto the shared accounting.
 
-    ``total_output_tokens`` excludes thoughts (the recorded totals decompose as
-    input + output + thought), so thoughts fold into ``output_tokens`` to keep
-    ``reasoning_tokens`` a breakdown of its parent, matching ``google_genai``.
+    ``total_output_tokens`` excludes thoughts, so they fold into
+    ``output_tokens`` to keep ``reasoning_tokens`` a breakdown of it, as in
+    ``google_genai``.
     """
 
     if raw is None:
@@ -615,12 +588,7 @@ def _tool_result_annotation_error(item: Mapping[str, object], path: str) -> str 
 
 
 def _tool_result_content_error(item: Mapping[str, object], path: str) -> str | None:
-    """Why one array entry cannot be a ``function_result`` content block.
-
-    The array form is validated field by field, not just by which keys are
-    present: a wrong ``annotations`` shape or an unknown ``resolution`` would
-    otherwise leave the process as a body the provider rejects.
-    """
+    """Why one array entry cannot be a ``function_result`` content block."""
 
     kind = item.get("type")
     if kind == "text":
@@ -667,9 +635,7 @@ def _tool_result_error(result: JSONValue) -> str | None:
     """Why ``result`` cannot be a ``function_result.result``, if it cannot.
 
     The wire accepts a string, an object, or an array of text/image content
-    blocks.  A bare number, boolean, ``null`` or any other array has no
-    faithful encoding there, and silently stringifying it would change what the
-    model sees, so those are refused instead.
+    blocks; anything else is refused rather than stringified.
     """
 
     if isinstance(result, str | dict):
@@ -781,7 +747,7 @@ def _opaque_step_error(step: Mapping[str, JSONValue], path: str) -> str | None:
 
 def _decode_opaque(value: str) -> tuple[str | None, tuple[JSONValue, ...]]:
     try:
-        raw = _strict_json_loads(value, "opaque continuation JSON")
+        raw = strict_json_loads(value, "opaque continuation JSON")
     except OutputContractError as exc:
         raise DialectError(str(exc)) from exc
     if (
@@ -1776,7 +1742,7 @@ class GoogleInteractionsDialect:
             json=prepared.thaw_body(),
         )
         route.verify_http(request, self._endpoint_root)
-        actual_body = _strict_json_loads(
+        actual_body = strict_json_loads(
             request.content.decode("utf-8"), "final Interactions request body"
         )
         if not isinstance(actual_body, dict):
@@ -1815,7 +1781,7 @@ class GoogleInteractionsDialect:
         if not stream:
             response = await self._connection.client.send(request)
             raise_for_provider_status(response, "Google")
-            payload = _strict_json_loads(response.text, "Interactions response body")
+            payload = strict_json_loads(response.text, "Interactions response body")
             return self._lift(payload, execution)
         response = await self._connection.client.send(request, stream=True)
         try:
@@ -1951,9 +1917,7 @@ def _content_text(item: Mapping[str, object], path: str) -> str:
 class _HostedResult:
     """A hosted tool's result, kept with the evidence the wire gave for it.
 
-    The wire reports a step-level boolean, not an error code; ``failed`` is
-    what carries it, because ``ServerToolUse.result`` alone would make a failed
-    lookup and a successful empty one persist as identical bytes.
+    ``failed`` keeps a failed lookup distinct from a successful empty one.
     """
 
     kind: str
@@ -2018,8 +1982,7 @@ def _projection_mismatch(left: "_LiftState", right: "_LiftState") -> str | None:
 class _LiftState:
     """Accumulate steps from one non-streamed reply or one streamed event run.
 
-    Both transports end in the same records, so the two lifting paths cannot
-    drift; only the final ``status`` means of ``usage`` differ.
+    Both transports share it, so the two lifting paths cannot drift.
     """
 
     request: Request
@@ -2045,8 +2008,8 @@ class _LiftState:
             try:
                 decoded = json.loads(
                     raw,
-                    object_pairs_hook=_reject_duplicate_keys,
-                    parse_constant=_reject_json_constant,
+                    object_pairs_hook=reject_duplicate_keys,
+                    parse_constant=reject_json_constant,
                 )
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
                 raise OutputContractError(
@@ -2294,8 +2257,8 @@ def _structured_output(req: Request, status: str, text: str) -> StructuredOutput
     try:
         value = json.loads(
             text,
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_json_constant,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_json_constant,
         )
         return StructuredOutput(cast(JSONValue, value))
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -2305,7 +2268,7 @@ def _structured_output(req: Request, status: str, text: str) -> StructuredOutput
 
 
 def _stream_event(payload: str) -> dict[str, object]:
-    raw = _strict_json_loads(payload, "Interactions stream event")
+    raw = strict_json_loads(payload, "Interactions stream event")
     return dict(_mapping(raw, "Interactions stream event"))
 
 
@@ -2431,8 +2394,6 @@ class _StreamState:
             cast(list[object], summary).append(dict(content))
             return
         if kind in _WHOLE_VALUE_DELTAS:
-            # These deltas carry complete values (a search result, a function
-            # result), so they fill in what ``step.start`` left empty.
             allowed = _WHOLE_VALUE_DELTAS[kind]
             extra = set(delta) - allowed - {"type"}
             if extra:
@@ -2474,9 +2435,7 @@ def _stream_index(event: Mapping[str, object]) -> int:
 async def _read_stream(response: httpx.Response) -> list[dict[str, object]]:
     """Parse SSE frames up to and including ``[DONE]``.
 
-    Google sends ``event:`` and ``data:`` lines and no ``id:`` line in practice,
-    although the specification lists an ``event_id`` field, so it is tolerated
-    and never required.
+    ``id`` and ``event_id`` lines are tolerated, never required.
     """
 
     events: list[dict[str, object]] = []
@@ -2527,10 +2486,8 @@ def _reconcile_terminal_steps(
     """Use the terminal snapshot when it is the only evidence, and check it
     against the deltas otherwise.
 
-    ``steps`` is optional on the terminal event ("when included in this
-    event"), so a run without deltas must still produce the reply from it.  A
-    snapshot that disagrees with what the deltas built is a contradiction the
-    caller cannot resolve, so it fails rather than picking a side.
+    ``steps`` is optional on the terminal event; a snapshot that disagrees
+    with the deltas fails rather than picking a side.
     """
 
     raw = terminal.get("steps")
