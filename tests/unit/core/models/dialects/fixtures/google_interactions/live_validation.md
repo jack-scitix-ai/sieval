@@ -71,10 +71,16 @@ are preserved as breakdowns, not added again.
 
 ## Local automated verification
 
-- Unit + integration: **10563 passed, 29 skipped** in the verification environment.
-- Interactions unit + resume integration: **799 passed**, dialect coverage **97%**.
+### After rebase onto `upstream/main` at `d1373e3`
+
+- Unit + integration: **10897 passed, 29 skipped** in the verification environment.
 - Repository Ruff lint and formatting, scoped type checks, and diff checks pass.
 - Quick preflight: **26 PASS, 1 SKIP**; the skip is deep HTTP link reachability.
 
-This record is not a claim of a completed rebase, clean-install gate, global
-coverage gate, mutation score or hosted CI result.
+The live captures predate the rebase. The dialect source and captured JSON/SSE
+bytes were preserved, and the rebased full suite includes the Interactions unit
+and resume integration tests. No additional live API requests were made for the
+post-rebase verification.
+
+This record does not claim a clean-install gate, global coverage gate, mutation
+score or hosted CI result.

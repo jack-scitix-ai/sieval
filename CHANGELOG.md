@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Shared request-definition normalization recognizes HTTP-envelope `body.stream`
+  when it is Boolean `true`, keeping Google Interactions streaming and
+  non-streaming request digests distinct. Existing GenerateContent path/query
+  stream detection is preserved.
 - Google Interactions derives each function result's name from its matching call,
   including opaque history, and advertises function calling, hosted tools and
   structured output in its legacy dialect capability view without bypassing
