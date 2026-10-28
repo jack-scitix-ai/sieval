@@ -257,6 +257,22 @@ task scores input: SGLang's `/v1/completions` cannot. `/generate` has no
 per-request `seed`, so an explicit one is refused; a managed engine pins
 `--random-seed` instead.
 
+A vLLM `gen` model keeps `openai_completions` unless it sets `dialect:
+vllm_native`, which posts to the same `/v1/completions` with vLLM's own
+fields (measured on 0.26.0):
+
+| Need | `openai_completions` | `vllm_native` |
+| --- | --- | --- |
+| Input scoring | `echo`, split at `usage.prompt_tokens` | `prompt_logprobs`, checked against `prompt_token_ids` |
+| `texts` of a scoring call | prompt + generation | generation only |
+| Token ids | none | input and sampled (`return_token_ids`) |
+| Structured output | refused | `structured_outputs` |
+| Unknown options | `extra_body` | refused, except `min_p`, `repetition_penalty`, `stop_token_ids` |
+
+It sends one non-streaming POST and offers no reasoning or tool parsers
+(they act on chat requests). `suffix` and `max_tokens: 0` are refused before
+I/O. Input top-k needs `--max-logprobs` at least the breadth.
+
 ### Model lifecycles
 
 A model `sieval run` launches may bound its engine by stage barriers
