@@ -2563,6 +2563,20 @@ class TestStreaming:
         assert result.reasoning[0] is not None
         assert result.reasoning[0].text == "part onepart two"
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "stream_thought_summary_completed",
+            "stream_thought_summary_incomplete",
+            "stream_signature_only_completed",
+            "stream_multiple_functions_signature_only",
+            "stream_url_context_signature_only",
+            "stream_google_search_signature_only",
+        ],
+    )
+    def test_live_sse_capture_preserves_final_frame_separator(self, name: str) -> None:
+        assert (FIXTURES / f"{name}.sse").read_bytes().endswith(b"\n\n")
+
     @pytest.mark.anyio
     @pytest.mark.parametrize(
         ("name", "hosted_kind", "function_count", "status"),

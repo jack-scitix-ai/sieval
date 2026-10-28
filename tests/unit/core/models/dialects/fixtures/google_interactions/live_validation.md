@@ -73,8 +73,10 @@ are preserved as breakdowns, not added again.
 
 ### After rebase onto `upstream/main` at `d1373e3`
 
-- Unit + integration: **10897 passed, 29 skipped** in the verification environment.
+- Unit + integration: **10903 passed, 29 skipped** in the verification environment.
 - Repository Ruff lint and formatting, scoped type checks, and diff checks pass.
+- CI-equivalent pre-commit checks: all hooks pass. Six live-SSE frame-boundary
+  regressions pass, and captured SSE bytes remain unchanged.
 - Quick preflight: **26 PASS, 1 SKIP**; the skip is deep HTTP link reachability.
 
 The live captures predate the rebase. The dialect source and captured JSON/SSE

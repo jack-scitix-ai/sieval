@@ -1,5 +1,9 @@
 # Google Interactions response fixtures
 
+Formatting must not change SSE event separators, including the final blank
+lines in the live captures. Only `end-of-file-fixer` excludes `.sse` files in
+this directory; all other hook selection remains unchanged.
+
 `stream_thought_summary_completed.sse` and
 `stream_thought_summary_incomplete.sse` come from successful live requests on
 October 27, 2026, to `POST /v1beta/interactions`, using `gemini-3.6-flash`,
