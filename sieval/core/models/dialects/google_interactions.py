@@ -83,6 +83,7 @@ from ._google_interactions_wire import resolve_interactions_endpoint
 from ._http_status import raise_for_provider_status
 
 _THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
+_OPAQUE_VERSION = 1
 _SUMMARY_MODES = frozenset({"none", "auto"})
 #: ``flex`` and ``deferred`` may answer with a ``queued`` interaction, which a
 #: synchronous call cannot wait out.
@@ -137,9 +138,6 @@ _REJECTED_PATHS = MappingProxyType(
         "structured_output.name": "Interactions response schemas have no name field",
         "structured_output.strict": (
             "Interactions response schemas have no strict switch"
-        ),
-        "session.opaque_continuation": (
-            "google_interactions does not support opaque continuation"
         ),
         "input.modality.image.detail": "Interactions images have no per-image detail",
     }
@@ -245,8 +243,12 @@ def _decisions() -> Mapping[CapabilityKey, DialectCapabilityDecision]:
             "Interactions evaluation is stateless: "
             "store=false prevents prompt retention"
         ),
-        "opaque_continuation": Unsupported(
-            "google_interactions does not support opaque continuation"
+        "opaque_continuation": Supported(
+            DialectCapabilityBinding(
+                "opaque_continuation",
+                request_leaves=("session.opaque_continuation",),
+                response_channels=("reasoning",),
+            )
         ),
         "multimodal_input": Supported(
             DialectCapabilityBinding(
@@ -312,6 +314,8 @@ class _ExecutionContext:
     declared_functions: frozenset[str] = frozenset()
     hosted_kinds: frozenset[str] = frozenset()
     tool_choice: JSONValue = None
+    input_steps: tuple[JSONValue, ...] = ()
+    system_instruction: str | None = None
 
 
 @dataclass(frozen=True)
@@ -389,9 +393,9 @@ def _optional_string(raw: object, path: str) -> str | None:
 def _count(
     usage: Mapping[str, object], name: str, *, default: int | None
 ) -> int | None:
-    value = usage.get(name)
-    if value is None:
+    if name not in usage:
         return default
+    value = usage[name]
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise OutputContractError(f"usage.{name} must be a non-negative integer")
     return value
@@ -699,14 +703,191 @@ def _function_result_step(part: ToolResultPart) -> dict[str, JSONValue]:
     return step
 
 
-def _orphan_result_error(chat: ChatInput) -> str | None:
-    """A tool result must answer a call made earlier in the same input."""
+_OPAQUE_STEP_KEYS = {
+    "user_input": frozenset({"type", "content"}),
+    "model_output": frozenset({"type", "content", "error"}),
+    "thought": frozenset({"type", "signature", "summary"}),
+    "function_call": frozenset({"type", "id", "name", "arguments", "signature"}),
+    "function_result": frozenset(
+        {"type", "call_id", "name", "result", "is_error", "signature"}
+    ),
+    "google_search_call": frozenset(
+        {"type", "id", "arguments", "search_type", "signature"}
+    ),
+    "google_search_result": frozenset(
+        {"type", "call_id", "result", "is_error", "signature"}
+    ),
+    "url_context_call": frozenset({"type", "id", "arguments", "signature"}),
+    "url_context_result": frozenset(
+        {"type", "call_id", "result", "is_error", "signature"}
+    ),
+}
+
+
+def _opaque_step_error(step: Mapping[str, JSONValue], path: str) -> str | None:
+    kind = step.get("type")
+    if not isinstance(kind, str) or kind not in _OPAQUE_STEP_KEYS:
+        return f"{path}.type is unsupported"
+    if set(step) - _OPAQUE_STEP_KEYS[kind]:
+        return f"{path} has unsupported fields"
+    if "signature" in step and not isinstance(step["signature"], str):
+        return f"{path}.signature must be a string"
+    if kind in {"user_input", "model_output", "thought"}:
+        if step.get("error") is not None:
+            return f"{path} carries an error"
+        field_name = "summary" if kind == "thought" else "content"
+        if field_name not in step:
+            return None
+        content = step[field_name]
+        if not isinstance(content, list):
+            return f"{path}.{field_name} must be an array"
+        for index, item in enumerate(content):
+            item_path = f"{path}.{field_name}[{index}]"
+            if not isinstance(item, dict):
+                return f"{item_path} must be an object"
+            if kind == "thought" and item.get("type") != "text":
+                return f"{item_path} must be text"
+            if error := _tool_result_content_error(item, item_path):
+                return error
+        return None
+    identifier = "id" if kind.endswith("_call") else "call_id"
+    if not isinstance(step.get(identifier), str) or not step[identifier]:
+        return f"{path}.{identifier} must be a non-empty string"
+    if (kind == "function_call" or "name" in step) and (
+        not isinstance(step.get("name"), str) or not step["name"]
+    ):
+        return f"{path}.name must be a non-empty string"
+    if kind.endswith("_call"):
+        if not isinstance(step.get("arguments"), dict):
+            return f"{path}.arguments must be an object"
+        if "search_type" in step and step["search_type"] not in (
+            "web_search",
+            "image_search",
+            "enterprise_web_search",
+        ):
+            return f"{path}.search_type is unsupported"
+    else:
+        if "result" not in step:
+            return f"{path}.result is required"
+        if "is_error" in step and not isinstance(step["is_error"], bool):
+            return f"{path}.is_error must be a boolean"
+        if kind == "function_result":
+            if error := _tool_result_error(step["result"]):
+                return f"{path}: {error}"
+        elif not step.get("is_error", False) and not isinstance(step["result"], list):
+            return f"{path}.result must be an array"
+    return None
+
+
+def _decode_opaque(value: str) -> tuple[str | None, tuple[JSONValue, ...]]:
+    try:
+        raw = _strict_json_loads(value, "opaque continuation JSON")
+    except OutputContractError as exc:
+        raise DialectError(str(exc)) from exc
+    if (
+        not isinstance(raw, dict)
+        or not {"version", "steps"}.issubset(raw)
+        or set(raw) - {"version", "steps", "system_instruction"}
+    ):
+        raise DialectError("invalid Interactions opaque continuation envelope")
+    if type(raw["version"]) is not int or raw["version"] != _OPAQUE_VERSION:
+        raise DialectError("unsupported Interactions opaque continuation version")
+    system = raw.get("system_instruction")
+    if "system_instruction" in raw and not isinstance(system, str):
+        raise DialectError("opaque system_instruction must be a string")
+    steps = raw["steps"]
+    if not isinstance(steps, list):
+        raise DialectError("opaque steps must be an array")
+    calls: dict[str, str] = {}
+    call_names: dict[str, str] = {}
+    answered: set[str] = set()
+    for index, step in enumerate(steps):
+        path = f"opaque.steps[{index}]"
+        if not isinstance(step, dict):
+            raise DialectError(f"{path} must be an object")
+        if error := _opaque_step_error(step, path):
+            raise DialectError(error)
+        kind = cast(str, step["type"])
+        if kind.endswith("_call"):
+            call_id = cast(str, step["id"])
+            if call_id in calls:
+                raise DialectError(f"{path} repeats opaque call id {call_id!r}")
+            calls[call_id] = kind
+            if kind == "function_call":
+                call_names[call_id] = cast(str, step["name"])
+        elif kind.endswith("_result"):
+            call_id = cast(str, step["call_id"])
+            if calls.get(call_id) != kind.removesuffix("_result") + "_call":
+                raise DialectError(f"{path} answers no matching earlier opaque call")
+            if call_id in answered:
+                raise DialectError(f"{path} answers an opaque call more than once")
+            if (
+                kind == "function_result"
+                and "name" in step
+                and step["name"] != call_names[call_id]
+            ):
+                raise DialectError(f"{path}.name differs from the earlier opaque call")
+            answered.add(call_id)
+    return cast(str | None, system), tuple(steps)
+
+
+def _encode_opaque(system: str | None, steps: Sequence[JSONValue]) -> str:
+    envelope: dict[str, JSONValue] = {
+        "version": _OPAQUE_VERSION,
+        "steps": copy_json_value(list(steps), "opaque history"),
+    }
+    if system is not None:
+        envelope["system_instruction"] = system
+    return json.dumps(
+        envelope,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _resolve_opaque_system(current: str | None, prior: str | None) -> str | None:
+    if prior is not None and current is not None and prior != current:
+        raise DialectError(
+            "opaque system_instruction conflicts with current system message"
+        )
+    return current if current is not None else prior
+
+
+def _history_function_names(history: Sequence[JSONValue]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for raw in history:
+        step = cast(dict[str, JSONValue], raw)
+        if step["type"] == "function_call":
+            names[cast(str, step["id"])] = cast(str, step["name"])
+    return names
+
+
+def _orphan_result_error(
+    chat: ChatInput, history: Sequence[JSONValue] = ()
+) -> str | None:
+    """A tool result must answer a call in validated history or current input."""
 
     calls: set[str] = set()
     answered: set[str] = set()
+    historical_ids: set[str] = set()
+    for raw in history:
+        step = cast(dict[str, JSONValue], raw)
+        if cast(str, step["type"]).endswith("_call"):
+            historical_ids.add(cast(str, step["id"]))
+        if step["type"] == "function_call":
+            calls.add(cast(str, step["id"]))
+        elif step["type"] == "function_result":
+            answered.add(cast(str, step["call_id"]))
     for message in chat.messages:
         for part in message.content:
             if isinstance(part, ToolCallPart):
+                if history and part.call_id in historical_ids | calls:
+                    return (
+                        f"tool call {part.call_id!r} repeats a call in opaque "
+                        "history or current input"
+                    )
                 calls.add(part.call_id)
             elif isinstance(part, ToolResultPart):
                 if part.call_id not in calls:
@@ -720,7 +901,7 @@ def _orphan_result_error(chat: ChatInput) -> str | None:
     return None
 
 
-def _chat_shape_error(chat: ChatInput) -> str | None:
+def _chat_shape_error(chat: ChatInput, history: Sequence[JSONValue] = ()) -> str | None:
     """Return a lossless-mapping error for chat history, if any.
 
     Part kinds have their own request leaves; nothing here rejects a part.
@@ -766,7 +947,7 @@ def _chat_shape_error(chat: ChatInput) -> str | None:
     # prefill the API has no field for.
     if chat.messages[-1].role not in ("user", "tool"):
         return "google_interactions does not support assistant-prefill input"
-    return _orphan_result_error(chat)
+    return _orphan_result_error(chat, history)
 
 
 def _part_to_content(part: object) -> dict[str, JSONValue]:
@@ -833,11 +1014,14 @@ def _message_to_steps(message: ChatMessage) -> list[JSONValue]:
     return steps
 
 
-def _input_to_wire(chat: ChatInput) -> tuple[str | None, list[JSONValue]]:
-    if error := _chat_shape_error(chat):
+def _input_to_wire(
+    chat: ChatInput, opaque: str | None = None
+) -> tuple[str | None, list[JSONValue]]:
+    prior_system, history = _decode_opaque(opaque) if opaque is not None else (None, ())
+    if error := _chat_shape_error(chat, history):
         raise DialectError(error)
     system: str | None = None
-    steps: list[JSONValue] = []
+    steps: list[JSONValue] = list(history)
     for message in chat.messages:
         if message.name is not None:
             raise DialectError("Interactions steps have no ChatMessage.name field")
@@ -845,7 +1029,14 @@ def _input_to_wire(chat: ChatInput) -> tuple[str | None, list[JSONValue]]:
             system = cast(TextPart, message.content[0]).text
             continue
         steps.extend(_message_to_steps(message))
-    return system, steps
+    call_names = _history_function_names(history)
+    for raw in steps[len(history) :]:
+        step = cast(dict[str, JSONValue], raw)
+        if step["type"] == "function_call":
+            call_names[cast(str, step["id"])] = cast(str, step["name"])
+        elif step["type"] == "function_result":
+            step["name"] = call_names[cast(str, step["call_id"])]
+    return _resolve_opaque_system(system, prior_system), steps
 
 
 @dataclass(frozen=True)
@@ -901,9 +1092,16 @@ class _InputVerifier:
 
     system: str | None
     steps: tuple[_ExpectedStep, ...]
+    history: tuple[JSONValue, ...] = ()
 
     @classmethod
-    def from_request(cls, chat: ChatInput) -> "_InputVerifier":
+    def from_request(
+        cls, chat: ChatInput, opaque: str | None = None
+    ) -> "_InputVerifier":
+        prior_system, history = (
+            _decode_opaque(opaque) if opaque is not None else (None, ())
+        )
+        call_names = _history_function_names(history)
         system: str | None = None
         steps: list[_ExpectedStep] = []
         for message in chat.messages:
@@ -916,6 +1114,7 @@ class _InputVerifier:
                     _ExpectedStep(
                         "function_result",
                         call_id=result.call_id,
+                        call_name=call_names.get(result.call_id),
                         payload=result.result,
                         is_error=result.is_error,
                     )
@@ -925,6 +1124,7 @@ class _InputVerifier:
             content: list[_ExpectedContent] = []
             for part in message.content:
                 if isinstance(part, ToolCallPart):
+                    call_names[part.call_id] = part.name
                     if content:
                         steps.append(_ExpectedStep(kind, tuple(content)))
                         content = []
@@ -950,15 +1150,22 @@ class _InputVerifier:
                     )
             if content:
                 steps.append(_ExpectedStep(kind, tuple(content)))
-        return cls(system, tuple(steps))
+        return cls(_resolve_opaque_system(system, prior_system), tuple(steps), history)
 
     def verify(self, body: Mapping[str, JSONValue]) -> str | None:
         raw = body.get("input")
         if not isinstance(raw, list):
             return "input is not a step array"
-        if len(raw) != len(self.steps):
+        if len(raw) != len(self.history) + len(self.steps):
             return "input steps no longer match the provider-neutral input"
-        for index, (raw_step, expected) in enumerate(zip(raw, self.steps, strict=True)):
+        if _encode_opaque(
+            self.system, cast(list[JSONValue], raw[: len(self.history)])
+        ) != _encode_opaque(self.system, self.history):
+            return "input opaque history no longer matches the continuation"
+        for index, (raw_step, expected) in enumerate(
+            zip(raw[len(self.history) :], self.steps, strict=True),
+            start=len(self.history),
+        ):
             problem = _compare_step(raw_step, expected, f"input[{index}]")
             if problem is not None:
                 return problem
@@ -971,13 +1178,18 @@ def _compare_step(raw: object, expected: _ExpectedStep, path: str) -> str | None
     if not isinstance(raw, Mapping):
         return f"{path} has an unexpected shape"
     step = cast(Mapping[str, object], raw)
-    if step.get("type") != expected.kind or set(step) - _STEP_KEYS[expected.kind]:
+    allowed = _STEP_KEYS[expected.kind]
+    if expected.kind == "function_result" and expected.call_name is not None:
+        allowed = allowed | {"name"}
+    if step.get("type") != expected.kind or set(step) - allowed:
         return f"{path} has an unexpected shape"
     if expected.kind == "function_result":
         if step.get("call_id") != expected.call_id:
             return f"{path} answers a different call"
         if step.get("result") != expected.payload:
             return f"{path} result no longer matches the tool result"
+        if expected.call_name is not None and step.get("name") != expected.call_name:
+            return f"{path} function result name no longer matches the earlier call"
         flag = step.get("is_error")
         if expected.is_error and flag is not True:
             return f"{path} lost its is_error flag"
@@ -1233,7 +1445,14 @@ class GoogleInteractionsDialect:
     capability_decisions = CAPABILITY_DECISIONS
     output_contract = OUTPUT_CONTRACT
     CAPABILITIES = frozenset(
-        {Capability.Chat, Capability.Reasoning, Capability.ReasoningEffort}
+        {
+            Capability.Chat,
+            Capability.FunctionCalling,
+            Capability.ServerTools,
+            Capability.Reasoning,
+            Capability.ReasoningEffort,
+            Capability.StructuredOutput,
+        }
     )
 
     def __init__(self, connection: object, requested_model_id: str):
@@ -1256,8 +1475,17 @@ class GoogleInteractionsDialect:
     ) -> None:
         audit.require_matches_request(req)
         del plan
+        opaque_error: str | None = None
+        history: tuple[JSONValue, ...] = ()
+        if req.session.opaque_continuation is not None:
+            try:
+                _, history = _decode_opaque(req.session.opaque_continuation.value)
+            except DialectError as exc:
+                opaque_error = str(exc)
         chat_shape_error = (
-            _chat_shape_error(req.input) if isinstance(req.input, ChatInput) else None
+            _chat_shape_error(req.input, history)
+            if isinstance(req.input, ChatInput)
+            else None
         )
         options = req.dialect_options
         invalid_option_paths = (
@@ -1275,6 +1503,8 @@ class GoogleInteractionsDialect:
             elif path == "input.chat":
                 if chat_shape_error is not None:
                     audit.rejected(path, chat_shape_error)
+            elif path == "session.opaque_continuation" and opaque_error is not None:
+                audit.rejected(path, opaque_error)
             elif path == "input.chat.message.name":
                 audit.rejected(
                     path, "Interactions steps have no ChatMessage.name field"
@@ -1382,7 +1612,7 @@ class GoogleInteractionsDialect:
             if req.session.opaque_continuation is not None
             else None
         )
-        system, steps = _input_to_wire(req.input)
+        system, steps = _input_to_wire(req.input, opaque)
         body: dict[str, JSONValue] = {
             "model": self._requested_model_id,
             "input": steps,
@@ -1390,7 +1620,7 @@ class GoogleInteractionsDialect:
         }
         if system is not None:
             body["system_instruction"] = system
-        input_verifier = _InputVerifier.from_request(req.input)
+        input_verifier = _InputVerifier.from_request(req.input, opaque)
         route = _RouteVerifier(self._requested_model_id, self._version)
         # Only leaves this concrete request activates may receive a decision;
         # an inactive path is a hard audit error.
@@ -1557,6 +1787,13 @@ class GoogleInteractionsDialect:
         stream = actual_body.get("stream", False)
         if not isinstance(stream, bool):
             raise DialectError("final Interactions request stream must be a boolean")
+        opaque = context.request.session.opaque_continuation
+        mismatch = _InputVerifier.from_request(
+            cast(ChatInput, context.request.input),
+            opaque.value if opaque is not None else None,
+        ).verify(actual_body)
+        if mismatch is not None:
+            raise DialectError(f"final Interactions request: {mismatch}")
         execution = _ExecutionContext(
             request=context.request,
             request_params={
@@ -1572,6 +1809,8 @@ class GoogleInteractionsDialect:
             declared_functions=_declared_function_names(context.request),
             hosted_kinds=frozenset(tool.kind for tool in context.request.tools.hosted),
             tool_choice=context.request.tools.choice,
+            input_steps=tuple(cast(list[JSONValue], actual_body["input"])),
+            system_instruction=cast(str | None, actual_body.get("system_instruction")),
         )
         if not stream:
             response = await self._connection.client.send(request)
@@ -1729,6 +1968,21 @@ _HOSTED_ERROR_CODE = "is_error"
 _UNSET = object()
 
 
+def _signature_evidence(steps: Sequence[JSONValue]) -> dict[tuple[str, str], str]:
+    evidence: dict[tuple[str, str], str] = {}
+    occurrences: dict[str, int] = {}
+    for raw in steps:
+        step = cast(dict[str, JSONValue], raw)
+        kind = cast(str, step["type"])
+        occurrence = occurrences.get(kind, 0)
+        occurrences[kind] = occurrence + 1
+        signature = step.get("signature")
+        if isinstance(signature, str):
+            identity = step.get("id", step.get("call_id", str(occurrence)))
+            evidence[kind, cast(str, identity)] = signature
+    return evidence
+
+
 def _projection_mismatch(left: "_LiftState", right: "_LiftState") -> str | None:
     """Compare observable output without requiring matching text segmentation."""
 
@@ -1742,6 +1996,13 @@ def _projection_mismatch(left: "_LiftState", right: "_LiftState") -> str | None:
     ):
         if left_value != right_value:
             return field_name
+    left_signatures = _signature_evidence(left.native_steps)
+    right_signatures = _signature_evidence(right.native_steps)
+    if any(
+        left_signatures[key] != right_signatures[key]
+        for key in left_signatures.keys() & right_signatures.keys()
+    ):
+        return "signatures"
     left_results = {
         key: (value.kind, value.result, value.failed)
         for key, value in left.server_results.items()
@@ -1774,6 +2035,7 @@ class _LiftState:
     hosted_call_kinds: dict[str, str] = field(default_factory=dict)
     citations: list[Citation] = field(default_factory=list)
     server_results: dict[str, _HostedResult] = field(default_factory=dict)
+    native_steps: list[JSONValue] = field(default_factory=list)
 
     def absorb(self, step: Mapping[str, object], index: int) -> None:
         path = f"response.steps[{index}]"
@@ -1793,6 +2055,8 @@ class _LiftState:
             if not isinstance(decoded, dict):
                 raise OutputContractError(f"{path}.arguments must decode to an object")
             step = {**step, "arguments": decoded}
+        if "signature" in step and not isinstance(step["signature"], str):
+            raise OutputContractError(f"{path}.signature must be a string")
         self.absorbed += 1
         if kind == "thought":
             self.saw_thought = True
@@ -1811,6 +2075,7 @@ class _LiftState:
             self._hosted_result(step, path, "url_context")
         else:
             raise OutputContractError(f"{path} has unsupported type {kind!r}")
+        self.native_steps.append(copy_json_value(step, path))
 
     def _model_output(self, step: Mapping[str, object], path: str) -> None:
         extra = set(step) - {"type", "content", "error"}
@@ -1954,16 +2219,29 @@ class _LiftState:
         usage_raw: object = _UNSET,
     ) -> Response:
         summary = "".join(self.summaries)
+        opaque: str | None = None
         if (
-            self.request.reasoning.summary == "auto"
-            and status != "incomplete"
-            and self.saw_thought
-            and not summary.strip()
-        ):
-            raise OutputContractError(
-                "Interactions reply returned an empty requested thought summary"
+            self.saw_thought
+            or any(
+                "signature" in cast(dict[str, JSONValue], step)
+                for step in self.native_steps
             )
-        reasoning = ReasoningOutput(text=summary) if summary else None
+            or self.request.session.opaque_continuation is not None
+        ):
+            opaque = _encode_opaque(
+                context.system_instruction, [*context.input_steps, *self.native_steps]
+            )
+            try:
+                _decode_opaque(opaque)
+            except DialectError as exc:
+                raise OutputContractError(
+                    f"response generated invalid opaque history: {exc}"
+                ) from exc
+        reasoning = (
+            ReasoningOutput(text=summary or None, opaque_roundtrip=opaque)
+            if summary or opaque is not None
+            else None
+        )
         server_uses = [
             ServerToolUse(
                 tool_type=use.tool_type,
@@ -2075,6 +2353,19 @@ class _StreamState:
             self._apply_delta(
                 self.partial[index], _mapping(event.get("delta"), "step.delta.delta")
             )
+            if "metadata" in event:
+                metadata = _mapping(event["metadata"], "step.delta.metadata")
+                if "total_usage" in metadata:
+                    usage = _mapping(
+                        metadata["total_usage"], "step.delta.metadata.total_usage"
+                    )
+                    try:
+                        _usage(usage)
+                    except OutputContractError as exc:
+                        raise OutputContractError(
+                            f"step.delta.metadata.total_usage: {exc}"
+                        ) from exc
+                    self.cumulative_usage = usage
             return
         if event_type == "step.stop":
             index = _stream_index(event)
@@ -2266,6 +2557,7 @@ def _reconcile_terminal_steps(
         lifted.hosted_call_kinds = snapshot.hosted_call_kinds
         lifted.citations = snapshot.citations
         lifted.server_results = snapshot.server_results
+        lifted.native_steps = snapshot.native_steps
         return
     mismatch = _projection_mismatch(lifted, snapshot)
     if mismatch is not None:

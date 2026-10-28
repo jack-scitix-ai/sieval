@@ -20,6 +20,7 @@ import pytest
 
 from sieval.core.models.capabilities import (
     CAPABILITY_KEYS,
+    Capability,
     HostedToolsOptions,
     MultimodalInputOptions,
     ReasoningOptions,
@@ -55,6 +56,7 @@ from sieval.core.models.ir import (
     HostedToolSpec,
     ImagePart,
     OpaqueContinuation,
+    ReasoningOutput,
     ReasoningParams,
     Request,
     Response,
@@ -69,8 +71,14 @@ from sieval.core.models.ir import (
     ToolResultPart,
     UsageStats,
 )
+from sieval.core.models.model import _LEGACY_CAPABILITY_MAP
 from sieval.core.tasks.run_meta import digest, request_definition
 from sieval.core.utils.meta import is_truncated_finish_reason
+from sieval.core.utils.serialization import (
+    dict_to_obj,
+    global_type_registry,
+    obj_to_dict,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "google_interactions"
 MODEL = "gemini-3.8-flash"
@@ -271,12 +279,12 @@ _REJECTED_REQUESTS: dict[str, Request] = {
     "tools.parallel": _request(tools=_FUNCTION_TOOLS),
     "structured_output.name": _request(structured_output=_STRUCTURED),
     "structured_output.strict": _request(structured_output=_STRUCTURED),
-    "session.opaque_continuation": _request(session=_OPAQUE),
     "input.modality.image.detail": _request(input=_IMAGE_INPUT),
 }
 
 #: Requests refused for their value or shape, with the reason's wording.
 _INVALID_REQUESTS = [
+    pytest.param(_request(session=_OPAQUE), "opaque.*JSON", id="invalid-opaque-json"),
     pytest.param(
         _request(input=_chat(_say("developer", "d"), _say("user", "u"))),
         "developer message authority",
@@ -414,6 +422,7 @@ class TestCapabilities:
             "hosted_tools",
             "structured_output",
             "multimodal_input",
+            "opaque_continuation",
         }
 
         spec = DIALECT_SPECS["google_interactions"]
@@ -501,6 +510,15 @@ class TestConstruction:
 
     def test_capabilities_view_is_the_class_constant(self) -> None:
         assert _dialect().capabilities is GoogleInteractionsDialect.CAPABILITIES
+
+    def test_legacy_capability_view_matches_supported_decisions(self) -> None:
+        expected = frozenset(
+            capability
+            for capability_key, decision in CAPABILITY_DECISIONS.items()
+            if isinstance(decision, Supported)
+            for capability in _LEGACY_CAPABILITY_MAP.get(capability_key, ())
+        ) | {Capability.Chat}
+        assert _dialect().capabilities == expected
 
 
 class TestRequestLowering:
@@ -806,7 +824,9 @@ class TestFinalWireEvidence:
     async def test_input_evidence_catches_a_lowering_that_changes_the_text(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def corrupt(_: ChatInput, **__: bool) -> tuple[str | None, list[Any]]:
+        def corrupt(
+            _chat: ChatInput, _opaque: str | None = None
+        ) -> tuple[str | None, list[Any]]:
             return (
                 None,
                 [
@@ -1175,7 +1195,10 @@ class TestResponseLifting:
 
         assert result.texts == ("pong",)
         assert result.finish_reasons == ("completed",)
-        assert result.reasoning is None
+        assert result.reasoning is not None
+        assert result.reasoning[0] is not None
+        assert result.reasoning[0].text is None
+        assert result.reasoning[0].opaque_roundtrip is not None
         assert result.session_id is None
         assert result.response_model == MODEL
         assert result.usage == UsageStats(
@@ -1257,22 +1280,28 @@ class TestResponseLifting:
         assert result.reasoning[0].text
 
     @pytest.mark.anyio
-    async def test_requested_summary_that_comes_back_empty_is_an_error(self) -> None:
-        with pytest.raises(
-            OutputContractError, match="empty requested thought summary"
-        ):
-            await _run(
-                _json_handler(_fixture("completed_text")),
-                _request(reasoning=ReasoningParams(summary="auto")),
-            )
+    async def test_requested_summary_may_be_omitted(self) -> None:
+        result = await _run(
+            _json_handler(_fixture("completed_text")),
+            _request(reasoning=ReasoningParams(summary="auto")),
+        )
+        assert result.reasoning is not None
+        assert result.reasoning[0] is not None
+        assert result.reasoning[0].text is None
+        assert result.reasoning[0].opaque_roundtrip is not None
 
     @pytest.mark.anyio
-    async def test_summary_none_does_not_surface_a_reasoning_channel(self) -> None:
+    async def test_summary_none_preserves_opaque_without_visible_reasoning(
+        self,
+    ) -> None:
         result = await _run(
             _json_handler(_fixture("completed_text")),
             _request(reasoning=ReasoningParams(summary="none")),
         )
-        assert result.reasoning is None
+        assert result.reasoning is not None
+        assert result.reasoning[0] is not None
+        assert result.reasoning[0].text is None
+        assert result.reasoning[0].opaque_roundtrip is not None
 
     @pytest.mark.anyio
     async def test_output_text_concatenates_in_step_and_content_order(self) -> None:
@@ -1546,6 +1575,21 @@ class TestUsage:
     def test_missing_counts_read_as_zero_and_breakdowns_stay_unreported(self) -> None:
         assert google_interactions._usage({}) == UsageStats()
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "total_input_tokens",
+            "total_output_tokens",
+            "total_tool_use_tokens",
+            "total_thought_tokens",
+            "total_cached_tokens",
+            "total_tokens",
+        ],
+    )
+    def test_a_provided_count_cannot_be_null(self, name: str) -> None:
+        with pytest.raises(OutputContractError, match=rf"usage\.{name}"):
+            google_interactions._usage({name: None})
+
     def test_thoughts_fold_into_output_so_reasoning_is_a_breakdown(self) -> None:
         usage = google_interactions._usage(
             {
@@ -1808,6 +1852,7 @@ class TestFunctionTools:
                 "type": "function_result",
                 "call_id": "call_1",
                 "result": {"temp_c": 18},
+                "name": "get_weather",
             },
             {
                 "type": "user_input",
@@ -1882,6 +1927,7 @@ class TestFunctionTools:
             "type": "function_result",
             "call_id": "c1",
             "result": {"temp_c": 18},
+            "name": "get_weather",
         }
 
         orphan = Request(
@@ -2028,6 +2074,7 @@ class TestFunctionTools:
             "type": "function_result",
             "call_id": "c1",
             "result": "no data",
+            "name": "get_weather",
             "is_error": True,
         }
 
@@ -2059,6 +2106,19 @@ class TestFunctionTools:
             await _run(
                 _json_handler(reply),
                 _request(tools=ToolParams(functions=(_FUNCTION_TOOL,), choice="none")),
+            )
+
+    @pytest.mark.anyio
+    async def test_live_provider_call_violating_choice_none_is_rejected(self) -> None:
+        declaration = {
+            "name": "get_code",
+            "description": "Retrieve the four-digit code.",
+            "parameters": {"type": "object"},
+        }
+        with pytest.raises(OutputContractError, match="outside the request's allowed"):
+            await _run(
+                _json_handler(_fixture("function_choice_none_provider_violation")),
+                _request(tools=ToolParams(functions=(declaration,), choice="none")),
             )
 
     @pytest.mark.anyio
@@ -2504,6 +2564,63 @@ class TestStreaming:
         assert result.reasoning[0].text == "part onepart two"
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("name", "hosted_kind", "function_count", "status"),
+        [
+            ("stream_signature_only_completed", None, 0, "completed"),
+            ("stream_multiple_functions_signature_only", None, 2, "requires_action"),
+            ("stream_url_context_signature_only", "url_context", 0, "completed"),
+            ("stream_google_search_signature_only", "google_search", 0, "completed"),
+        ],
+    )
+    async def test_live_signature_only_thought_preserves_opaque(
+        self,
+        name: str,
+        hosted_kind: str | None,
+        function_count: int,
+        status: str,
+    ) -> None:
+        functions = (
+            (
+                {
+                    "name": "lookup_value",
+                    "description": "Look up a label's value.",
+                    "parameters": {"type": "object"},
+                },
+            )
+            if function_count
+            else ()
+        )
+        hosted = (HostedToolSpec(hosted_kind),) if hosted_kind else ()
+        result = await _run(
+            _stream(_recorded_stream(name)),
+            _request(
+                reasoning=ReasoningParams(summary="auto"),
+                scheduling=SchedulingParams(stream=True),
+                tools=ToolParams(functions=functions, hosted=hosted),
+            ),
+        )
+        assert result.finish_reasons == (status,)
+        assert result.reasoning is not None
+        assert result.reasoning[0] is not None
+        assert result.reasoning[0].text is None
+        assert result.reasoning[0].opaque_roundtrip is not None
+        history = json.loads(result.reasoning[0].opaque_roundtrip)["steps"]
+        assert any(
+            step["type"] == "thought" and step.get("signature") == "sig-redacted"
+            for step in history
+        )
+        assert len(result.tool_calls or ()) == function_count
+        if hosted_kind:
+            assert result.server_tool_uses
+            assert all(
+                tool.tool_type == hosted_kind and tool.result is not None
+                for tool in result.server_tool_uses
+            )
+            assert result.citations
+            assert result.texts[0]
+
+    @pytest.mark.anyio
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize(
         ("name", "status", "summary_chars"),
@@ -2928,7 +3045,12 @@ class TestCoverageBranches:
                     "name": "f",
                     "arguments": {"a": 1},
                 },
-                {"type": "function_result", "call_id": "c1", "result": "ok"},
+                {
+                    "type": "function_result",
+                    "call_id": "c1",
+                    "name": "f",
+                    "result": "ok",
+                },
                 {"type": "user_input", "content": [{"type": "text", "text": "next"}]},
             ]
         }
@@ -2985,6 +3107,7 @@ class TestCoverageBranches:
                     "type": "function_result",
                     "call_id": "c1",
                     "result": "boom",
+                    "name": "f",
                     "is_error": True,
                 },
             ]
@@ -4377,6 +4500,221 @@ class TestStreamTerminalEvidence:
         assert result.texts == ("firstsecond",)
 
 
+class TestStreamDeltaUsage:
+    @staticmethod
+    async def run_events(
+        *events: dict[str, Any], terminal_usage: dict[str, int] | None = None
+    ) -> Response:
+        terminal = _completed()
+        if terminal_usage is None:
+            terminal["interaction"].pop("usage")
+        else:
+            terminal["interaction"]["usage"] = terminal_usage
+        return await _run(
+            _stream(_sse(_created(), *events, terminal, _DONE)),
+            _request(scheduling=SchedulingParams(stream=True)),
+        )
+
+    @staticmethod
+    def delta(usage: dict[str, Any], index: int = 0) -> dict[str, Any]:
+        return {
+            **_delta(index, {"type": "text", "text": "hi"}),
+            "metadata": {"total_usage": usage},
+        }
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("reported_total", [12, 99])
+    async def test_delta_usage_survives_without_stop_or_terminal_usage(
+        self, reported_total: int
+    ) -> None:
+        result = await self.run_events(
+            _start(0, {"type": "model_output"}),
+            self.delta(
+                {
+                    "total_input_tokens": 7,
+                    "total_output_tokens": 3,
+                    "total_tool_use_tokens": 1,
+                    "total_thought_tokens": 1,
+                    "total_cached_tokens": 2,
+                    "total_tokens": reported_total,
+                }
+            ),
+            _stop(0),
+        )
+        assert result.texts == ("hi",)
+        assert result.usage == UsageStats(
+            input_tokens=8,
+            output_tokens=4,
+            total_tokens=12,
+            reasoning_tokens=1,
+            cached_tokens=2,
+            reported_total_tokens=None if reported_total == 12 else reported_total,
+        )
+
+    @pytest.mark.anyio
+    async def test_latest_cumulative_delta_replaces_instead_of_adds(self) -> None:
+        result = await self.run_events(
+            _start(0, {"type": "model_output"}),
+            self.delta({"total_input_tokens": 7, "total_output_tokens": 2}),
+            self.delta({"total_input_tokens": 7, "total_output_tokens": 3}),
+            _stop(0),
+        )
+        assert result.usage == UsageStats(
+            input_tokens=7, output_tokens=3, total_tokens=10
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("explicit_zeroes", [False, True])
+    async def test_empty_or_zero_counts_are_valid(self, explicit_zeroes: bool) -> None:
+        usage = (
+            {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "total_tool_use_tokens": 0,
+                "total_thought_tokens": 0,
+                "total_cached_tokens": 0,
+                "total_tokens": 0,
+            }
+            if explicit_zeroes
+            else {}
+        )
+        result = await self.run_events(
+            _start(0, {"type": "model_output"}),
+            self.delta(usage),
+            _stop(0),
+        )
+        expected = (
+            UsageStats(reasoning_tokens=0, cached_tokens=0)
+            if explicit_zeroes
+            else UsageStats()
+        )
+        assert result.usage == expected
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("metadata", [_DROP, {}])
+    async def test_missing_or_empty_metadata_keeps_previous_usage(
+        self, metadata: Any
+    ) -> None:
+        delta = _delta(0, {"type": "text", "text": "more"})
+        if metadata is not _DROP:
+            delta["metadata"] = metadata
+        result = await self.run_events(
+            _start(0, {"type": "model_output"}),
+            self.delta({"total_input_tokens": 7, "total_output_tokens": 3}),
+            delta,
+            _stop(0),
+        )
+        assert result.usage == UsageStats(
+            input_tokens=7, output_tokens=3, total_tokens=10
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("terminal_present", [False, True])
+    async def test_stop_and_terminal_usage_keep_their_precedence(
+        self, terminal_present: bool
+    ) -> None:
+        result = await self.run_events(
+            _start(0, {"type": "model_output"}),
+            self.delta({"total_input_tokens": 1, "total_output_tokens": 1}),
+            {
+                **_stop(0),
+                "usage": {"total_input_tokens": 7, "total_output_tokens": 3},
+            },
+            terminal_usage=(
+                {"total_input_tokens": 9, "total_output_tokens": 4}
+                if terminal_present
+                else None
+            ),
+        )
+        expected = (
+            UsageStats(input_tokens=9, output_tokens=4, total_tokens=13)
+            if terminal_present
+            else UsageStats(input_tokens=7, output_tokens=3, total_tokens=10)
+        )
+        assert result.usage == expected
+
+    @pytest.mark.anyio
+    async def test_delta_after_another_steps_stop_is_the_latest_usage(self) -> None:
+        result = await self.run_events(
+            _start(0, {"type": "model_output"}),
+            _start(1, {"type": "model_output"}),
+            {
+                **_stop(0),
+                "usage": {"total_input_tokens": 7, "total_output_tokens": 2},
+            },
+            self.delta({"total_input_tokens": 7, "total_output_tokens": 3}, index=1),
+            _stop(1),
+        )
+        assert result.usage == UsageStats(
+            input_tokens=7, output_tokens=3, total_tokens=10
+        )
+
+    @pytest.mark.anyio
+    async def test_step_usage_is_not_a_cumulative_fallback(self) -> None:
+        result = await self.run_events(
+            _start(0, {"type": "model_output"}),
+            self.delta({"total_input_tokens": 7, "total_output_tokens": 3}),
+            {**_stop(0), "step_usage": {"total_output_tokens": 1}},
+        )
+        assert result.usage == UsageStats(
+            input_tokens=7, output_tokens=3, total_tokens=10
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            None,
+            True,
+            0,
+            "",
+            [],
+            {"total_usage": None},
+            {"total_usage": True},
+            {"total_usage": 0},
+            {"total_usage": ""},
+            {"total_usage": []},
+        ],
+    )
+    async def test_invalid_metadata_is_not_hidden_by_terminal_usage(
+        self, metadata: Any
+    ) -> None:
+        with pytest.raises(OutputContractError, match=r"step\.delta\.metadata"):
+            await self.run_events(
+                _start(0, {"type": "model_output"}),
+                {**_delta(0, {"type": "text", "text": "hi"}), "metadata": metadata},
+                _stop(0),
+                terminal_usage={"total_input_tokens": 7, "total_output_tokens": 3},
+            )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "total_input_tokens",
+            "total_output_tokens",
+            "total_tool_use_tokens",
+            "total_thought_tokens",
+            "total_cached_tokens",
+            "total_tokens",
+        ],
+    )
+    @pytest.mark.parametrize("value", [None, True, -1, 1.5, "1", [], {}])
+    async def test_invalid_counts_fail_even_with_a_valid_terminal(
+        self, name: str, value: Any
+    ) -> None:
+        with pytest.raises(
+            OutputContractError,
+            match=rf"step\.delta\.metadata\.total_usage: usage\.{name}",
+        ):
+            await self.run_events(
+                _start(0, {"type": "model_output"}),
+                self.delta({name: value}),
+                _stop(0),
+                terminal_usage={"total_input_tokens": 7, "total_output_tokens": 3},
+            )
+
+
 class TestHostedResultEvidence:
     """Failures and duplicate/ill-typed results must survive or be refused."""
 
@@ -4895,6 +5233,7 @@ class TestToolResultContentFields:
             "type": "function_result",
             "call_id": "c1",
             "result": original,
+            "name": "get_weather",
         }
         assert value == original
         assert "previous_interaction_id" not in sent[0]
@@ -4918,3 +5257,417 @@ class TestToolResultContentFields:
             }
         ]
         assert google_interactions._tool_result_error(result) is None
+
+
+class TestOpaqueContinuation:
+    @staticmethod
+    def reasoning(response: Response) -> ReasoningOutput:
+        assert response.reasoning is not None
+        reasoning = response.reasoning[0]
+        assert reasoning is not None
+        return reasoning
+
+    @classmethod
+    def opaque(cls, response: Response) -> str:
+        opaque = cls.reasoning(response).opaque_roundtrip
+        assert isinstance(opaque, str)
+        return opaque
+
+    @staticmethod
+    def session(steps: list[dict[str, Any]], **fields: Any) -> SessionParams:
+        envelope = {"version": 1, "steps": steps, **fields}
+        return SessionParams(
+            opaque_continuation=OpaqueContinuation(
+                "google_interactions", json.dumps(envelope)
+            )
+        )
+
+    @staticmethod
+    def history() -> list[dict[str, Any]]:
+        return [
+            {"type": "user_input", "content": [{"type": "text", "text": "first"}]},
+            _thought(["one\n\n\n", "two"]),
+            _model_output("answer"),
+        ]
+
+    @pytest.mark.anyio
+    async def test_current_call_cannot_reuse_a_historical_id(self) -> None:
+        history = [{"type": "function_call", "id": "c1", "name": "f", "arguments": {}}]
+        with pytest.raises(DialectError, match="repeats a call"):
+            await _run(
+                _no_io,
+                _request(
+                    session=self.session(history),
+                    input=_chat(
+                        ChatMessage("assistant", (ToolCallPart("c1", "f", {}),)),
+                        _say("user", "next"),
+                    ),
+                ),
+            )
+
+    @pytest.mark.anyio
+    async def test_response_cannot_emit_an_unreplayable_duplicate_id(self) -> None:
+        history = [{"type": "function_call", "id": "c1", "name": "f", "arguments": {}}]
+        output = [
+            {
+                "type": "function_call",
+                "id": "c1",
+                "name": "get_weather",
+                "arguments": {},
+            }
+        ]
+        with pytest.raises(
+            OutputContractError, match="invalid opaque history.*repeats"
+        ):
+            await _run(
+                _json_handler(_reply(status="requires_action", steps=output)),
+                _request(
+                    session=self.session(history),
+                    tools=ToolParams(functions=(_FUNCTION_TOOL,)),
+                ),
+            )
+
+    @pytest.mark.anyio
+    async def test_opaque_survives_typed_disk_round_trip(self, tmp_path: Path) -> None:
+        response = await _run(
+            _json_handler(
+                _reply(steps=[_thought(["summary"]), _model_output("answer")])
+            )
+        )
+        target = tmp_path / "response.json"
+        target.write_text(json.dumps(obj_to_dict(response, add_type=True)))
+        restored = dict_to_obj(json.loads(target.read_text()), global_type_registry)
+        assert isinstance(restored, Response)
+        assert self.opaque(restored) == self.opaque(response)
+        assert restored.reasoning == response.reasoning
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("field", ["arguments", "is_error"])
+    async def test_verifier_preserves_numeric_and_boolean_types(
+        self, monkeypatch: pytest.MonkeyPatch, field: str
+    ) -> None:
+        history = [
+            {
+                "type": "function_call",
+                "id": "c1",
+                "name": "f",
+                "arguments": {"value": 1},
+            },
+            {
+                "type": "function_result",
+                "call_id": "c1",
+                "result": "failed",
+                "is_error": True,
+            },
+        ]
+
+        def mutate(body: dict[str, Any]) -> None:
+            if field == "arguments":
+                body["input"][0]["arguments"]["value"] = True
+            else:
+                body["input"][1]["is_error"] = 1
+
+        _tamper_prepared(monkeypatch, mutate)
+        with pytest.raises(DialectError, match="opaque history"):
+            await _run(_no_io, _request(session=self.session(history)))
+
+    @pytest.mark.anyio
+    async def test_signed_response_emits_exact_history(self) -> None:
+        output = [_thought(["one\n\n\n", "two"]), _model_output("answer")]
+        response = await _run(
+            _json_handler(_reply(steps=output)),
+            _request(input=_chat(_say("system", "rules"), _say("user", "first"))),
+        )
+        reasoning = self.reasoning(response)
+        assert reasoning.text == "one\n\n\ntwo"
+        assert json.loads(self.opaque(response)) == {
+            "version": 1,
+            "system_instruction": "rules",
+            "steps": [
+                {"type": "user_input", "content": [{"type": "text", "text": "first"}]},
+                *output,
+            ],
+        }
+        assert response.session_id is None
+
+    @pytest.mark.anyio
+    async def test_replay_preserves_history_and_system_without_new_signature(
+        self,
+    ) -> None:
+        history = self.history()
+        sent = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append(json.loads(request.content))
+            return httpx.Response(200, json=_reply())
+
+        response = await _run(
+            handler,
+            _request(
+                input=_chat(_say("user", "next")),
+                session=self.session(history, system_instruction="rules"),
+            ),
+        )
+        assert sent[0]["input"] == [
+            *history,
+            {"type": "user_input", "content": [{"type": "text", "text": "next"}]},
+        ]
+        assert sent[0]["system_instruction"] == "rules"
+        assert sent[0]["store"] is False
+        assert "previous_interaction_id" not in sent[0]
+        reasoning = self.reasoning(response)
+        assert reasoning.text is None
+        assert json.loads(self.opaque(response))["steps"] == [
+            *sent[0]["input"],
+            _model_output("Hi"),
+        ]
+
+    @pytest.mark.anyio
+    async def test_current_system_must_match_prior_authority(self) -> None:
+        with pytest.raises(DialectError, match="system_instruction.*conflict"):
+            await _run(
+                _no_io,
+                _request(
+                    input=_chat(_say("system", "different"), _say("user", "next")),
+                    session=self.session(self.history(), system_instruction="rules"),
+                ),
+            )
+
+    @pytest.mark.anyio
+    async def test_tool_result_can_answer_a_call_in_opaque_history(self) -> None:
+        history = [
+            {"type": "user_input", "content": [{"type": "text", "text": "weather"}]},
+            _thought(),
+            {"type": "function_call", "id": "c1", "name": "old_tool", "arguments": {}},
+        ]
+        sent = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append(json.loads(request.content))
+            return httpx.Response(200, json=_reply())
+
+        await _run(
+            handler,
+            _request(
+                input=_chat(ChatMessage("tool", (ToolResultPart("c1", "sunny"),))),
+                session=self.session(history),
+            ),
+        )
+        assert sent[0]["input"] == [
+            *history,
+            {
+                "type": "function_result",
+                "call_id": "c1",
+                "name": "old_tool",
+                "result": "sunny",
+            },
+        ]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("replacement", [None, "wrong_function"])
+    async def test_result_name_cannot_be_removed_or_changed(
+        self, monkeypatch: pytest.MonkeyPatch, replacement: str | None
+    ) -> None:
+        history = [
+            {"type": "function_call", "id": "c1", "name": "old_tool", "arguments": {}}
+        ]
+
+        def mutate(body: dict[str, Any]) -> None:
+            if replacement is None:
+                body["input"][-1].pop("name")
+            else:
+                body["input"][-1]["name"] = replacement
+
+        _tamper_prepared(monkeypatch, mutate)
+        with pytest.raises(DialectError, match="result name"):
+            await _run(
+                _no_io,
+                _request(
+                    input=_chat(ChatMessage("tool", (ToolResultPart("c1", "sunny"),))),
+                    session=self.session(history),
+                ),
+            )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("answered", [False, True])
+    async def test_unknown_or_already_answered_historical_call_fails(
+        self, answered: bool
+    ) -> None:
+        history = self.history()
+        if answered:
+            history.extend(
+                [
+                    {"type": "function_call", "id": "c1", "name": "f", "arguments": {}},
+                    {"type": "function_result", "call_id": "c1", "result": "done"},
+                ]
+            )
+        with pytest.raises(DialectError, match="earlier tool call|more than once"):
+            await _run(
+                _no_io,
+                _request(
+                    input=_chat(ChatMessage("tool", (ToolResultPart("c1", "again"),))),
+                    session=self.session(history),
+                ),
+            )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "envelope",
+        [
+            {"version": True, "steps": []},
+            {"version": 2, "steps": []},
+            {"version": 1, "steps": None},
+            {"version": 1, "steps": [1]},
+            {"version": 1, "steps": [{"type": "unknown"}]},
+            {"version": 1, "steps": [{"type": "thought", "signature": None}]},
+            {"version": 1, "steps": [{"type": "thought", "summary": None}]},
+            {
+                "version": 1,
+                "steps": [
+                    {"type": "function_call", "id": "x", "name": "f", "arguments": 1}
+                ],
+            },
+            {
+                "version": 1,
+                "steps": [
+                    {"type": "function_result", "call_id": "x", "result": "orphan"}
+                ],
+            },
+            {"version": 1, "steps": [], "system_instruction": None},
+            {"version": 1, "steps": [], "extra": True},
+        ],
+    )
+    async def test_malformed_history_fails_before_io(self, envelope: Any) -> None:
+        session = SessionParams(
+            opaque_continuation=OpaqueContinuation(
+                "google_interactions", json.dumps(envelope)
+            )
+        )
+        with pytest.raises(DialectError, match="opaque"):
+            await _run(_no_io, _request(session=session))
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "not JSON",
+            '{"version":1,"version":1,"steps":[]}',
+            '{"version":1,"steps":[],"system_instruction":NaN}',
+        ],
+    )
+    async def test_history_requires_strict_json(self, value: str) -> None:
+        session = SessionParams(
+            opaque_continuation=OpaqueContinuation("google_interactions", value)
+        )
+        with pytest.raises(DialectError, match="opaque.*JSON"):
+            await _run(_no_io, _request(session=session))
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("field", ["signature", "summary", "input", "current"])
+    async def test_prepared_history_and_current_turn_are_verified(
+        self, monkeypatch: pytest.MonkeyPatch, field: str
+    ) -> None:
+        def mutate(body: dict[str, Any]) -> None:
+            if field == "signature":
+                body["input"][1]["signature"] = "changed"
+            elif field == "summary":
+                body["input"][1]["summary"].reverse()
+            elif field == "input":
+                body["input"][0]["content"][0]["text"] = "changed"
+            else:
+                body["input"][-1]["content"][0]["text"] = "changed"
+
+        _tamper_prepared(monkeypatch, mutate)
+        with pytest.raises(DialectError, match="opaque history|provider-neutral input"):
+            await _run(_no_io, _request(session=self.session(self.history())))
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "name",
+        ["stream_thought_summary_completed", "stream_thought_summary_incomplete"],
+    )
+    async def test_stream_keeps_summary_item_boundaries_in_opaque(
+        self, name: str
+    ) -> None:
+        events = _recorded_stream(name)
+        summary = [
+            event["delta"]["content"]
+            for line in events.decode().splitlines()
+            if line.startswith("data: {")
+            for event in [json.loads(line[6:])]
+            if event.get("delta", {}).get("type") == "thought_summary"
+        ]
+        response = await _run(
+            _stream(events), _request(scheduling=SchedulingParams(stream=True))
+        )
+        reasoning = self.reasoning(response)
+        history = json.loads(self.opaque(response))["steps"]
+        thought = next(step for step in history if step["type"] == "thought")
+        assert thought["summary"] == summary
+        assert reasoning.text == "".join(item["text"] for item in summary)
+        assert thought["signature"] == "sig-redacted"
+
+    @pytest.mark.anyio
+    async def test_snapshot_only_retains_native_steps(self) -> None:
+        output = [_thought(["summary"]), _model_output("answer")]
+        response = await _run(
+            _stream(_sse(_created(), _completed(steps=output), _DONE)),
+            _request(scheduling=SchedulingParams(stream=True)),
+        )
+        assert json.loads(self.opaque(response))["steps"][1:] == output
+
+    @pytest.mark.anyio
+    async def test_conflicting_terminal_signatures_fail(self) -> None:
+        events = _sse(
+            _created(),
+            _start(0, {"type": "thought", "signature": "first"}),
+            _stop(0),
+            _completed(steps=[{"type": "thought", "signature": "different"}]),
+            _DONE,
+        )
+        with pytest.raises(OutputContractError, match="signatures"):
+            await _run(
+                _stream(events), _request(scheduling=SchedulingParams(stream=True))
+            )
+
+    @pytest.mark.anyio
+    async def test_hosted_signatures_survive_replay_without_current_hosted_tools(
+        self,
+    ) -> None:
+        output = [
+            {
+                "type": "google_search_call",
+                "id": "s1",
+                "arguments": {},
+                "signature": "call-signature",
+            },
+            {
+                "type": "google_search_result",
+                "call_id": "s1",
+                "result": [],
+                "signature": "result-signature",
+            },
+            _model_output("answer"),
+        ]
+        first = await _run(
+            _json_handler(_reply(steps=output)),
+            _request(tools=ToolParams(hosted=(HostedToolSpec("google_search"),))),
+        )
+        opaque = self.opaque(first)
+        sent = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append(json.loads(request.content))
+            return httpx.Response(200, json=_reply())
+
+        await _run(
+            handler,
+            _request(
+                session=SessionParams(
+                    opaque_continuation=OpaqueContinuation(
+                        "google_interactions", opaque
+                    )
+                )
+            ),
+        )
+        assert sent[0]["input"][1:4] == output

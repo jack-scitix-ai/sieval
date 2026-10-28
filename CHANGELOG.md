@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Google Interactions supports stateless opaque continuation: native steps,
+  thought signatures and system instructions round-trip through
+  `ReasoningOutput.opaque_roundtrip`, with independently audited history replay.
+  Provider storage remains disabled with `store: false`.
+
+### Fixed
+
+- Google Interactions derives each function result's name from its matching call,
+  including opaque history, and advertises function calling, hosted tools and
+  structured output in its legacy dialect capability view without bypassing
+  model-profile gates.
+- Streaming accounting preserves `step.delta.metadata.total_usage` as a
+  cumulative fallback. Observations replace rather than sum, terminal usage
+  retains priority, and malformed delta usage fails when received.
+- Google Interactions accepts signature-only thought steps when
+  `thinking_summaries: auto` omits visible summaries, preserving opaque history
+  rather than rejecting otherwise valid text, function or hosted-tool replies.
+
+### Changed
+
+- Google Interactions distinguishes omitted usage counters from explicit `null`:
+  omitted counters retain their existing defaults; provided counters must be
+  non-negative integers. Explicit `null` now raises an output-contract error
+  instead of being treated as missing. This strictness is specific to the
+  Interactions dialect.
+
 ## [0.15.0] - 2026-10-28
 
 A minor bump with breaking changes: `dialect: sglang_legacy` is replaced by

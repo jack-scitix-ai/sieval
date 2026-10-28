@@ -498,7 +498,7 @@ follow Google's sampling guidance. A successful request records what was
 sent, not a guarantee that the model used every control.
 Ordinary YAML bindings do not yet supply Google
 model-profile outcomes, so a capability that needs one (reasoning, tools,
-structured output, images) fails reconciliation with
+structured output, images, opaque continuation) fails reconciliation with
 `model_outcome_missing`; plain text generation, streaming and `dialect_options`
 work today. The `google_genai` provider-enforced capability evidence does not
 apply automatically to Interactions, so YAML reasoning remains guarded until
@@ -506,7 +506,7 @@ this endpoint has its own evidence. HTTP failures include Google's bounded
 `error.message` in the exception and the failed sample's `error_msg`.
 
 Not supported, and rejected before any network I/O: stateful sessions
-(`previous_response_id`), opaque continuation,
+(`previous_response_id`),
 logprobs, input scoring, `n > 1`, `top_k`, penalties, `developer` messages, assistant
 prefill, per-image `detail`, more than one system message, `tools.parallel`,
 and a tool message that carries more than one `ToolResultPart` (the IR has no
@@ -523,6 +523,11 @@ to `generation_config.tool_choice`, where the IR's `required` is the wire's
 `image_search`, `enterprise_web_search`) and `url_context` accepts no config.
 `url_citation` annotations become citations; other annotation kinds fail
 loudly rather than being dropped.
+
+Each `function_result` includes the function name inferred from its matching
+earlier call, including calls in opaque history. The live-tested Gemini backend
+requires this name even though the OpenAPI marks it optional; the request audit
+verifies it rather than accepting a caller-supplied override.
 
 SiEval **always sends `store: false`** to disable Interactions storage of
 evaluation prompts. The request audit pins this value; `store: true`, non-boolean
@@ -563,16 +568,35 @@ Accounting:
   `reasoning_tokens` stays a breakdown of `output_tokens`. Interactions report
   `total_output_tokens` without thoughts, and it can read 0 for a reply that
   did produce text, so token counts are observations, not a check on the text.
+- When terminal `usage` is absent, streaming uses the latest cumulative
+  `step.delta.metadata.total_usage` or `step.stop.usage`. These snapshots replace
+  earlier observations; they are not summed, and `step_usage` is not a cumulative
+  fallback. Delta metadata and its counters are validated when received, so
+  malformed values cannot be hidden by later valid usage. Missing counters use
+  the shared defaults; provided counters must be non-negative integers, not
+  booleans or `null`.
 - `reasoning.summary: auto` requests thought summaries. Any returned summaries
-  are preserved even when not requested. Thought summaries arrive as one or more
+  are preserved even when not requested. `auto` does not guarantee a visible
+  summary: a signed thought without summary Content is valid, with
+  `ReasoningOutput.text` left unset and its opaque continuation preserved.
+  Thought summaries arrive as one or more
   Content items; `ReasoningOutput.text` concatenates their text verbatim, without
   adding separators or normalizing provider-supplied whitespace.
   A terminal snapshot with `steps` is used as the complete reply only when no
   streamed steps were assembled. When streamed steps exist, any terminal snapshot
   must agree on summaries and thought presence; conflicting evidence, including
   snapshot-only summaries or thought presence, fails the call rather than
-  supplementing the streamed output. Opaque thought signatures are not exposed
-  as reusable continuation.
+  supplementing the streamed output. Contradictory signatures also fail the call.
+- Opaque continuation supports stateless multi-turn calls without enabling
+  provider storage. When a reply contains thought blocks or signatures, its
+  `ReasoningOutput.opaque_roundtrip` preserves the input and generated native
+  steps, including thought-summary Content item boundaries and hosted-tool
+  signatures. Pass it as `session.opaque_continuation` with dialect ID
+  `google_interactions`, and supply only the new turn in `input`. Subsequent
+  replies extend the history even when they contain no new thought signature.
+  The previous system instruction is preserved; a conflicting current system
+  message, malformed history, or a tool result without a matching earlier call
+  is rejected before I/O. `store` remains `false` and no session ID is returned.
 
 ## Environment Variables
 
